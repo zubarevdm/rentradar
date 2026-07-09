@@ -1,0 +1,90 @@
+"""Диспетчер персонального бота.
+
+Раз в N минут (по интервалу каждого фильтра) подбирает новые лоты из уже
+собранной БД под критерии пользователя и шлёт в личку. Площадки НЕ дёргаются —
+матчинг идёт по `recent_listings`. Триал-гейт: первые `free_limit` отправок
+бесплатно, дальше нужна активная подписка. Скам отсекается скорингом.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+
+from ..config import SearchProfile, Settings
+from ..interfaces import Publisher, ScoringEngine
+from ..models import ScoredListing
+from ..storage import SqlStorage
+from .filters import UserFilter, matches
+from .store import PersonalStore
+
+logger = logging.getLogger(__name__)
+
+
+class PersonalDispatcher:
+    def __init__(
+        self,
+        *,
+        store: PersonalStore,
+        storage: SqlStorage,
+        scoring: ScoringEngine,
+        publisher: Publisher,
+        settings: Settings,
+    ) -> None:
+        self._ps = store
+        self._storage = storage
+        self._scoring = scoring
+        self._publisher = publisher
+        self._settings = settings
+
+    async def run_due(self, now: datetime) -> int:
+        """Прогнать все фильтры, у которых наступил интервал. Вернуть число отправок."""
+        total = 0
+        for filter_id, flt in await self._ps.due_filters(now):
+            total += await self._dispatch_one(filter_id, flt, now)
+            await self._ps.touch_filter(filter_id, now)
+        return total
+
+    async def _dispatch_one(self, filter_id: int, flt: UserFilter, now: datetime) -> int:
+        since = now - timedelta(hours=self._settings.personal_lookback_hours)
+        listings = await self._storage.recent_listings(flt.city, since)  # newest first
+        profile = SearchProfile(name=flt.name, city=flt.city)
+
+        sent = 0
+        for listing in listings:
+            if sent >= self._settings.personal_max_per_check:
+                break
+            if not matches(listing, flt):
+                continue
+            content_key = listing.content_key
+            if await self._ps.was_sent(flt.user_id, content_key):
+                continue
+
+            # Триал-гейт: бесплатные отправки исчерпаны и подписка не активна.
+            active = await self._ps.is_active(flt.user_id, now)
+            if not active:
+                used = await self._ps.free_sends_used(flt.user_id)
+                if used >= self._settings.free_sends_limit:
+                    logger.debug("user %s: триал исчерпан, нужна подписка", flt.user_id)
+                    break
+
+            score = await self._scoring.score(listing, profile)
+            if not score.is_publishable:  # отсекаем скам/мусор
+                await self._ps.mark_sent(flt.user_id, content_key)
+                continue
+
+            ok = await self._publisher.publish(
+                ScoredListing(listing=listing, score=score),
+                channel=str(flt.user_id),
+                use_custom_emoji=True,  # личка — можно кастом-эмодзи
+            )
+            await self._ps.mark_sent(flt.user_id, content_key)
+            if not ok:
+                continue
+            if not active:
+                await self._ps.increment_free_sends(flt.user_id)
+            sent += 1
+
+        if sent:
+            logger.info("user %s filter %s: отправлено %d", flt.user_id, filter_id, sent)
+        return sent

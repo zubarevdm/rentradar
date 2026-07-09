@@ -1,0 +1,67 @@
+{
+  "data": {
+    "offerCount": 3,
+    "offersSerialized": [
+      {
+        "id": 311111111,
+        "cianId": 311111111,
+        "fullUrl": "https://www.cian.ru/rent/flat/311111111/",
+        "bargainTerms": { "priceRur": 55000, "price": 55000, "currency": "rur" },
+        "totalArea": "38.5",
+        "roomsCount": 1,
+        "isStudio": false,
+        "floorNumber": 5,
+        "building": { "floorsCount": 12, "materialType": { "name": "brick" } },
+        "addedTimestamp": 1718900000,
+        "geo": {
+          "userInput": "Москва, ул. Льва Толстого, 16",
+          "address": [
+            { "type": "location", "fullName": "Москва" },
+            { "type": "okrug", "fullName": "ЦАО" },
+            { "type": "district", "fullName": "Хамовники" },
+            { "type": "street", "fullName": "улица Льва Толстого" }
+          ],
+          "undergrounds": [
+            { "name": "Парк культуры", "time": 7, "transportType": "walk" },
+            { "name": "Фрунзенская", "time": 15, "transportType": "transport" }
+          ],
+          "coordinates": { "lat": 55.7345, "lng": 37.5876 }
+        },
+        "photos": [
+          { "fullUrl": "https://images.cian.site/a.jpg", "isDefault": true },
+          { "fullUrl": "https://images.cian.site/b.jpg", "isDefault": false }
+        ],
+        "phones": [ { "countryCode": "+7", "number": "9990001122" } ]
+      },
+      {
+        "id": 322222222,
+        "cianId": 322222222,
+        "fullUrl": "https://www.cian.ru/rent/flat/322222222/",
+        "bargainTerms": { "priceRur": 42000, "currency": "rur" },
+        "totalArea": "24,0",
+        "roomsCount": null,
+        "isStudio": true,
+        "addedTimestamp": 1718990000,
+        "geo": {
+          "userInput": "Москва, Дербеневская набережная, 1",
+          "address": [
+            { "type": "location", "fullName": "Москва" },
+            { "type": "district", "fullName": "Даниловский" }
+          ],
+          "undergrounds": [
+            { "name": "Павелецкая", "time": 12, "transportType": "transport" }
+          ],
+          "coordinates": { "lat": 55.7101, "lng": 37.6452 }
+        },
+        "photos": [ { "fullUrl": "https://images.cian.site/c.jpg", "isDefault": true } ],
+        "phones": [ { "countryCode": "+7", "number": "9995553344" } ]
+      },
+      {
+        "id": 333333333,
+        "bargainTerms": { "priceRur": 70000 },
+        "totalArea": "55.0",
+        "roomsCount": 2
+      }
+    ]
+  }
+}

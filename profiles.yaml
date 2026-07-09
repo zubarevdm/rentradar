@@ -1,0 +1,35 @@
+# Профили поиска RentRadar.
+# Каждый профиль — отдельная стратегия мониторинга. Веса и пороги задаются здесь,
+# чтобы менять «вкусность» без правки кода.
+
+profiles:
+  - name: "Студии и 1к у метро (Москва)"
+    city: "Москва"
+    deal_type: long_rent
+    property_types: [studio, flat]
+    price_min: 30000
+    price_max: 70000
+    rooms: [0, 1]
+    metro_only: true
+    # Порог строгий: 40%+ ниже медианы района = ~90, реальные сделки редки.
+    publish_threshold: 60.0
+    weights:
+      below_market: 0.35
+      price_per_m2: 0.18
+      location: 0.12
+      freshness: 0.10
+      condition: 0.25  # состояние/красота по vision-оценке
+    fraud:
+      suspicious_discount: 0.55
+      min_price: 15000
+      require_photos: true
+
+  - name: "Двушки в центре (Москва)"
+    city: "Москва"
+    deal_type: long_rent
+    property_types: [flat]
+    price_min: 50000
+    price_max: 150000
+    rooms: [2]
+    metro_only: false
+    publish_threshold: 60.0
