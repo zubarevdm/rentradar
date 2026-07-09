@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..storage import SqlStorage
 from ..storage.orm import ListingRow, SubscriberRow, UserFilterRow, UserSentRow
@@ -98,6 +98,49 @@ class PersonalStore:
                 )
             ).scalars()
             return [_row_to_filter(r) for r in rows]
+
+    async def admin_stats(self, now: datetime) -> dict[str, int]:
+        """Сводка для админской команды /stats: подписчики и фильтры."""
+        async with self._session() as session:
+            total = await session.scalar(
+                select(func.count()).select_from(SubscriberRow)
+            ) or 0
+            paid = await session.scalar(
+                select(func.count())
+                .select_from(SubscriberRow)
+                .where(SubscriberRow.paid_until.is_not(None))
+                .where(SubscriberRow.paid_until > now)
+            ) or 0
+            paused = await session.scalar(
+                select(func.count())
+                .select_from(SubscriberRow)
+                .where(SubscriberRow.paused_at.is_not(None))
+            ) or 0
+            trial = await session.scalar(
+                select(func.count())
+                .select_from(SubscriberRow)
+                .where(SubscriberRow.paid_until.is_(None))
+            ) or 0
+            expired = await session.scalar(
+                select(func.count())
+                .select_from(SubscriberRow)
+                .where(SubscriberRow.paid_until.is_not(None))
+                .where(SubscriberRow.paid_until <= now)
+            ) or 0
+            active_filters = await session.scalar(
+                select(func.count())
+                .select_from(UserFilterRow)
+                .where(UserFilterRow.active.is_(True))
+            ) or 0
+        # paid + trial + expired = subscribers; paused — оверлей (подмножество paid).
+        return {
+            "subscribers": total,
+            "paid": paid,
+            "trial": trial,
+            "expired": expired,
+            "paused": paused,
+            "active_filters": active_filters,
+        }
 
     async def touch_filter(self, filter_id: int, now: datetime) -> None:
         async with self._session() as session:

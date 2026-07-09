@@ -120,10 +120,15 @@ class Pipeline:
         candidates = await self.collect_and_score(profile)
         return await self.publish_top(candidates)
 
-    async def collect_only(self, profile: SearchProfile) -> int:
+    async def collect_only(self, profile: SearchProfile) -> tuple[int, dict[str, str]]:
         """Только собрать и сохранить (без скоринга/постинга) — для частого сбора,
-        который питает и публичный канал, и персонального бота. Вернуть число новых."""
+        который питает и публичный канал, и персонального бота.
+
+        Возвращает (число новых лотов, {source: 'ok'|'blocked'|'error'}) — статус по
+        каждой площадке нужен health-мониторингу (алерт админам при падении). Сбой
+        одной площадки не мешает остальным."""
         new_total = 0
+        statuses: dict[str, str] = {}
         for collector in self._collectors:
             try:
                 raw_items = await collector.fetch(profile)
@@ -131,11 +136,19 @@ class Pipeline:
                 logger.warning(
                     "collect %s [%s]: блок (%s)", profile.name, collector.source_name, exc
                 )
+                statuses[collector.source_name] = "blocked"
+                continue
+            except Exception:  # noqa: BLE001 — неожиданная ошибка площадки не валит сбор
+                logger.exception(
+                    "collect %s [%s]: ошибка", profile.name, collector.source_name
+                )
+                statuses[collector.source_name] = "error"
                 continue
             listings = [n for r in raw_items if (n := collector.normalize(r))]
             fresh = await self._storage.upsert_listings(listings)
             new_total += len(fresh)
-        return new_total
+            statuses[collector.source_name] = "ok"
+        return new_total, statuses
 
     async def score_recent(self, profile: SearchProfile, since: datetime) -> list[ScoredListing]:
         """Оценить свежие (по `since`) лоты города из БД — кандидаты для публикации.

@@ -79,6 +79,52 @@ async def _build_pipeline(
     return pipeline, storage
 
 
+async def test_collect_only_reports_status(settings: Settings) -> None:
+    # collect_only возвращает (число новых, {source: 'ok'|...}) для health-мониторинга.
+    profile = SearchProfile(name="t", city="Москва", publish_threshold=40.0)
+    listings = [_make_listing("1", 50_000), _make_listing("2", 60_000)]
+    pipeline, storage = await _build_pipeline(settings, listings)
+    try:
+        new, statuses = await pipeline.collect_only(profile)
+        assert new == 2
+        assert statuses == {"fake": "ok"}
+        # повторный сбор — тех же нет как новых, но площадка всё равно 'ok'
+        new2, statuses2 = await pipeline.collect_only(profile)
+        assert new2 == 0
+        assert statuses2 == {"fake": "ok"}
+    finally:
+        await storage.dispose()
+
+
+async def test_collect_only_marks_blocked(settings: Settings) -> None:
+    from rentradar.errors import CollectorBlockedError
+
+    class BlockedCollector(BaseCollector):
+        source_name = "avito"
+
+        async def fetch(self, profile, *, limit=50):
+            raise CollectorBlockedError("бан")
+
+        def normalize(self, raw):
+            return None
+
+    storage = SqlStorage(settings.db_url, db_path=settings.db_path)
+    await storage.init()
+    pipeline = Pipeline(
+        collectors=[BlockedCollector()],
+        storage=storage,
+        scoring=PlaceholderScoringEngine(),
+        publisher=TelegramPublisher(dry_run=True),
+        settings=settings,
+    )
+    try:
+        new, statuses = await pipeline.collect_only(SearchProfile(name="t", city="Москва"))
+        assert new == 0
+        assert statuses == {"avito": "blocked"}
+    finally:
+        await storage.dispose()
+
+
 async def test_pipeline_publishes_fresh(settings: Settings) -> None:
     profile = SearchProfile(name="t", city="Москва", publish_threshold=40.0)
     listings = [_make_listing("1", 50_000), _make_listing("2", 60_000)]

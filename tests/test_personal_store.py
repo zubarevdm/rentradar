@@ -186,3 +186,23 @@ async def test_recent_listings_roundtrip(storage: SqlStorage) -> None:
     assert r.photos == ["https://img/a", "https://img/b"]
     assert r.floor == 5 and r.building_material == "кирпич"
     assert r.address == "улица Тест, 1" and r.metro_distance_min == 7
+
+
+# ── админ-статистика ─────────────────────────────────────────────────────────
+async def test_admin_stats(ps: PersonalStore) -> None:
+    now = datetime(2026, 7, 9, 12, 0, 0)
+    await ps.get_or_create_subscriber(1)  # триал (не платил)
+    await ps.get_or_create_subscriber(2)
+    await ps.set_paid_until(2, now + timedelta(days=10))  # платный активный
+    await ps.pause(2, now)  # его же на паузу (пауза только для активной подписки)
+    await ps.get_or_create_subscriber(3)
+    await ps.set_paid_until(3, now - timedelta(days=1))  # истёкший
+    await ps.upsert_filter(UserFilter(user_id=1, name="ф", rooms=[1]))
+
+    s = await ps.admin_stats(now)
+    assert s["subscribers"] == 3
+    assert s["paid"] == 1  # только #2 активен
+    assert s["paused"] == 1  # #2
+    assert s["trial"] == 1  # #1 (никогда не платил)
+    assert s["expired"] == 1  # #3
+    assert s["active_filters"] == 1

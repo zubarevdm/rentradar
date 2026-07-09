@@ -340,15 +340,30 @@ async def _serve(settings: Settings) -> None:
         try:
             await storage.recompute_market_stats(window_days=settings.market_window_days)
             total = 0
+            agg: dict[str, list[str]] = {}
             for p in profiles:
-                total += await pipeline.collect_only(p)
+                new, statuses = await pipeline.collect_only(p)
+                total += new
+                for src, st in statuses.items():
+                    agg.setdefault(src, []).append(st)
             log.info("Сбор: новых лотов = %d", total)
+            runtime["last_collect_at"] = _utcnow()
+            runtime["last_collect_new"] = total
+            await _check_source_health(agg)  # 🔴/🟢 при смене состояния площадки
             # Сразу дообогащаем свежий Авито — до vision-прохода и постинга.
             await enrich_job()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка сбора")
+            await _alert_admin(
+                f"⚠️ Джоб сбора упал: {type(exc).__name__}: {exc}",
+                key="job:collect",
+                cooldown_h=1,
+            )
 
     async def public_job() -> None:
+        if public_paused["on"]:
+            log.info("Публичный постинг на паузе (/resumepublic — снять)")
+            return
         try:
             since = _utcnow() - timedelta(hours=settings.public_lookback_hours)
             candidates = []
@@ -364,33 +379,81 @@ async def _serve(settings: Settings) -> None:
                     await _alert_admin(
                         f"⚠️ Канал голодает: все {n_unanalyzed} кандидатов слота не "
                         "прошли vision-анализ (vision отстаёт или стоит). "
-                        "Проверь лог vision-прохода."
+                        "Проверь лог vision-прохода.",
+                        key="starving",
+                        cooldown_h=3,
                     )
             n = len(await pipeline.publish_top(passed))
+            runtime["last_public_at"] = _utcnow()
+            runtime["last_public_n"] = n
             log.info(
                 "Публичный топ: опубликовано %d (кандидатов %d, прошло гейт %d)",
                 n,
                 len(candidates),
                 len(passed),
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка публичного постинга")
+            await _alert_admin(
+                f"⚠️ Джоб публичного постинга упал: {type(exc).__name__}: {exc}",
+                key="job:public",
+                cooldown_h=1,
+            )
 
-    vision_alert: dict = {"at": None}  # время последнего алерта об ошибке API (антиспам)
+    # Троттл алертов ПО КЛЮЧУ: разные категории (vision/сбор/площадка/джоб) не
+    # глушат друг друга. Значение — время последней отправки этого ключа.
+    alert_state: dict[str, datetime] = {}
+    # Состояние площадок для health-мониторинга: source → 'ok'|'down'. Алертим на
+    # переходе (не каждый цикл): 🔴 при падении, 🟢 при восстановлении.
+    source_health: dict[str, str] = {}
+    # Пауза публичного постинга (админ-команда) — не мешает сбору и личке.
+    public_paused = {"on": False}
+    # Живые метрики для команды /health.
+    runtime: dict = {
+        "started_at": _utcnow(),
+        "last_collect_at": None,
+        "last_collect_new": None,
+        "last_public_at": None,
+        "last_public_n": None,
+    }
 
-    async def _alert_admin(text: str) -> None:
-        last = vision_alert["at"]
+    async def _alert_admin(text: str, *, key: str = "general", cooldown_h: float = 6.0) -> None:
+        """Уведомить всех админов. `key` — категория (свой троттл у каждой),
+        `cooldown_h` — не частить одинаковыми (0 = слать всегда, для редких событий)."""
         now = _utcnow()
-        if last is not None and (now - last).total_seconds() < 6 * 3600:
-            return  # не чаще раза в 6ч
-        vision_alert["at"] = now
-        log.warning("VISION ALERT: %s", text)
+        last = alert_state.get(key)
+        if last is not None and cooldown_h and (now - last).total_seconds() < cooldown_h * 3600:
+            return
+        alert_state[key] = now
+        log.warning("ADMIN ALERT [%s]: %s", key, text)
         if bot is not None:
             for admin in settings.admins:
                 try:
                     await bot.send_message(admin, text)
                 except Exception:  # noqa: BLE001
-                    log.warning("Не смог уведомить админа %s о vision", admin)
+                    log.warning("Не смог уведомить админа %s (%s)", admin, key)
+
+    async def _check_source_health(agg: dict[str, list[str]]) -> None:
+        """По итогам сбора: source считается живым, если собрал хоть в одном профиле.
+        Алертим только на смене состояния (ok↔down) — без спама каждые 10 минут."""
+        for src, results in agg.items():
+            state = "ok" if "ok" in results else "down"
+            if source_health.get(src, "ok") == state:
+                continue
+            source_health[src] = state
+            if state == "down":
+                await _alert_admin(
+                    f"🔴 Площадка <b>{src}</b> перестала собираться "
+                    "(блокировка/ошибка). Остальные площадки работают.",
+                    key=f"src:{src}",
+                    cooldown_h=0,
+                )
+            else:
+                await _alert_admin(
+                    f"🟢 Площадка <b>{src}</b> снова собирается.",
+                    key=f"src:{src}",
+                    cooldown_h=0,
+                )
 
     async def vision_job() -> None:
         """Проанализировать свежие необработанные лоты (выбор фото + ремонт), закэшировать.
@@ -446,7 +509,9 @@ async def _serve(settings: Settings) -> None:
                     await _alert_admin(
                         "⚠️ Vision: похоже, кончился баланс или лимит API "
                         "(или неверный ключ).\nПостинг продолжается без анализа фото.\n\n"
-                        f"{exc}"
+                        f"{exc}",
+                        key="vision",
+                        cooldown_h=6,
                     )
                     return  # не долбим API дальше в этом проходе
                 except Exception:  # noqa: BLE001
@@ -461,7 +526,7 @@ async def _serve(settings: Settings) -> None:
                         analyzed_at=_utcnow(),
                     )
                     continue
-                vision_alert["at"] = None  # успешный вызов → следующий сбой снова алертнёт
+                alert_state.pop("vision", None)  # успех → следующий сбой снова алертнёт
                 best_urls = (
                     [listing.photos[i] for i in analysis.best_photos] if analysis else []
                 )
@@ -478,16 +543,26 @@ async def _serve(settings: Settings) -> None:
                 analyzed += 1
             if analyzed:
                 log.info("Vision: проанализировано %d", analyzed)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка vision-прохода")
+            await _alert_admin(
+                f"⚠️ Джоб vision упал: {type(exc).__name__}: {exc}",
+                key="job:vision",
+                cooldown_h=1,
+            )
 
     async def personal_job() -> None:
         try:
             n = await personal.run_due(_utcnow())
             if n:
                 log.info("Личная рассылка: отправлено %d", n)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка личной рассылки")
+            await _alert_admin(
+                f"⚠️ Джоб личной рассылки упал: {type(exc).__name__}: {exc}",
+                key="job:personal",
+                cooldown_h=1,
+            )
 
     async def lifecycle_job() -> None:
         """Раз в сутки: триал-кончился / подписка-истекает / win-back. Дедуп по флагам."""
@@ -508,8 +583,13 @@ async def _serve(settings: Settings) -> None:
                     log.warning("lifecycle: не уведомил %s", sub.telegram_id)
             if sent:
                 log.info("Lifecycle: отправлено напоминаний %d", sent)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка lifecycle")
+            await _alert_admin(
+                f"⚠️ Джоб lifecycle упал: {type(exc).__name__}: {exc}",
+                key="job:lifecycle",
+                cooldown_h=1,
+            )
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(collect_job, "interval", minutes=max(1, settings.collect_interval_min))
@@ -547,17 +627,125 @@ async def _serve(settings: Settings) -> None:
             dp = Dispatcher(storage=MemoryStorage())
             dp.include_router(build_router(personal_store, settings))
 
+            def _is_admin(message: Message) -> bool:
+                return message.from_user is not None and message.from_user.id in settings.admins
+
             @dp.message(Command("postnow", "postnew"))
             async def _post_now(message: Message) -> None:
                 """Админ: форснуть публикацию топа в канал прямо сейчас."""
-                if message.from_user is None or message.from_user.id not in settings.admins:
+                if not _is_admin(message):
+                    return
+                if public_paused["on"]:
+                    await message.answer("⏸ Публичный постинг на паузе — сними /resumepublic.")
                     return
                 await message.answer("⏳ Публикую топ в канал…")
                 await public_job()
                 await message.answer("✅ Готово — проверь канал и лог.")
 
+            @dp.message(Command("health"))
+            async def _health(message: Message) -> None:
+                """Админ: сводка состояния системы."""
+                if not _is_admin(message):
+                    return
+                now = _utcnow()
+                if source_health:
+                    src = "  ".join(
+                        f"{'🟢' if s == 'ok' else '🔴'} {n}"
+                        for n, s in sorted(source_health.items())
+                    )
+                else:
+                    src = "ещё не собирал"
+                total = await storage.count_listings()
+                since = now - timedelta(hours=24)
+                vqueue = len(await storage.unanalyzed_listings("Москва", since, 10_000))
+                try:
+                    import resource
+
+                    mem_s = f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024} МБ"
+                except Exception:  # noqa: BLE001 — Windows/dev без resource
+                    mem_s = "н/д"
+
+                def _ago(dt: datetime | None) -> str:
+                    if dt is None:
+                        return "—"
+                    m = int((now - dt).total_seconds() // 60)
+                    return f"{m} мин назад" if m < 120 else f"{m // 60} ч назад"
+
+                up = int((now - runtime["started_at"]).total_seconds() // 60)
+                pub = _ago(runtime["last_public_at"])
+                if runtime["last_public_n"] is not None:
+                    pub += f" ({runtime['last_public_n']} шт)"
+                if public_paused["on"]:
+                    pub += " ⏸ПАУЗА"
+                await message.answer(
+                    "🩺 <b>Health</b>\n"
+                    f"Площадки: {src}\n"
+                    f"Сбор: {_ago(runtime['last_collect_at'])} "
+                    f"(+{runtime['last_collect_new'] or 0} новых)\n"
+                    f"Паблик: {pub}\n"
+                    f"Лотов в БД: {total} · очередь vision: {vqueue}\n"
+                    f"Память: {mem_s} · аптайм: {up // 60}ч {up % 60}м"
+                )
+
+            @dp.message(Command("collectnow"))
+            async def _collect_now(message: Message) -> None:
+                """Админ: форснуть сбор площадок прямо сейчас."""
+                if not _is_admin(message):
+                    return
+                await message.answer("⏳ Запускаю сбор…")
+                await collect_job()
+                await message.answer(
+                    f"✅ Собрано, новых: {runtime['last_collect_new']}. /health — детали."
+                )
+
+            @dp.message(Command("pausepublic"))
+            async def _pause_public(message: Message) -> None:
+                """Админ: приостановить публичный постинг (сбор и личка продолжаются)."""
+                if not _is_admin(message):
+                    return
+                public_paused["on"] = True
+                await message.answer("⏸ Публичный постинг на паузе. /resumepublic — снять.")
+
+            @dp.message(Command("resumepublic"))
+            async def _resume_public(message: Message) -> None:
+                """Админ: возобновить публичный постинг."""
+                if not _is_admin(message):
+                    return
+                public_paused["on"] = False
+                await message.answer("▶️ Публичный постинг возобновлён.")
+
+            @dp.message(Command("stats"))
+            async def _stats(message: Message) -> None:
+                """Админ: метрики подписчиков."""
+                if not _is_admin(message):
+                    return
+                s = await personal_store.admin_stats(_utcnow())
+                await message.answer(
+                    "📊 <b>Подписчики</b>\n"
+                    f"Всего: {s['subscribers']}\n"
+                    f"Платных активных: {s['paid']} (из них на паузе: {s['paused']})\n"
+                    f"На триале: {s['trial']}\n"
+                    f"Истёкших: {s['expired']}\n"
+                    f"Активных фильтров: {s['active_filters']}"
+                )
+
+            @dp.message(Command("admin"))
+            async def _admin_help(message: Message) -> None:
+                """Админ: список админ-команд."""
+                if not _is_admin(message):
+                    return
+                await message.answer(
+                    "🛠 <b>Админ-команды</b>\n"
+                    "/health — состояние системы\n"
+                    "/stats — подписчики\n"
+                    "/collectnow — собрать сейчас\n"
+                    "/postnow — опубликовать топ в канал\n"
+                    "/pausepublic · /resumepublic — пауза канала\n"
+                    "/grant &lt;id&gt; [дней] — выдать подписку"
+                )
+
             asyncio.create_task(startup_jobs())  # параллельно с поллингом
-            log.info("Бот на связи: /start /new /myfilters /status /buy /postnow(админ)")
+            log.info("Бот на связи: /start /new /myfilters /status /buy · админ: /admin")
             await dp.start_polling(bot)
         else:
             await startup_jobs()
