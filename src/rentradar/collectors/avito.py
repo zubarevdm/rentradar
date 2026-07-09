@@ -5,20 +5,23 @@
 фото). Парсим их через selectolax. Заголовок вида «2-к. квартира, 40 м², 2/2 эт.»
 несёт структуру — её и разбираем в `normalize`.
 
-⚠️ Антибот Авито жёстче, чем у Циан/Яндекса: с дата-центрового IP — баны и капча.
-С резидентного IP (локальный запуск) при вежливом темпе работает. При срабатывании
-антибота страница приходит без карточек → поднимаем `CollectorBlockedError`, и
+⚠️ Антибот Авито режет по TLS-ФИНГЕРПРИНТУ, а не по IP: голый httpx (Python-TLS)
+ловит 403 «Доступ ограничен: проблема с IP» даже с дата-центра, а `curl_cffi` с
+имитацией браузерного TLS проходит с того же IP без прокси. Рабочий фингерпринт
+Авито периодически банит, поэтому держим набор и ротируем (`_avito_fetch_html`).
+При исчерпании всех профилей страница не приходит → `CollectorBlockedError`, и
 остальные площадки продолжают.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import UTC, datetime
 from typing import NamedTuple
 
-import httpx
+from curl_cffi import requests as cffi_requests
 from selectolax.parser import HTMLParser
 
 from ..config import SearchProfile
@@ -30,10 +33,72 @@ logger = logging.getLogger(__name__)
 
 BASE = "https://www.avito.ru"
 
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+# Профили TLS-имитации curl_cffi. Авито адаптивно банит фингерпринт по мере
+# нагрузки, поэтому держим несколько и ротируем: начинаем с последнего рабочего,
+# при блоке идём по кругу. Порядок — эмпирический (safari/свежий chrome живучее).
+_IMPERSONATE_PROFILES = (
+    "safari17_0",
+    "chrome124",
+    "chrome123",
+    "safari15_5",
+    "chrome110",
+    "chrome131",
 )
+
+
+class _FingerprintRotator:
+    """Помнит индекс последнего сработавшего профиля; выдаёт порядок перебора."""
+
+    def __init__(self, profiles: tuple[str, ...]) -> None:
+        self._profiles = profiles
+        self._good = 0
+
+    def order(self) -> list[str]:
+        n = len(self._profiles)
+        return [self._profiles[(self._good + i) % n] for i in range(n)]
+
+    def mark_good(self, profile: str) -> None:
+        self._good = self._profiles.index(profile)
+
+
+_rotator = _FingerprintRotator(_IMPERSONATE_PROFILES)
+
+
+def _blocking_get(
+    url: str, impersonate: str, params: dict | None, proxy: str | None, timeout: float
+) -> object:
+    kwargs: dict = {"impersonate": impersonate, "timeout": timeout}
+    if params:
+        kwargs["params"] = params
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    return cffi_requests.get(url, **kwargs)
+
+
+async def _avito_fetch_html(
+    url: str,
+    *,
+    params: dict | None = None,
+    proxy: str | None = None,
+    timeout: float = 25.0,
+) -> str | None:
+    """GET страницы Авито через curl_cffi с ротацией TLS-фингерпринта.
+
+    Начинаем с последнего рабочего профиля; если он теперь режется (403 или
+    заглушка «доступ ограничен») — перебираем остальные. Возвращаем HTML первого
+    прошедшего профиля или None, если заблокированы все (тогда caller поднимет
+    CollectorBlockedError). curl_cffi синхронный — гоним в пуле потоков."""
+    for imp in _rotator.order():
+        try:
+            resp = await asyncio.to_thread(_blocking_get, url, imp, params, proxy, timeout)
+        except Exception as exc:  # noqa: BLE001 — сетевые/curl-ошибки: пробуем следующий
+            logger.warning("avito curl_cffi[%s]: %s: %s", imp, type(exc).__name__, exc)
+            continue
+        blocked = resp.status_code != 200 or "доступ ограничен" in resp.text[:4000].lower()
+        if not blocked:
+            _rotator.mark_good(imp)
+            return resp.text
+    return None
 # Полноразмерные фото (1280x960) в JSON страницы объявления — экранированы: \"1280x960\":\"URL\".
 _FULL_PHOTO_RE = re.compile(r'\\"1280x960\\":\\"(https://[^\\"]+?)\\"')
 # Залог/комиссия одной строкой в JSON: \"depositCommission\":\"залог 125000 ₽, без комиссии\".
@@ -95,17 +160,11 @@ async def fetch_detail(
     В выдаче Авито только мелкие превью и ни описания, ни условий — всё это лежит
     на детальной странице; один запрос отдаёт всё сразу. None — блокировка/ошибка
     сети (вызывающему стоит прекратить проход и подождать)."""
-    headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "ru-RU,ru;q=0.9"}
-    try:
-        async with httpx.AsyncClient(
-            headers=headers, follow_redirects=True, timeout=timeout, proxy=proxy or None
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        logger.warning("avito detail: не открыл %s: %s", url, exc)
+    html = await _avito_fetch_html(url, proxy=proxy, timeout=timeout)
+    if html is None:
+        logger.warning("avito detail: не открыл %s (все TLS-профили заблокированы)", url)
         return None
-    return parse_detail(resp.text, price=price, limit=limit)
+    return parse_detail(html, price=price, limit=limit)
 
 
 def parse_detail(html: str, *, price: int | None = None, limit: int = 10) -> AvitoDetail:
@@ -146,14 +205,6 @@ REGION_PATH: dict[str, str] = {
 # «длительный срок» — без него отдаётся лендинг без объявлений. s=104 — по дате.
 _CATEGORY_PATH = "kvartiry/sdam/na_dlitelnyy_srok-ASgBAgICAkSSA8gQ8AeQUg"
 
-_HTML_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Upgrade-Insecure-Requests": "1",
-}
-
 
 class AvitoCollector(HttpCollector):
     source_name = Source.AVITO.value
@@ -166,29 +217,29 @@ class AvitoCollector(HttpCollector):
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         region = REGION_PATH.get(profile.city.strip().lower(), "moskva")
         results: list[RawListing] = []
-        async with self._client(follow_redirects=True) as client:
-            for page in range(1, self._max_pages + 1):
-                await self._throttle()
-                url = f"{BASE}/{region}/{_CATEGORY_PATH}"
-                resp = await client.get(
-                    url,
-                    params={"s": "104", "p": page},
-                    headers=dict(_HTML_HEADERS),
-                    timeout=self._timeout,
+        for page in range(1, self._max_pages + 1):
+            await self._throttle()
+            url = f"{BASE}/{region}/{_CATEGORY_PATH}"
+            html = await _avito_fetch_html(
+                url, params={"s": "104", "p": page}, proxy=self._proxy, timeout=self._timeout
+            )
+            if html is None:
+                raise CollectorBlockedError(
+                    f"Авито: все TLS-профили заблокированы для {url}"
                 )
-                cards = _parse_cards(resp.text)
-                if cards is None:
-                    raise CollectorBlockedError(
-                        f"Авито не отдал карточки (вероятно антибот/капча) для {url}"
-                    )
-                if not cards:
-                    break
-                for card in cards:
-                    raw = _wrap_card(card)
-                    if raw is not None:
-                        results.append(raw)
-                    if len(results) >= limit:
-                        return results
+            cards = _parse_cards(html)
+            if cards is None:
+                raise CollectorBlockedError(
+                    f"Авито не отдал карточки (вероятно антибот/капча) для {url}"
+                )
+            if not cards:
+                break
+            for card in cards:
+                raw = _wrap_card(card)
+                if raw is not None:
+                    results.append(raw)
+                if len(results) >= limit:
+                    return results
         return results
 
     def normalize(self, raw: RawListing) -> Listing | None:
