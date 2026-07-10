@@ -14,10 +14,10 @@ git fetch -q origin 2>/dev/null
 git checkout -q main 2>/dev/null
 if ! git merge -q --no-edit "origin/$BRANCH" >/tmp/rentradar-cc-merge.log 2>&1; then
   git merge --abort 2>/dev/null
-  jq -n --arg b "$BRANCH" '{status:"conflict",branch:$b}'
+  jq -nc --arg b "$BRANCH" '{status:"conflict",branch:$b}'
   exit 0
 fi
 git push -q origin main 2>/dev/null
 git push -q origin --delete "$BRANCH" 2>/dev/null   # прибрать влитую ветку с GitHub
 rm -f "$REPO/.cc_pending"
-jq -n --arg b "$BRANCH" '{status:"applied",branch:$b}'
+jq -nc --arg b "$BRANCH" '{status:"applied",branch:$b}'
