@@ -644,9 +644,18 @@ async def _serve(settings: Settings) -> None:
     post_hours = settings.public_post_hours.strip()
     if post_hours:
         scheduler.add_job(
-            public_job, "cron", hour=post_hours, minute=0, timezone=ZoneInfo("Europe/Moscow")
+            public_job,
+            "cron",
+            hour=post_hours,
+            minute=0,
+            jitter=max(0, settings.public_post_jitter_sec),  # ±сдвиг, чтобы не ровно в HH:00
+            timezone=ZoneInfo("Europe/Moscow"),
         )
-        log.info("Публичный постинг по часам MSK: %s", post_hours)
+        log.info(
+            "Публичный постинг по часам MSK: %s (±%dс разброс)",
+            post_hours,
+            settings.public_post_jitter_sec,
+        )
     else:
         scheduler.add_job(public_job, "interval", minutes=max(1, settings.poll_interval_min))
     scheduler.add_job(personal_job, "interval", minutes=1)
