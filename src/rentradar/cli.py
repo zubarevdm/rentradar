@@ -399,7 +399,11 @@ async def _serve(settings: Settings) -> None:
             since = _utcnow() - timedelta(hours=settings.public_lookback_hours)
             candidates = []
             for p in profiles:
-                candidates.extend(await pipeline.score_recent(p, since))
+                # Канал: свой (низкий) порог вкусности — отбор по красоте, лучшие
+                # сделки бережём боту (см. public_min_score).
+                candidates.extend(
+                    await pipeline.score_recent(p, since, min_score=settings.public_min_score)
+                )
             # Паблик-гейт по «красоте»: в канал только приличный ремонт.
             passed = [c for c in candidates if _passes_public_gate(c, settings)]
             # Канал голодает из-за отставшего vision? Кандидаты по скору есть, но

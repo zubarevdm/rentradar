@@ -161,13 +161,18 @@ class Pipeline:
             statuses[collector.source_name] = "ok"
         return new_total, statuses
 
-    async def score_recent(self, profile: SearchProfile, since: datetime) -> list[ScoredListing]:
+    async def score_recent(
+        self, profile: SearchProfile, since: datetime, *, min_score: float | None = None
+    ) -> list[ScoredListing]:
         """Оценить свежие (по `since`) лоты города из БД — кандидаты для публикации.
+        `min_score` — порог «вкусности» (None → publish_threshold профиля). Канал
+        передаёт свой (низкий) порог: там отбор по красоте, а не по выгодности.
         Дедуп против истории постинга делает `publish_top`."""
+        threshold = min_score if min_score is not None else profile.publish_threshold
         listings = await self._storage.recent_listings(profile.city, since)  # type: ignore[attr-defined]
         out: list[ScoredListing] = []
         for listing in listings:
             score = await self._scoring.score(listing, profile)
-            if score.is_publishable and score.total >= profile.publish_threshold:
+            if score.is_publishable and score.total >= threshold:
                 out.append(ScoredListing(listing=listing, score=score))
         return out
