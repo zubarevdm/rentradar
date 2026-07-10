@@ -102,6 +102,8 @@ class Settings(BaseSettings):
     protect_content_public: bool = False
     # Оплата ЮKassa: provider-token из @BotFather (пусто = оплата выключена).
     yookassa_provider_token: str = ""
+    # Контакт админа для ручной активации подписки (пока оплата картой не подключена).
+    admin_contact: str = "@ol1nn4"
     # Цена подписки, ₽, и срок, дней.
     sub_price_rub: int = 499
     sub_days: int = 30

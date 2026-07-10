@@ -49,8 +49,8 @@ ROOM_OPTIONS: list[tuple[str, str, list[int]]] = [
 # ниже — «без убитого» (simple+, отсекает soviet/needs_repair).
 RENOVATION_OPTIONS: list[tuple[str, str, str | None]] = [
     ("any", "Любой", None),
-    ("simple", "Без убитого (косметика и лучше)", "simple"),
-    ("modern", "Хороший (современный/евро)", "modern"),
+    ("simple", "Приличный", "simple"),
+    ("modern", "Современный", "modern"),
 ]
 
 # Подписи кнопок главного меню (reply-клавиатура снизу).
@@ -62,8 +62,14 @@ BTN_BUY = "💳 Подписка"
 _METRO_INTRO = (
     "🚇 <b>Метро</b>\n"
     "Напишите станцию — покажу кнопками 👇\n"
-    "Можно несколько. Не нужно — «пропустить»."
+    "Можно несколько. Не нужно — жми «Пропустить»."
 )
+
+
+def _kb_skip(action: str) -> InlineKeyboardMarkup:
+    """Кнопка «Пропустить» для необязательных шагов (чтобы не писать слово руками)."""
+    button = InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"skip:{action}")
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 
 class NewFilter(StatesGroup):
@@ -101,7 +107,8 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         await state.set_state(NewFilter.price)
         await message.answer(
             "Бюджет, ₽/мес. Примеры: <code>30000-70000</code>, <code>до 60000</code>, "
-            "<code>от 40000</code> или «пропустить»."
+            "<code>от 40000</code>. Не важно — жми «Пропустить».",
+            reply_markup=_kb_skip("price"),
         )
 
     async def _do_myfilters(message: Message) -> None:
@@ -165,19 +172,42 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         )
 
     async def _do_buy(message: Message) -> None:
-        if not settings.yookassa_provider_token:
-            await message.answer(
-                "Оплата картой скоро будет подключена. Напишите администратору для "
-                "ручной активации."
+        uid = message.from_user.id
+        now = _utcnow()
+        until = await store.paid_until_of(uid)
+        # Шапка со статусом: сколько дней осталось + глагол действия.
+        if await store.is_paused(uid, now):
+            header = "⏸ Подписка на паузе (возобновится сама).\n\n"
+            verb = "продлить"
+        elif await store.is_active(uid, now) and until:
+            days_left = max(0, (until - now).days)
+            left = f"{days_left} дн." if days_left else "меньше суток"
+            header = f"✅ Подписка активна ещё <b>{left}</b> (до {until:%d.%m.%Y}).\n\n"
+            verb = "продлить"
+        else:
+            header = "У тебя пока нет активной подписки.\n\n"
+            verb = "оформить"
+
+        price_line = f"Стоимость: <b>{settings.sub_price_rub} ₽</b> / {settings.sub_days} дней."
+        # ЮKassa подключена → сразу инвойс; иначе временно ручная активация.
+        if settings.yookassa_provider_token:
+            await message.answer(header + price_line)
+            await message.answer_invoice(
+                title="Подписка RentRadar",
+                description=f"Доступ к персональному поиску на {settings.sub_days} дней",
+                payload=f"sub:{settings.sub_days}",
+                provider_token=settings.yookassa_provider_token,
+                currency="RUB",
+                prices=[LabeledPrice(label="Подписка", amount=settings.sub_price_rub * 100)],
             )
             return
-        await message.answer_invoice(
-            title="Подписка RentRadar",
-            description=f"Доступ к персональному поиску на {settings.sub_days} дней",
-            payload=f"sub:{settings.sub_days}",
-            provider_token=settings.yookassa_provider_token,
-            currency="RUB",
-            prices=[LabeledPrice(label="Подписка", amount=settings.sub_price_rub * 100)],
+        await message.answer(
+            header
+            + "💳 Оплата картой скоро будет подключена.\n"
+            + f"Чтобы {verb} подписку сейчас — напиши администратору "
+            + f"{settings.admin_contact} для ручной активации.\n\n"
+            + price_line,
+            disable_web_page_preview=True,
         )
 
     # ── онбординг ───────────────────────────────────────────────────────
@@ -344,12 +374,36 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         await state.update_data(rooms=parse_rooms(message.text or ""))
         await _ask_price(message, state)
 
+    @router.callback_query(NewFilter.price, F.data == "skip:price")
+    async def skip_price(cq: CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(
+            price_min=None, price_max=None, metros_sel=[], metros_last=[]
+        )
+        await cq.message.edit_text("Бюджет: любой")
+        await state.set_state(NewFilter.metro)
+        await cq.message.answer(_METRO_INTRO, reply_markup=_kb_skip("metro"))
+        await cq.answer()
+
     @router.message(NewFilter.price)
     async def set_price(message: Message, state: FSMContext) -> None:
         lo, hi = parse_price_range(message.text or "")
         await state.update_data(price_min=lo, price_max=hi, metros_sel=[], metros_last=[])
         await state.set_state(NewFilter.metro)
-        await message.answer(_METRO_INTRO)
+        await message.answer(_METRO_INTRO, reply_markup=_kb_skip("metro"))
+
+    @router.callback_query(NewFilter.metro, F.data == "skip:metro")
+    async def skip_metro(cq: CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(metros=[])
+        await cq.message.edit_text("Метро: любые")
+        await _ask_max_metro(cq.message, state)
+        await cq.answer()
+
+    @router.callback_query(NewFilter.max_metro, F.data == "skip:maxmetro")
+    async def skip_max_metro(cq: CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(max_metro_min=None)
+        await cq.message.edit_text("До метро: не важно")
+        await _ask_renovation(cq.message, state)
+        await cq.answer()
 
     # ── метро: поиск-подсказка (typeahead) ──────────────────────────────
     @router.message(NewFilter.metro)
@@ -363,7 +417,10 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         city = data.get("city", "Москва")
         found = suggest_metros(text, await store.distinct_metros(city))
         if not found:
-            await message.answer("Не нашёл такую станцию. Попробуйте иначе или «пропустить».")
+            await message.answer(
+                "Не нашёл такую станцию. Попробуйте иначе или жмите «Пропустить».",
+                reply_markup=_kb_skip("metro"),
+            )
             return
         await state.update_data(metros_last=found)
         await message.answer(
@@ -402,7 +459,10 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
 
     async def _ask_max_metro(message: Message, state: FSMContext) -> None:
         await state.set_state(NewFilter.max_metro)
-        await message.answer("Максимум минут пешком до метро (число) или «пропустить».")
+        await message.answer(
+            "Максимум минут пешком до метро (число). Не важно — жми «Пропустить».",
+            reply_markup=_kb_skip("maxmetro"),
+        )
 
     @router.message(NewFilter.max_metro)
     async def set_max_metro(message: Message, state: FSMContext) -> None:
@@ -636,9 +696,9 @@ def _kb_renovation() -> InlineKeyboardMarkup:
 def _renovation_filter_label(renovation_min: str) -> str:
     """renovation_min → подпись для описания фильтра."""
     return {
-        "simple": "без убитого",
-        "modern": "современный/евро",
-        "designer": "только дизайнерский",  # legacy — старые фильтры
+        "simple": "приличный",
+        "modern": "современный",
+        "designer": "дизайнерский",  # legacy — старые фильтры
     }.get(renovation_min, renovation_min)
 
 
