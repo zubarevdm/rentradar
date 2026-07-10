@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from ..config import SearchProfile, Settings
 from ..interfaces import Publisher, ScoringEngine
-from ..models import ScoredListing
+from ..models import ScoredListing, dedupe_cross_source
 from ..storage import SqlStorage
 from .filters import UserFilter, matches
 from .store import PersonalStore
@@ -48,6 +48,9 @@ class PersonalDispatcher:
     async def _dispatch_one(self, filter_id: int, flt: UserFilter, now: datetime) -> int:
         since = now - timedelta(hours=self._settings.personal_lookback_hours)
         listings = await self._storage.recent_listings(flt.city, since)  # newest first
+        # Одна квартира с 2-3 площадок → шлём только одну (дешевле; при равной цене
+        # приоритет Avito>Cian>Yandex), чтобы не дублировать в личке.
+        listings = dedupe_cross_source(listings)
         profile = SearchProfile(name=flt.name, city=flt.city)
 
         sent = 0

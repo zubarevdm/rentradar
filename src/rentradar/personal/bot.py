@@ -44,10 +44,13 @@ ROOM_OPTIONS: list[tuple[str, str, list[int]]] = [
 ]
 
 # Опции ремонта (одиночный выбор): ключ → (подпись, renovation_min). None = любой.
+# «Только дизайнерский» убран: нейросеть ставит ярлык designer крайне редко (~0.2%
+# рынка), фильтр давал пусто. Верхняя реальная планка — «современный/евро» (modern+),
+# ниже — «без убитого» (simple+, отсекает soviet/needs_repair).
 RENOVATION_OPTIONS: list[tuple[str, str, str | None]] = [
     ("any", "Любой", None),
-    ("modern", "Современный и лучше", "modern"),
-    ("designer", "Только дизайнерский", "designer"),
+    ("simple", "Без убитого (косметика и лучше)", "simple"),
+    ("modern", "Хороший (современный/евро)", "modern"),
 ]
 
 # Подписи кнопок главного меню (reply-клавиатура снизу).
@@ -632,9 +635,11 @@ def _kb_renovation() -> InlineKeyboardMarkup:
 
 def _renovation_filter_label(renovation_min: str) -> str:
     """renovation_min → подпись для описания фильтра."""
-    return {"modern": "современный и лучше", "designer": "только дизайнерский"}.get(
-        renovation_min, renovation_min
-    )
+    return {
+        "simple": "без убитого",
+        "modern": "современный/евро",
+        "designer": "только дизайнерский",  # legacy — старые фильтры
+    }.get(renovation_min, renovation_min)
 
 
 def _describe(flt: UserFilter) -> str:

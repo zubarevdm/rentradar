@@ -31,7 +31,7 @@ from .collectors import AvitoCollector, CianCollector, YandexCollector
 from .collectors.avito import fetch_detail
 from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .errors import CollectorBlockedError
-from .models import ScoredListing, Source
+from .models import ScoredListing, Source, source_rank
 from .personal import PersonalStore
 from .personal.bot import build_router
 from .personal.dispatcher import PersonalDispatcher
@@ -75,6 +75,26 @@ def _lifecycle_nudge(
             "присылать все подходящие варианты первым. Кнопка «💳 Подписка»."
         )
     return None, ""
+
+
+def _dedupe_scored(scored: list[ScoredListing]) -> list[ScoredListing]:
+    """Кросс-площадочный дедуп кандидатов канала: одна квартира с разных площадок →
+    оставить дешевле (при равенстве Avito>Cian>Yandex). Порядок первого появления
+    сохраняем — финальную сортировку сделает publish_top."""
+    order: list[str] = []
+    best: dict[str, ScoredListing] = {}
+    for s in scored:
+        key = s.listing.content_key
+        if key not in best:
+            order.append(key)
+            best[key] = s
+            continue
+        cur = best[key]
+        if source_rank(s.listing.source.value, s.listing.price) < source_rank(
+            cur.listing.source.value, cur.listing.price
+        ):
+            best[key] = s
+    return [best[key] for key in order]
 
 
 def _passes_public_gate(scored: ScoredListing, settings: Settings) -> bool:
@@ -249,6 +269,8 @@ async def _serve(settings: Settings) -> None:
             cta_public_text=settings.cta_public_text,
             cta_public_url=settings.cta_public_url,
             avito_proxy=settings.avito_proxy,
+            protect_bot=settings.protect_content_bot,
+            protect_public=settings.protect_content_public,
         )
     else:
         publisher = TelegramPublisher(
@@ -261,6 +283,8 @@ async def _serve(settings: Settings) -> None:
             cta_public_text=settings.cta_public_text,
             cta_public_url=settings.cta_public_url,
             avito_proxy=settings.avito_proxy,
+            protect_bot=settings.protect_content_bot,
+            protect_public=settings.protect_content_public,
         )
 
     pipeline = Pipeline(
@@ -390,7 +414,11 @@ async def _serve(settings: Settings) -> None:
                         key="starving",
                         cooldown_h=3,
                     )
-            n = len(await pipeline.publish_top(passed))
+            # Канал = витрина: ранжируем по красоте (WOW), а не по «вкусности» —
+            # лучшие сделки бережём для бота. Кросс-дедуп одной квартиры с разных
+            # площадок (дешевле/приоритет) — чтобы не постить дубли.
+            passed = _dedupe_scored(passed)
+            n = len(await pipeline.publish_top(passed, by_appeal=settings.public_rank_by_appeal))
             runtime["last_public_at"] = _utcnow()
             runtime["last_public_n"] = n
             log.info(

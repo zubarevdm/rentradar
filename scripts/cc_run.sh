@@ -43,7 +43,7 @@ COST="$(jq -r '.total_cost_usd // 0' /tmp/rentradar-cc-claude.json 2>/dev/null)"
 git add -A 2>/dev/null
 CHANGED="$(git diff --cached --name-only 2>/dev/null | grep -c . || true)"
 if [ "${CHANGED:-0}" = "0" ]; then
-  jq -n --arg s "$SUMMARY" --argjson c "$COST" '{status:"no_changes",summary:$s,cost:$c}'
+  jq -c -n --arg s "$SUMMARY" --argjson c "$COST" '{status:"no_changes",summary:$s,cost:$c}'
   exit 0
 fi
 DIFFSTAT="$(git diff --cached --stat 2>/dev/null | tail -30)"
@@ -57,6 +57,6 @@ git commit -q -m "cc: $TASK" 2>/dev/null
 git push -qf origin "$BRANCH" 2>/dev/null
 echo "$BRANCH" > "$REPO/.cc_pending"
 
-jq -n --arg br "$BRANCH" --arg s "$SUMMARY" --arg ds "$DIFFSTAT" \
+jq -c -n --arg br "$BRANCH" --arg s "$SUMMARY" --arg ds "$DIFFSTAT" \
   --argjson ch "$CHANGED" --argjson rc "$PYTEST_RC" --arg pt "$PYTEST_TAIL" --argjson c "$COST" \
   '{status:"done",branch:$br,summary:$s,diffstat:$ds,changed:$ch,pytest_rc:$rc,pytest:$pt,cost:$c}'

@@ -46,3 +46,46 @@ def test_price_must_be_positive() -> None:
             city="Москва",
             collected_at=datetime(2026, 6, 21),
         )
+
+
+def _same_flat(source: Source, price: int, ext: str) -> Listing:
+    # Один и тот же адрес/комнаты/площадь → одинаковый content_key на всех площадках.
+    return Listing(
+        source=source, external_id=ext, url=f"http://{source.value}/{ext}",
+        price=price, area=40.0, rooms=1, city="Москва", address="ул. Тестовая, 5",
+        collected_at=datetime(2026, 7, 11, 12, 0, 0),
+    )
+
+
+def test_dedupe_cross_source_keeps_cheapest() -> None:
+    from rentradar.models import dedupe_cross_source
+
+    items = [
+        _same_flat(Source.CIAN, 60_000, "c1"),
+        _same_flat(Source.YANDEX, 55_000, "y1"),  # дешевле всех
+        _same_flat(Source.AVITO, 62_000, "a1"),
+    ]
+    out = dedupe_cross_source(items)
+    assert len(out) == 1
+    assert out[0].source == Source.YANDEX and out[0].price == 55_000
+
+
+def test_dedupe_cross_source_tie_priority_avito() -> None:
+    from rentradar.models import dedupe_cross_source
+
+    items = [
+        _same_flat(Source.YANDEX, 60_000, "y1"),
+        _same_flat(Source.CIAN, 60_000, "c1"),
+        _same_flat(Source.AVITO, 60_000, "a1"),  # та же цена → приоритет Avito
+    ]
+    out = dedupe_cross_source(items)
+    assert len(out) == 1 and out[0].source == Source.AVITO
+
+
+def test_dedupe_cross_source_keeps_distinct_flats() -> None:
+    from rentradar.models import dedupe_cross_source
+
+    a = _same_flat(Source.CIAN, 60_000, "c1")
+    b = _same_flat(Source.CIAN, 60_000, "c2").model_copy(update={"address": "ул. Другая, 9"})
+    out = dedupe_cross_source([a, b])
+    assert len(out) == 2  # разные адреса → разные квартиры, не схлопываем

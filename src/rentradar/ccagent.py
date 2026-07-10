@@ -46,12 +46,20 @@ async def _run(name: str, *args: str, timeout: float) -> dict:
         proc.kill()
         return {"status": "timeout"}
     text = out.decode(errors="replace").strip()
-    last = text.splitlines()[-1] if text else ""
-    try:
-        return json.loads(last)
-    except (json.JSONDecodeError, ValueError):
-        tail = err.decode(errors="replace")[-300:] or text[-300:] or "нет вывода"
-        return {"status": "error", "msg": tail}
+    # Скрипт печатает JSON-результат. jq может отдать его в несколько строк, поэтому
+    # пробуем сначала весь stdout как единый объект, затем — строки с конца (на
+    # случай git-шума перед JSON). Раньше брали только последнюю строку → у
+    # multiline-JSON это «}», парсинг падал, и бот слал ложную «ошибку».
+    for candidate in (text, *reversed(text.splitlines())):
+        candidate = candidate.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    tail = err.decode(errors="replace")[-300:] or text[-300:] or "нет вывода"
+    return {"status": "error", "msg": tail}
 
 
 async def run_task(task: str, *, timeout: float = 1300) -> dict:

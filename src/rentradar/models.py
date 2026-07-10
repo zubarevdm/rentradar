@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
 
@@ -260,6 +261,35 @@ def build_segment_keys(
     # dict.fromkeys убирает дубли (если район пуст, fine/mid могут совпасть),
     # сохраняя порядок от точного к грубому.
     return list(dict.fromkeys([fine, mid, coarse]))
+
+
+# Приоритет площадок при равной цене одной и той же квартиры (кросс-дедуп).
+SOURCE_PRIORITY = {"avito": 0, "cian": 1, "yandex": 2}
+
+
+def source_rank(source_value: str, price: int) -> tuple[int, int]:
+    """Ключ выбора лучшей площадки для одной квартиры: дешевле, затем приоритет."""
+    return (price, SOURCE_PRIORITY.get(source_value, 9))
+
+
+def dedupe_cross_source(listings: Iterable[Listing]) -> list[Listing]:
+    """Схлопнуть одну квартиру, выставленную на нескольких площадках, в одну.
+
+    Оставляем где ДЕШЕВЛЕ; при равной цене — приоритет Avito > Cian > Yandex.
+    Ключ схлопывания — `content_key` (адрес+комнаты+площадь, без цены и источника).
+    Порядок первого появления ключа сохраняется — важно для «сначала свежие»."""
+    order: list[str] = []
+    best: dict[str, Listing] = {}
+    for lst in listings:
+        key = lst.content_key
+        if key not in best:
+            order.append(key)
+            best[key] = lst
+            continue
+        cur = best[key]
+        if source_rank(lst.source.value, lst.price) < source_rank(cur.source.value, cur.price):
+            best[key] = lst
+    return [best[key] for key in order]
 
 
 def _normalize_text(text: str) -> str:

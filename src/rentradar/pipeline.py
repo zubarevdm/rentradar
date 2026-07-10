@@ -82,13 +82,24 @@ class Pipeline:
                 candidates.append(ScoredListing(listing=listing, score=score))
         return candidates
 
-    async def publish_top(self, candidates: list[ScoredListing]) -> list[ScoredListing]:
+    async def publish_top(
+        self, candidates: list[ScoredListing], *, by_appeal: bool = False
+    ) -> list[ScoredListing]:
         """Опубликовать глобальный топ кандидатов (со всех профилей).
 
-        Сортируем по «вкусности», схлопываем дубли по content_key (в прогоне и
-        против истории), режем по лимиту цикла и постим с антифлуд-паузой.
+        Сортируем по «вкусности» (или по красоте `appeal`, если by_appeal — для
+        канала-витрины), схлопываем дубли по content_key (в прогоне и против
+        истории), режем по лимиту цикла и постим с антифлуд-паузой.
         """
-        ranked = sorted(candidates, key=lambda c: c.score.total, reverse=True)
+        if by_appeal:
+            # Канал = витрина: вперёд самые красивые (WOW), при равенстве — вкуснее.
+            ranked = sorted(
+                candidates,
+                key=lambda c: (c.listing.appeal or 0, c.score.total),
+                reverse=True,
+            )
+        else:
+            ranked = sorted(candidates, key=lambda c: c.score.total, reverse=True)
 
         published: list[ScoredListing] = []
         seen: set[str] = set()

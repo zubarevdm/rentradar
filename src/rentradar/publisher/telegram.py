@@ -53,6 +53,8 @@ class TelegramPublisher(Publisher):
         cta_public_text: str = "",
         cta_public_url: str = "",
         avito_proxy: str = "",
+        protect_bot: bool = False,
+        protect_public: bool = False,
     ) -> None:
         self._dry_run = dry_run
         self._bot = bot
@@ -69,6 +71,9 @@ class TelegramPublisher(Publisher):
         self._cta_url = cta_url
         self._cta_public_text = cta_public_text
         self._cta_public_url = cta_public_url
+        # Запрет пересылки/сохранения (protect_content): в личке и/или в канале.
+        self._protect_bot = protect_bot
+        self._protect_public = protect_public
 
     @classmethod
     def from_settings(cls, settings: Settings) -> TelegramPublisher:
@@ -87,6 +92,8 @@ class TelegramPublisher(Publisher):
                 cta_public_text=settings.cta_public_text,
                 cta_public_url=settings.cta_public_url,
                 avito_proxy=settings.avito_proxy,
+                protect_bot=settings.protect_content_bot,
+                protect_public=settings.protect_content_public,
             )
         bot = Bot(
             token=settings.bot_token,
@@ -228,9 +235,12 @@ class TelegramPublisher(Publisher):
         # работает) и грузим байтами. Полноразмер уже получен выше.
         if photos and scored.listing.source == Source.AVITO:
             photos = await self._download_photos(avito_full or photos)
+        # Защита от кражи контента: в личке (платное) — по protect_bot, в канале —
+        # по protect_public (use_custom_emoji=True только в личных чатах).
+        protect = self._protect_bot if use_custom_emoji else self._protect_public
         # Уровни деградации: полный альбом → только первое фото → текст без фото.
         for level in (photos, photos[:1], []):
-            if await self._try_send(channel, text, level, kb):
+            if await self._try_send(channel, text, level, kb, protect=protect):
                 return True
         logger.error("Не удалось отправить пост в %s (все фолбэки исчерпаны)", channel)
         return False
@@ -257,9 +267,16 @@ class TelegramPublisher(Publisher):
         return out
 
     async def _try_send(
-        self, channel: str, text: str, photos: list, kb: InlineKeyboardMarkup
+        self,
+        channel: str,
+        text: str,
+        photos: list,
+        kb: InlineKeyboardMarkup,
+        *,
+        protect: bool = False,
     ) -> bool:
-        """Одна попытка отправки на заданном уровне фолбэка (с учётом флуда)."""
+        """Одна попытка отправки на заданном уровне фолбэка (с учётом флуда).
+        `protect` — запрет пересылки/сохранения (Telegram protect_content)."""
         assert self._bot is not None
         for _ in range(2):  # повтор после ожидания флуд-лимита
             try:
@@ -270,14 +287,18 @@ class TelegramPublisher(Publisher):
                         else InputMediaPhoto(media=url)
                         for i, url in enumerate(photos)
                     ]
-                    await self._bot.send_media_group(chat_id=channel, media=media)
+                    await self._bot.send_media_group(
+                        chat_id=channel, media=media, protect_content=protect
+                    )
                 elif photos and len(text) <= _CAPTION_LIMIT:
                     await self._bot.send_photo(
-                        chat_id=channel, photo=photos[0], caption=text, reply_markup=kb
+                        chat_id=channel, photo=photos[0], caption=text,
+                        reply_markup=kb, protect_content=protect,
                     )
                 else:
                     await self._bot.send_message(
-                        chat_id=channel, text=text, reply_markup=kb, disable_web_page_preview=False
+                        chat_id=channel, text=text, reply_markup=kb,
+                        disable_web_page_preview=False, protect_content=protect,
                     )
                 return True
             except TelegramRetryAfter as exc:
