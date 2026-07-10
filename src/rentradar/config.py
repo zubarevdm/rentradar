@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     bot_token: str = ""
     public_channel: str = ""
     private_channel: str = ""
+    # Годовой OAuth-токен Claude Code (claude setup-token) — для админ-команды /cc.
+    # Пусто = /cc выключен. Работает от подписки Claude.ai, без API-биллинга.
+    claude_token: str = ""
     admin_id: int | None = None  # основной админ (на него шлём системные алерты)
     admin_ids: str = ""  # доп. админы через запятую: "111,222,333"
 

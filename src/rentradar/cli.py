@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import logging
+import subprocess
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -24,6 +26,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from . import ccagent
 from .collectors import AvitoCollector, CianCollector, YandexCollector
 from .collectors.avito import fetch_detail
 from .config import SearchProfile, Settings, load_emoji, load_profiles
@@ -734,6 +737,7 @@ async def _serve(settings: Settings) -> None:
                 """Админ: список админ-команд."""
                 if not _is_admin(message):
                     return
+                cc = "\n/cc &lt;задача&gt; · /cc apply — правки кодом через Claude"
                 await message.answer(
                     "🛠 <b>Админ-команды</b>\n"
                     "/health — состояние системы\n"
@@ -742,7 +746,99 @@ async def _serve(settings: Settings) -> None:
                     "/postnow — опубликовать топ в канал\n"
                     "/pausepublic · /resumepublic — пауза канала\n"
                     "/grant &lt;id&gt; [дней] — выдать подписку"
+                    + (cc if ccagent.is_configured(settings.claude_token) else "")
                 )
+
+            async def _cc_report(message: Message, res: dict) -> None:
+                """Отправить админу отчёт о прогоне /cc."""
+                st = res.get("status")
+                if st == "busy":
+                    await message.answer("⏳ Уже выполняется другая задача /cc — подожди.")
+                elif st == "timeout":
+                    await message.answer("⏱ Claude не уложился в лимит времени, прогон отменён.")
+                elif st == "no_changes":
+                    await message.answer(
+                        "🤖 Claude не внёс изменений.\n\n"
+                        + html.escape((res.get("summary") or "")[:1500])
+                    )
+                elif st == "done":
+                    ok = res.get("pytest_rc") == 0
+                    tests = "✅ прошли" if ok else f"❌ упали (код {res.get('pytest_rc')})"
+                    warn = "" if ok else "\n\n⚠️ Тесты красные — применять НЕ рекомендую."
+                    br = html.escape(res.get("branch", ""))
+                    await message.answer(
+                        f"🤖 <b>Готово</b> · ветка <code>{br}</code>\n\n"
+                        f"{html.escape((res.get('summary') or '')[:1000])}\n\n"
+                        f"📝 Файлов изменено: {res.get('changed')}\n"
+                        f"<pre>{html.escape((res.get('diffstat') or '')[:1200])}</pre>\n"
+                        f"🧪 Тесты: {tests}\n"
+                        f"<pre>{html.escape((res.get('pytest') or '')[:500])}</pre>"
+                        f"💳 ≈${float(res.get('cost') or 0):.3f} (по подписке не списывается)"
+                        f"{warn}\n\n"
+                        "Выкатить на прод: <code>/cc apply</code>"
+                    )
+                else:
+                    await message.answer(
+                        "❌ Ошибка /cc: " + html.escape(str(res.get("msg") or res))[:500]
+                    )
+
+            @dp.message(Command("cc"))
+            async def _cc(message: Message) -> None:
+                """Админ: правки кодом через Claude Code. /cc <задача> · /cc apply."""
+                if not _is_admin(message):
+                    return
+                if not ccagent.is_configured(settings.claude_token):
+                    await message.answer(
+                        "⚙️ /cc не настроен: нет RENTRADAR_CLAUDE_TOKEN или скриптов "
+                        "(команда работает только на сервере)."
+                    )
+                    return
+                parts = (message.text or "").split(maxsplit=1)
+                body = parts[1].strip() if len(parts) > 1 else ""
+
+                if body.lower() == "apply":
+                    await message.answer("⏳ Вливаю ветку в main…")
+                    res = await ccagent.apply()
+                    st = res.get("status")
+                    if st == "applied":
+                        await message.answer(
+                            f"✅ Ветка <code>{html.escape(res.get('branch', ''))}</code> "
+                            "влита в main. Перезапускаю сервис — вернусь через ~10 сек."
+                        )
+                        await asyncio.sleep(1)  # дать сообщению уйти до рестарта
+                        subprocess.Popen(["systemctl", "restart", "rentradar"])
+                    elif st == "nothing":
+                        await message.answer("Нечего применять — сначала /cc &lt;задача&gt;.")
+                    elif st == "conflict":
+                        cbr = html.escape(res.get("branch", ""))
+                        await message.answer(
+                            f"⚠️ Конфликт при вливании <code>{cbr}</code> "
+                            "— нужно разрулить вручную на сервере."
+                        )
+                    else:
+                        emsg = html.escape(str(res.get("msg") or res))[:400]
+                        await message.answer("❌ Не удалось применить: " + emsg)
+                    return
+
+                if not body:
+                    await message.answer(
+                        "Использование:\n<code>/cc задача текстом</code> — Claude сделает "
+                        "правку в ветке и покажет дифф\n"
+                        "<code>/cc apply</code> — выкатить последнюю на прод"
+                    )
+                    return
+
+                await message.answer("🤖 Claude работает над задачей… (обычно 1–3 мин)")
+
+                async def _bg() -> None:
+                    try:
+                        res = await ccagent.run_task(body)
+                        await _cc_report(message, res)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Ошибка /cc")
+                        await message.answer(f"❌ /cc упал: {type(exc).__name__}: {exc}")
+
+                asyncio.create_task(_bg())  # не блокируем поллинг на минуты
 
             asyncio.create_task(startup_jobs())  # параллельно с поллингом
             log.info("Бот на связи: /start /new /myfilters /status /buy · админ: /admin")
