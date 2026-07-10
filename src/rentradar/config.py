@@ -85,8 +85,10 @@ class Settings(BaseSettings):
     free_sends_limit: int = 5
     # Максимум активных фильтров на пользователя.
     max_filters_per_user: int = 3
-    # Окно «свежести» лотов для матчинга, часов.
-    personal_lookback_hours: int = 24
+    # Окно «свежести» лотов для матчинга, часов. 7 суток — чтобы не терять лоты,
+    # которые не попали в предыдущее (более узкое) окно между проверками;
+    # повторной отправки не будет — её отсекает per-user дедуп (content_key).
+    personal_lookback_hours: int = 24 * 7
     # Максимум отправок одному пользователю за одну проверку (антифлуд).
     personal_max_per_check: int = 5
     # Оплата ЮKassa: provider-token из @BotFather (пусто = оплата выключена).
