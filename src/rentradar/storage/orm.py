@@ -63,6 +63,7 @@ class ListingRow(Base):
     commission_pct: Mapped[int | None] = mapped_column(Integer, nullable=True)
     deposit_rub: Mapped[int | None] = mapped_column(Integer, nullable=True)
     meters_included: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    utilities_rub: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Анализ фото (vision)
     renovation: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     has_furniture: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

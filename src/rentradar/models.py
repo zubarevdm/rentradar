@@ -113,6 +113,7 @@ class Listing(BaseModel):
     commission_pct: int | None = Field(default=None, ge=0, description="Комиссия с клиента, %")
     deposit_rub: int | None = Field(default=None, ge=0, description="Залог, ₽")
     meters_included: bool | None = None  # счётчики/коммуналка включены в цену?
+    utilities_rub: int | None = None  # фикс. ЖКУ сверх аренды, ₽/мес (если не включены)
 
     # Анализ фото нейросетью (vision) — заполняется отдельным проходом, кэшируется.
     renovation: str | None = None  # значение Renovation

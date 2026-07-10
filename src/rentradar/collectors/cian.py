@@ -174,6 +174,7 @@ class CianCollector(HttpCollector):
                 commission_pct=_int_or_none(bt.get("clientFee")),
                 deposit_rub=_int_or_none(bt.get("deposit")),
                 meters_included=_meters_included(bt),
+                utilities_rub=_utilities_rub(bt),
                 photos=_photos(offer),
                 contact_hash=_contact_hash(offer),
                 published_at=_published_at(offer),
@@ -275,6 +276,18 @@ def _meters_included(bt: dict) -> bool | None:
     if flag is None:
         return None
     return not bool(flag)
+
+
+def _utilities_rub(bt: dict) -> int | None:
+    """Фикс. сумма ЖКУ сверх аренды, ₽. Циан: utilitiesTerms.price, если не включена
+    в цену (includedInPrice=False) и > 0. Иначе None (нет доплаты или неизвестно)."""
+    ut = bt.get("utilitiesTerms")
+    if not isinstance(ut, dict):
+        return None
+    price = ut.get("price")
+    if isinstance(price, (int, float)) and price > 0 and ut.get("includedInPrice") is False:
+        return int(price)
+    return None
 
 
 # Коды/имена материалов Циан → человекочитаемо.

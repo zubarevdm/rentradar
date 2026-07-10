@@ -98,8 +98,7 @@ def _dedupe_scored(scored: list[ScoredListing]) -> list[ScoredListing]:
 
 
 def _passes_public_gate(scored: ScoredListing, settings: Settings) -> bool:
-    """Пускать ли лот в публичный канал по «красоте». Неанализированные (renovation
-    is None) проходят — чтобы канал не голодал, пока vision не догнал."""
+    """Пускать ли лот в публичный WOW-канал по «красоте»."""
     listing = scored.listing
     # Без vision-проверки в канал не пускаем — иначе скам-оверлей на фото проскочит
     # до анализа (как и случилось). Проверенные лоты имеют analyzed_at.
@@ -109,10 +108,11 @@ def _passes_public_gate(scored: ScoredListing, settings: Settings) -> bool:
         return False
     if listing.renovation in settings.public_block_renovations:
         return False
+    # WOW-порог: канал — витрина, нужен ПОДТВЕРЖДЁННЫЙ красивый интерьер. Неизвестный
+    # appeal (нет фото квартиры — только дом/двор/рендеры) в канал НЕ пускаем.
     return not (
         settings.public_min_appeal
-        and listing.appeal is not None
-        and listing.appeal < settings.public_min_appeal
+        and (listing.appeal is None or listing.appeal < settings.public_min_appeal)
     )
 
 
@@ -566,15 +566,23 @@ async def _serve(settings: Settings) -> None:
                     )
                     continue
                 alert_state.pop("vision", None)  # успех → следующий сбой снова алертнёт
+                # Нет фото самой квартиры (только дом/двор/рендеры) → ремонт и красоту
+                # НЕ определить: renovation/appeal = None. Такой лот пройдёт только под
+                # фильтр «любой» и не попадёт в WOW-канал (appeal неизвестен).
+                no_interior = bool(analysis and analysis.no_interior)
                 best_urls = (
-                    [listing.photos[i] for i in analysis.best_photos] if analysis else []
+                    [listing.photos[i] for i in analysis.best_photos]
+                    if analysis and not no_interior
+                    else []
                 )
+                reno = None if no_interior else (analysis.renovation if analysis else None)
+                appeal = None if no_interior else (analysis.appeal if analysis else None)
                 await storage.save_photo_analysis(
                     listing.source.value,
                     listing.external_id,
-                    renovation=(analysis.renovation if analysis else None),
+                    renovation=reno,
                     has_furniture=(analysis.has_furniture if analysis else None),
-                    appeal=(analysis.appeal if analysis else None),
+                    appeal=appeal,
                     best_photos=best_urls,
                     flagged=bool(analysis and analysis.contact_overlay),
                     analyzed_at=_utcnow(),

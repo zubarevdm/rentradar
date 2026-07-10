@@ -137,9 +137,13 @@ class TelegramPublisher(Publisher):
 
         lines.append("")  # пустая строка — отделяем «что» от «почём»
 
-        # 3) Цена/мес (+ залог, если есть)
-        dep_hint = " (+ залог)" if (listing.deposit_pct or listing.deposit_rub) else ""
-        lines.append(f"{_ce(em, 'price', '💳')} <b>{_money(listing.price)} ₽</b> / мес.{dep_hint}")
+        # 3) Цена/мес + что доплачивать ежемесячно (счётчики / фикс. ЖКУ ₽).
+        # Залог сюда НЕ пишем — он только в строке «Заехать» (разовый, не ежемесячный).
+        util = _utilities_suffix(listing)
+        util_str = f" {util}" if util else ""
+        lines.append(
+            f"{_ce(em, 'price', '💳')} <b>{_money(listing.price)} ₽</b> / мес.{util_str}"
+        )
 
         # 4) Сумма на заезд с расшифровкой
         total = listing.move_in_total
@@ -331,7 +335,8 @@ def _select_photos(listing: Listing, max_photos: int) -> list[str]:
 
 
 def _move_in_breakdown(listing: Listing) -> str:
-    """Расшифровка суммы на заезд: «1-й месяц + 100% залог, без комиссии»."""
+    """Расшифровка разовой суммы на заезд: «1-й месяц + 100% залог, без комиссии».
+    Ежемесячные доплаты (счётчики/ЖКУ) сюда НЕ входят — они в строке цены/мес."""
     parts = "1-й месяц"
     if listing.deposit_pct:
         parts += f" + {listing.deposit_pct}% залог"
@@ -341,9 +346,18 @@ def _move_in_breakdown(listing: Listing) -> str:
         parts += ", без комиссии"
     elif listing.commission_pct:
         parts += f", комиссия {listing.commission_pct}%"
-    if listing.meters_included is False:
-        parts += " + счётчики"
     return parts
+
+
+def _utilities_suffix(listing: Listing) -> str:
+    """Ежемесячные доплаты сверх аренды: фикс. ЖКУ (₽) и/или счётчики. Пусто, если
+    ничего не доплачивать или неизвестно."""
+    bits: list[str] = []
+    if listing.utilities_rub:
+        bits.append(f"+ {_money(listing.utilities_rub)} ₽ ЖКУ")
+    if listing.meters_included is False:
+        bits.append("+ счётчики")
+    return " ".join(bits)
 
 
 # Ремонт (значение Renovation) → подпись для поста.
@@ -365,23 +379,6 @@ def _renovation_line(listing: Listing) -> str | None:
     if listing.appeal is not None:
         line += f" · 👁 {listing.appeal}/100"
     return line
-
-
-def _terms_inline(listing: Listing) -> str | None:
-    """Строка условий «комиссия X% · залог Y%». Если сумму на заезд посчитать
-    нельзя (нет залога), а счётчики сверху — добавляем «+ счётчики» сюда. Иначе
-    «+ счётчики» уходит в строку «Заехать». Пустые поля опускаем → None."""
-    parts: list[str] = []
-    if listing.commission_pct is not None:
-        parts.append(
-            "без комиссии" if listing.commission_pct == 0 else f"комиссия {listing.commission_pct}%"
-        )
-    dep_pct = listing.deposit_pct
-    if dep_pct is not None:
-        parts.append("без залога" if dep_pct == 0 else f"залог {dep_pct}%")
-    if listing.move_in_total is None and listing.meters_included is False:
-        parts.append("+ счётчики")
-    return " · ".join(parts) if parts else None
 
 
 def _first_reason(score: ScoreBreakdown) -> str | None:

@@ -72,8 +72,22 @@ def test_move_in_block(sample_listing: Listing) -> None:
     assert "1-й месяц" in text
     assert "100% залог" in text
     assert "комиссия 50%" in text
-    assert "счётчики" in text
-    assert "(+ залог)" in text  # подсказка в строке цены
+    # Счётчики — в строке цены/мес, НЕ в «Заехать» (ежемесячная доплата, не разовая).
+    assert "/ мес. + счётчики" in text
+    assert "(+ залог)" not in text  # залог только в «Заехать», не в строке цены
+    # Разбивка «Заехать» без счётчиков.
+    move_in_line = next(ln for ln in text.splitlines() if "Заехать" in ln)
+    assert "счётчики" not in move_in_line
+
+
+def test_utilities_rub_in_price_line(sample_listing: Listing) -> None:
+    # Фикс. ЖКУ сверх аренды → «+ N ₽ ЖКУ» в строке цены.
+    scored = ScoredListing(
+        listing=sample_listing.model_copy(update={"price": 40_000, "utilities_rub": 5_500}),
+        score=ScoreBreakdown(total=70.0, signals=[]),
+    )
+    text = TelegramPublisher(dry_run=True).render(scored)
+    assert "+ 5 500 ₽ ЖКУ" in text
 
 
 def test_move_in_block_omitted_without_terms(sample_listing: Listing) -> None:

@@ -75,9 +75,10 @@ _AN = datetime(2026, 6, 27, 12, 0, 0)  # метка «проанализиров
 
 
 def test_public_gate_requires_analyzed_and_renovation(sample_listing: Listing) -> None:
-    s = Settings()  # дефолт: блокируем needs_repair и soviet, требуем analyzed
-    soviet = sample_listing.model_copy(update={"renovation": "soviet", "analyzed_at": _AN})
-    designer = sample_listing.model_copy(update={"renovation": "designer", "analyzed_at": _AN})
+    s = Settings()  # дефолт: блокируем needs_repair/soviet, требуем analyzed, appeal≥75
+    an = {"analyzed_at": _AN, "appeal": 88}  # красивый интерьер, проходит WOW-порог
+    soviet = sample_listing.model_copy(update={"renovation": "soviet", **an})
+    designer = sample_listing.model_copy(update={"renovation": "designer", **an})
     assert _passes_public_gate(_scored(soviet), s) is False  # убитый ремонт
     assert _passes_public_gate(_scored(designer), s) is True
     # Неанализированный (analyzed_at None) в канал НЕ пускаем — скам не проверен.
@@ -98,5 +99,15 @@ def test_public_gate_min_appeal() -> None:
     s = Settings(public_min_appeal=50)
     assert _passes_public_gate(_scored(base.model_copy(update={"appeal": 30})), s) is False
     assert _passes_public_gate(_scored(base.model_copy(update={"appeal": 70})), s) is True
-    # appeal неизвестен → не режем по нему.
-    assert _passes_public_gate(_scored(base), s) is True
+    # appeal неизвестен (нет фото квартиры) → в WOW-канал НЕ пускаем.
+    assert _passes_public_gate(_scored(base), s) is False
+
+
+def test_parse_analysis_no_interior_clears_best() -> None:
+    # Нет фото квартиры (только дом/двор) → best_photos пусто, флаг no_interior.
+    a = parse_analysis(
+        '{"renovation":"unknown","appeal":0,"best_photos":[0,1,2],"no_interior":true}', 5
+    )
+    assert a is not None
+    assert a.no_interior is True
+    assert a.best_photos == []

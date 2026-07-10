@@ -245,7 +245,10 @@ def _area(offer: dict) -> float | None:
 
 
 def _rooms_and_type(offer: dict) -> tuple[int | None, PropertyType]:
-    if offer.get("roomsTotalKey") == "STUDIO":
+    # Яндекс отдаёт ключ студии в РАЗНОМ регистре ("STUDIO" и "studio") — сравниваем
+    # без регистра, иначе студия попадает в UNKNOWN и рендерится как «Квартира».
+    key = str(offer.get("roomsTotalKey") or "").upper()
+    if key == "STUDIO" or offer.get("studio") is True:
         return 0, PropertyType.STUDIO
     rooms = offer.get("roomsTotal")
     if isinstance(rooms, int):

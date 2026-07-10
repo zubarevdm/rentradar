@@ -51,16 +51,22 @@ _PROMPT = (
     "Верни СТРОГО JSON без текста вокруг:\n"
     '{"renovation":"needs_repair|soviet|simple|modern|designer",'
     '"has_furniture":true|false,"appeal":0-100,"best_photos":[индексы 5-7 лучших],'
-    '"contact_overlay":true|false}\n'
+    '"contact_overlay":true|false,"no_interior":true|false}\n'
+    "ВАЖНО: renovation, appeal и best_photos оценивай ТОЛЬКО по фото ИНТЕРЬЕРА самой "
+    "квартиры (комнаты/кухня/санузел). Фасады дома, двор, подъезд, вид из окна, "
+    "рендеры застройщика и планировки — НЕ интерьер: в best_photos их НЕ включай.\n"
+    "no_interior: true, если СРЕДИ ФОТО НЕТ НИ ОДНОГО снимка интерьера квартиры "
+    "(только дом/двор/подъезд/рендеры/планировки). Тогда best_photos=[], "
+    'renovation="unknown", appeal=0.\n'
     "renovation: needs_repair — голые стены/убитое/идёт ремонт; soviet — старый "
     "«бабушкин» ремонт; simple — чистый косметический; modern — свежий евроремонт; "
     "designer — продуманный дизайнерский интерьер.\n"
-    "appeal — насколько фото привлекательны для рекламы (0-100).\n"
+    "appeal — насколько фото ИНТЕРЬЕРА привлекательны для рекламы (0-100).\n"
     "contact_overlay: true, если НА ФОТО есть наложенный текст с призывом связаться вне "
     "площадки (имя+телефон/telegram/вотсап, «пишите собственнику», водяной знак с "
     "контактами) — признак мошенника. Логотип площадки (Avito/Циан) — НЕ contact_overlay.\n"
-    "best_photos — индексы 5-7 самых информативных и красивых кадров, лучшее первым "
-    "(общий вид комнат, кухня, санузел), без размытых/тёмных/дублей. "
+    "best_photos — индексы 5-7 самых информативных и красивых кадров ИНТЕРЬЕРА, лучшее "
+    "первым (общий вид комнат, кухня, санузел), без размытых/тёмных/дублей. "
     "Фото даны по порядку, индексация с 0."
 )
 
@@ -73,6 +79,7 @@ class PhotoAnalysis(BaseModel):
     appeal: int | None = Field(default=None, ge=0, le=100)
     best_photos: list[int] = Field(default_factory=list)
     contact_overlay: bool = False  # текст-призыв связаться вне площадки на фото
+    no_interior: bool = False  # среди фото нет интерьера квартиры (только дом/двор/рендеры)
 
     @field_validator("renovation")
     @classmethod
@@ -109,6 +116,9 @@ def parse_analysis(text: str, n_photos: int) -> PhotoAnalysis | None:
             best.append(i)
         if len(best) >= 7:
             break
+    # Нет интерьера → лучших кадров интерьера нет по определению.
+    if data.get("no_interior"):
+        best = []
     data["best_photos"] = best
     try:
         return PhotoAnalysis.model_validate(data)

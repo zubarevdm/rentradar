@@ -139,3 +139,13 @@ async def test_fetch_raises_on_captcha(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     with pytest.raises(CollectorBlockedError):
         await collector.fetch(SearchProfile(name="t", city="Москва"))
+
+
+def test_studio_lowercase_key() -> None:
+    # Яндекс отдаёт ключ студии в разном регистре — оба должны стать Студией (rooms=0).
+    from rentradar.collectors.yandex import _rooms_and_type
+
+    assert _rooms_and_type({"roomsTotalKey": "studio"}) == (0, PropertyType.STUDIO)
+    assert _rooms_and_type({"roomsTotalKey": "STUDIO"}) == (0, PropertyType.STUDIO)
+    assert _rooms_and_type({"studio": True}) == (0, PropertyType.STUDIO)
+    assert _rooms_and_type({"roomsTotalKey": "2", "roomsTotal": 2}) == (2, PropertyType.FLAT)
