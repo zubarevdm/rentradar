@@ -50,6 +50,8 @@ class TelegramPublisher(Publisher):
         show_renovation: bool = False,
         cta_text: str = "",
         cta_url: str = "",
+        cta_public_text: str = "",
+        cta_public_url: str = "",
         avito_proxy: str = "",
     ) -> None:
         self._dry_run = dry_run
@@ -62,9 +64,11 @@ class TelegramPublisher(Publisher):
         self._emoji = emoji or {}
         # Временно показывать строку оценки ремонта в посте (калибровка).
         self._show_renovation = show_renovation
-        # CTA-ссылка в конце поста (на бота) — для пересылок друзьям.
+        # CTA в конце поста: в канале ведём на бота, в личке — на публичный канал.
         self._cta_text = cta_text
         self._cta_url = cta_url
+        self._cta_public_text = cta_public_text
+        self._cta_public_url = cta_public_url
 
     @classmethod
     def from_settings(cls, settings: Settings) -> TelegramPublisher:
@@ -80,6 +84,8 @@ class TelegramPublisher(Publisher):
                 show_renovation=show_ren,
                 cta_text=settings.cta_text,
                 cta_url=settings.cta_url,
+                cta_public_text=settings.cta_public_text,
+                cta_public_url=settings.cta_public_url,
                 avito_proxy=settings.avito_proxy,
             )
         bot = Bot(
@@ -154,10 +160,13 @@ class TelegramPublisher(Publisher):
                 lines.append("")
                 lines.append(" ".join(tags))
 
-        # 7) CTA на бота — чтобы при пересылке другу легко перейти в FlatLikeThat
-        if self._cta_url:
+        # 7) CTA: в канале → на бота (читатель настроит свой поиск), в личке → на
+        # публичный канал (подписчик увидит общий поток / перешлёт друзьям).
+        cta_url = self._cta_public_url if use_custom_emoji else self._cta_url
+        cta_text = self._cta_public_text if use_custom_emoji else self._cta_text
+        if cta_url:
             lines.append("")
-            lines.append(f'👉 <a href="{self._cta_url}">{self._cta_text}</a>')
+            lines.append(f'👉 <a href="{cta_url}">{cta_text}</a>')
 
         return "\n".join(lines)
 

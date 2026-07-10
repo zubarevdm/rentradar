@@ -246,6 +246,8 @@ async def _serve(settings: Settings) -> None:
             show_renovation=settings.show_renovation_in_post,
             cta_text=settings.cta_text,
             cta_url=settings.cta_url,
+            cta_public_text=settings.cta_public_text,
+            cta_public_url=settings.cta_public_url,
             avito_proxy=settings.avito_proxy,
         )
     else:
@@ -256,6 +258,8 @@ async def _serve(settings: Settings) -> None:
             show_renovation=settings.show_renovation_in_post,
             cta_text=settings.cta_text,
             cta_url=settings.cta_url,
+            cta_public_text=settings.cta_public_text,
+            cta_public_url=settings.cta_public_url,
             avito_proxy=settings.avito_proxy,
         )
 
