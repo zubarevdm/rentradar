@@ -141,9 +141,11 @@ class TelegramPublisher(Publisher):
             if ren_line:
                 lines.append(ren_line)
 
-        # 5) Ссылка на источник — сразу под ценовым блоком, выше хэштегов
-        # (значок площадки: source_cian/source_yandex; иначе 🌐)
-        src_icon = _ce(em, f"source_{listing.source.value}", _ce(em, "link", "🌐"))
+        # 5) Ссылка на источник — сразу под ценовым блоком, выше хэштегов.
+        # Значок площадки: кастом source_<name> в личке; в канале — плоский
+        # (Авито — 🛍, остальные — 🌐). Плоский заодно fallback кастома.
+        plain_src = "🛍" if listing.source == Source.AVITO else "🌐"
+        src_icon = _ce(em, f"source_{listing.source.value}", _ce(em, "link", plain_src))
         lines.append(f'{src_icon} <a href="{listing.url}">Открыть объявление на источнике</a>')
 
         # 6) Хэштеги — только в канале (навигация по постам; в личке не нужны)
