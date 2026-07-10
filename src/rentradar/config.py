@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     # перешлёт друзьям). Пустой URL → строки нет в этом контексте.
     cta_text: str = "FlatLikeThat — найти квартиру"  # в канале → бот
     cta_url: str = "https://t.me/FlatLike_bot"
-    cta_public_text: str = "📢 Больше вариантов — в канале FlatLikeThat"  # в личке → паблик
+    cta_public_text: str = "FlatLikeThat — найти квартиру"  # в личке → паблик (тот же текст)
     cta_public_url: str = "https://t.me/flatslike"
 
     # ── Персональный (платный) бот ─────────────────────────────────────
