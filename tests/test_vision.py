@@ -103,6 +103,19 @@ def test_public_gate_min_appeal() -> None:
     assert _passes_public_gate(_scored(base), s) is False
 
 
+def test_public_gate_max_price() -> None:
+    base = Listing(
+        source="cian", external_id="1", url="http://x", price=170_000, city="Москва",
+        collected_at=_AN, analyzed_at=_AN, appeal=90,
+    )
+    s = Settings(public_max_price=100_000)
+    assert _passes_public_gate(_scored(base), s) is False  # дороже потолка
+    cheap = base.model_copy(update={"price": 60_000})
+    assert _passes_public_gate(_scored(cheap), s) is True
+    # 0 = потолок выключен.
+    assert _passes_public_gate(_scored(base), Settings(public_max_price=0)) is True
+
+
 def test_parse_analysis_no_interior_clears_best() -> None:
     # Нет фото квартиры (только дом/двор) → best_photos пусто, флаг no_interior.
     a = parse_analysis(

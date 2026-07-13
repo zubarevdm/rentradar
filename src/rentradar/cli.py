@@ -108,6 +108,10 @@ def _passes_public_gate(scored: ScoredListing, settings: Settings) -> bool:
         return False
     if listing.renovation in settings.public_block_renovations:
         return False
+    # Потолок цены: за любые деньги квартира почти всегда красива — это не
+    # впечатляет аудиторию, которая ищет оптимальную ПО ЦЕНЕ квартиру.
+    if settings.public_max_price and listing.price > settings.public_max_price:
+        return False
     # WOW-порог: канал — витрина, нужен ПОДТВЕРЖДЁННЫЙ красивый интерьер. Неизвестный
     # appeal (нет фото квартиры — только дом/двор/рендеры) в канал НЕ пускаем.
     return not (
