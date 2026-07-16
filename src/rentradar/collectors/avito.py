@@ -209,12 +209,29 @@ _CATEGORY_PATH = "kvartiry/sdam/na_dlitelnyy_srok-ASgBAgICAkSSA8gQ8AeQUg"
 class AvitoCollector(HttpCollector):
     source_name = Source.AVITO.value
 
-    def __init__(self, *, max_pages: int = 3, min_delay: float = 4.0, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *,
+        max_pages: int = 2,
+        min_delay: float = 6.0,
+        min_interval_sec: float = 0.0,
+        **kwargs: object,
+    ) -> None:
         # Темп помедленнее остальных — у Авито антибот злее.
         super().__init__(min_delay=min_delay, **kwargs)  # type: ignore[arg-type]
         self._max_pages = max_pages
+        # Авито дёргаем не чаще этого (рейт-лимит по IP), даже если общий сбор чаще.
+        self._min_interval_sec = min_interval_sec
+        self._last_fetch_at = 0.0  # monotonic-время последней попытки
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
+        # Гейт частоты: если с прошлой попытки прошло мало времени — пропускаем этот
+        # цикл (возвращаем пусто, не блок), чтобы не долбить Авито и не ловить 429.
+        loop_now = asyncio.get_event_loop().time()
+        if self._min_interval_sec and (loop_now - self._last_fetch_at) < self._min_interval_sec:
+            return []
+        self._last_fetch_at = loop_now
+
         region = REGION_PATH.get(profile.city.strip().lower(), "moskva")
         results: list[RawListing] = []
         for page in range(1, self._max_pages + 1):

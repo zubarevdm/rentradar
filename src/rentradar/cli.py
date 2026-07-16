@@ -188,7 +188,11 @@ def _build_collectors(settings: Settings) -> list:
     return [
         CianCollector(),
         YandexCollector(),
-        AvitoCollector(proxy=settings.avito_proxy or None),
+        AvitoCollector(
+            proxy=settings.avito_proxy or None,
+            max_pages=settings.avito_max_pages,
+            min_interval_sec=settings.avito_collect_interval_min * 60,
+        ),
     ]
 
 
@@ -330,6 +334,14 @@ async def _serve(settings: Settings) -> None:
         при блоке антибота проход прерывается до следующего сбора."""
         if settings.avito_detail_max_per_run <= 0:
             return
+        # Гейт частоты: детальные страницы Авито бьют по тому же IP, что и поиск.
+        # Не чаще avito_collect_interval_min, иначе не выйти из рейт-лимита 429.
+        last_enrich = runtime.get("last_enrich_at")
+        if last_enrich is not None and (
+            (_utcnow() - last_enrich).total_seconds() < settings.avito_collect_interval_min * 60
+        ):
+            return
+        runtime["last_enrich_at"] = _utcnow()
         try:
             since = _utcnow() - timedelta(hours=24)
             cands = await storage.unenriched_listings(
