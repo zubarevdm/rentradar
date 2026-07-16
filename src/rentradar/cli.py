@@ -390,6 +390,9 @@ async def _serve(settings: Settings) -> None:
                 key="job:collect",
                 cooldown_h=1,
             )
+        # После сбора сразу разослать личке: «Сразу»-юзеры получают лот в тот же
+        # момент, как он собрался (в фазе со сбором, без лишнего ожидания тика).
+        await personal_job()
 
     async def public_job() -> None:
         if public_paused["on"]:

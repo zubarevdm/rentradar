@@ -33,7 +33,7 @@ from .store import PersonalStore
 
 logger = logging.getLogger(__name__)
 
-INTERVALS = [5, 15, 30, 60, 180]
+INTERVALS = [5, 15, 30, 60, 180, 1440]  # 5 мин = «Сразу», 1440 = раз в день
 
 # Опции комнат: ключ кнопки → (подпись, какие значения rooms покрывает).
 ROOM_OPTIONS: list[tuple[str, str, list[int]]] = [
@@ -510,7 +510,10 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         await cq.message.edit_text("Без посредников: " + ("да" if nc else "не важно"))
         await state.set_state(NewFilter.interval)
         await cq.message.answer(
-            "Как часто проверять? Выберите интервал:", reply_markup=_kb_intervals()
+            "Как часто присылать новые варианты?\n"
+            "🔔 Сразу — пришлю в момент, как появится (для активного поиска).\n"
+            "Реже — если не хотите частых сообщений.",
+            reply_markup=_kb_intervals(),
         )
         await cq.answer()
 
@@ -676,15 +679,23 @@ def _rooms_label(rooms: list[int]) -> str:
     return ", ".join(parts)
 
 
+def _interval_label(m: int) -> str:
+    if m <= MIN_INTERVAL_MIN:
+        return "🔔 Сразу"
+    if m >= 1440:
+        return "Раз в день"
+    return f"{m} мин" if m < 60 else f"{m // 60} ч"
+
+
 def _kb_intervals() -> InlineKeyboardMarkup:
-    row = [
-        InlineKeyboardButton(
-            text=f"{m} мин" if m < 60 else f"{m // 60} ч", callback_data=f"int:{m}"
-        )
+    buttons = [
+        InlineKeyboardButton(text=_interval_label(m), callback_data=f"int:{m}")
         for m in INTERVALS
         if MIN_INTERVAL_MIN <= m <= MAX_INTERVAL_MIN
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    # По 3 в ряд, чтобы кнопки не сжимались.
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _kb_renovation() -> InlineKeyboardMarkup:
@@ -721,7 +732,7 @@ def _describe(flt: UserFilter) -> str:
         parts.append("ремонт: " + _renovation_filter_label(flt.renovation_min))
     if flt.no_commission:
         parts.append("без посредников")
-    parts.append(f"проверка каждые {flt.clamp_interval()} мин")
+    parts.append("присылаю: " + _interval_label(flt.clamp_interval()).lstrip("🔔 ").lower())
     return "\n".join(parts)
 
 
