@@ -52,12 +52,34 @@ class PersonalDispatcher:
         # приоритет Avito>Cian>Yandex), чтобы не дублировать в личке.
         listings = dedupe_cross_source(listings)
         profile = SearchProfile(name=flt.name, city=flt.city)
+        matched = [lst for lst in listings if matches(lst, flt)]  # newest first
 
-        sent = 0
-        for listing in listings:
-            if sent >= self._settings.personal_max_per_check:
-                break
-            if not matches(listing, flt):
+        # Две дорожки. СВЕЖИЕ (появились с прошлой проверки) идут вперёд и почти без
+        # лимита — их и надо ловить в моменте. Старый БЭКЛОГ досылаем мягко ПОСЛЕ
+        # свежих, чтобы он не задерживал моментальные. Первый прогон (last=None) —
+        # холодный старт: показываем свежайшие N, остальное само станет бэклогом.
+        last = flt.last_checked_at
+        cold = last is None
+        if cold:
+            fresh_cap = self._settings.personal_cold_start_limit
+            backlog_cap = 0
+        else:
+            fresh_cap = self._settings.personal_fresh_max
+            backlog_cap = self._settings.personal_backlog_per_check
+
+        def _is_fresh(lst: object) -> bool:
+            return cold or lst.collected_at > last  # type: ignore[union-attr,operator]
+
+        ordered = sorted(matched, key=lambda lst: not _is_fresh(lst))  # свежие первыми
+
+        sent = sent_fresh = sent_backlog = 0
+        for listing in ordered:
+            fresh = _is_fresh(listing)
+            # Кап дорожки исчерпан — этот лот пропускаем (свежие капом почти не
+            # режутся; бэклог добираем по чуть-чуть).
+            if fresh and sent_fresh >= fresh_cap:
+                continue
+            if not fresh and sent_backlog >= backlog_cap:
                 continue
             content_key = listing.content_key
             if await self._ps.was_sent(flt.user_id, content_key):
@@ -87,7 +109,18 @@ class PersonalDispatcher:
             if not active:
                 await self._ps.increment_free_sends(flt.user_id)
             sent += 1
+            if fresh:
+                sent_fresh += 1
+            else:
+                sent_backlog += 1
 
         if sent:
-            logger.info("user %s filter %s: отправлено %d", flt.user_id, filter_id, sent)
+            logger.info(
+                "user %s filter %s: отправлено %d (свежих %d, бэклог %d)",
+                flt.user_id,
+                filter_id,
+                sent,
+                sent_fresh,
+                sent_backlog,
+            )
         return sent

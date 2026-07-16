@@ -377,4 +377,5 @@ def _row_to_filter(row: UserFilterRow) -> UserFilter:
         no_commission=bool(row.no_commission),
         interval_min=row.interval_min,
         active=bool(row.active),
+        last_checked_at=row.last_checked_at,
     )

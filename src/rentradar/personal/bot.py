@@ -538,11 +538,15 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         since = _utcnow() - timedelta(hours=settings.personal_lookback_hours)
         found = await store.count_new_matches(flt, since)
         if found:
-            tail = f"\n\n🔔 Уже нашёл подходящих: <b>{found}</b> — пришлю в ближайшую минуту."
+            tail = (
+                f"\n\n🔔 Уже нашёл за неделю подходящих: <b>{found}</b>. "
+                "Свежие покажу сразу, остальные пришлю постепенно, а новые, "
+                "как только появятся."
+            )
         else:
             tail = (
-                "\n\n🔍 Пока подходящих вариантов нет — пришлю, как только появятся. "
-                "Если ждёте быстрее, попробуйте расширить критерии (станции, цену, комнаты)."
+                "\n\n🔍 Пока подходящих нет, но как появятся, сразу пришлю. "
+                "Хотите быстрее? Попробуйте расширить критерии: станции, цену, комнаты."
             )
         await cq.message.edit_text("✅ Фильтр сохранён!\n\n" + _describe(flt) + tail)
         await cq.answer("Готово")

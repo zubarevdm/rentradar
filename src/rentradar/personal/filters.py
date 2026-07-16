@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from ..models import Listing, Renovation, _normalize_text
@@ -38,6 +40,9 @@ class UserFilter(BaseModel):
 
     interval_min: int = 30
     active: bool = True
+    # Когда фильтр проверяли в прошлый раз. None = ещё ни разу (холодный старт).
+    # Используется диспетчером, чтобы отличить «свежие» лоты от старого бэклога.
+    last_checked_at: datetime | None = None
 
     def clamp_interval(self) -> int:
         return max(MIN_INTERVAL_MIN, min(MAX_INTERVAL_MIN, self.interval_min))

@@ -30,7 +30,13 @@ class FakePublisher:
         return "post"
 
 
-def _listing(ext: str, *, price: int = 55_000, photos: list[str] | None = None) -> Listing:
+def _listing(
+    ext: str,
+    *,
+    price: int = 55_000,
+    photos: list[str] | None = None,
+    collected: datetime | None = None,
+) -> Listing:
     return Listing(
         source=Source.CIAN,
         external_id=ext,
@@ -46,7 +52,7 @@ def _listing(ext: str, *, price: int = 55_000, photos: list[str] | None = None) 
         metro="Парк культуры",
         metro_distance_min=7,
         photos=["p.jpg"] if photos is None else photos,
-        collected_at=NOW - timedelta(hours=1),
+        collected_at=collected or (NOW - timedelta(hours=1)),
     )
 
 
@@ -62,7 +68,9 @@ async def env(tmp_path):
 def _dispatcher(st, ps, pub, **over):
     settings = Settings(
         free_sends_limit=over.get("free", 3),
-        personal_max_per_check=over.get("max_per_check", 10),
+        personal_cold_start_limit=over.get("cold_start", 12),
+        personal_fresh_max=over.get("fresh_max", 15),
+        personal_backlog_per_check=over.get("backlog", 5),
         personal_lookback_hours=24,
     )
     return PersonalDispatcher(
@@ -94,7 +102,7 @@ async def test_trial_gate_then_subscription(env) -> None:
     await ps.get_or_create_subscriber(200)  # не подписан
     await ps.upsert_filter(UserFilter(user_id=200, rooms=[1], interval_min=5))
     pub = FakePublisher()
-    disp = _dispatcher(st, ps, pub, free=3, max_per_check=10)
+    disp = _dispatcher(st, ps, pub, free=3)
 
     # Триал: только 3 бесплатные отправки.
     assert await disp.run_due(NOW) == 3
@@ -131,3 +139,41 @@ async def test_respects_filter_criteria(env) -> None:
 
     await disp.run_due(NOW)
     assert {s.listing.external_id for _, s in pub.sent} == {"cheap"}
+
+
+async def test_cold_start_shows_burst_then_drains_backlog(env) -> None:
+    # Новый фильтр + 6 лотов из базы: первый прогон показывает cold_start (3),
+    # остальное досылается мягко бэклогом (по 2 за проверку).
+    st, ps = env
+    await st.upsert_listings([_listing(str(i)) for i in range(6)])
+    await ps.get_or_create_subscriber(500)
+    await ps.set_paid_until(500, NOW + timedelta(days=30))
+    await ps.upsert_filter(UserFilter(user_id=500, rooms=[1], interval_min=5))
+    pub = FakePublisher()
+    disp = _dispatcher(st, ps, pub, cold_start=3, backlog=2)
+
+    assert await disp.run_due(NOW) == 3  # холодный старт: свежайшие 3
+    assert await disp.run_due(NOW + timedelta(minutes=6)) == 2  # бэклог по 2
+    assert await disp.run_due(NOW + timedelta(minutes=12)) == 1  # остаток
+    assert await disp.run_due(NOW + timedelta(minutes=18)) == 0  # всё разослано
+
+
+async def test_fresh_not_blocked_by_backlog(env) -> None:
+    # После холодного старта остаётся бэклог. Новый лот, появившийся «в моменте»,
+    # должен уйти сразу, не встав в очередь за старым.
+    st, ps = env
+    await st.upsert_listings([_listing(f"old{i}") for i in range(6)])
+    await ps.get_or_create_subscriber(600)
+    await ps.set_paid_until(600, NOW + timedelta(days=30))
+    await ps.upsert_filter(UserFilter(user_id=600, rooms=[1], interval_min=5))
+    pub = FakePublisher()
+    disp = _dispatcher(st, ps, pub, cold_start=2, backlog=1)
+
+    assert await disp.run_due(NOW) == 2  # холодный старт
+    pub.sent.clear()
+    # Появился свежий лот (собран после последней проверки).
+    await st.upsert_listings([_listing("hot", collected=NOW + timedelta(minutes=3))])
+    sent = await disp.run_due(NOW + timedelta(minutes=6))
+    ids = {s.listing.external_id for _, s in pub.sent}
+    assert "hot" in ids  # свежий ушёл сразу, несмотря на бэклог
+    assert sent >= 1
