@@ -65,7 +65,10 @@ class PersonalDispatcher:
             backlog_cap = 0
         else:
             fresh_cap = self._settings.personal_fresh_max
-            backlog_cap = self._settings.personal_backlog_per_check
+            # «Только новые»: старый бэклог не досылаем вовсе.
+            backlog_cap = (
+                self._settings.personal_backlog_per_check if flt.include_backlog else 0
+            )
 
         def _is_fresh(lst: object) -> bool:
             return cold or lst.collected_at > last  # type: ignore[union-attr,operator]
@@ -73,6 +76,7 @@ class PersonalDispatcher:
         ordered = sorted(matched, key=lambda lst: not _is_fresh(lst))  # свежие первыми
 
         sent = sent_fresh = sent_backlog = 0
+        handled: set[str] = set()  # content_key, которые уже пометили показанными
         for listing in ordered:
             fresh = _is_fresh(listing)
             # Кап дорожки исчерпан — этот лот пропускаем (свежие капом почти не
@@ -96,6 +100,7 @@ class PersonalDispatcher:
             score = await self._scoring.score(listing, profile)
             if not score.is_publishable:  # отсекаем скам/мусор
                 await self._ps.mark_sent(flt.user_id, content_key)
+                handled.add(content_key)
                 continue
 
             ok = await self._publisher.publish(
@@ -104,6 +109,7 @@ class PersonalDispatcher:
                 use_custom_emoji=True,  # личка — можно кастом-эмодзи
             )
             await self._ps.mark_sent(flt.user_id, content_key)
+            handled.add(content_key)
             if not ok:
                 continue
             if not active:
@@ -113,6 +119,13 @@ class PersonalDispatcher:
                 sent_fresh += 1
             else:
                 sent_backlog += 1
+
+        # Режим «только новые» на холодном старте: остальной бэклог помечаем
+        # показанным, чтобы он не капал потом (пользователь выбрал не показывать его).
+        if cold and not flt.include_backlog:
+            for listing in ordered:
+                if listing.content_key not in handled:
+                    await self._ps.mark_sent(flt.user_id, listing.content_key)
 
         if sent:
             logger.info(

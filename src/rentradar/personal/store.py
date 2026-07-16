@@ -356,6 +356,7 @@ def _apply_filter(row: UserFilterRow, flt: UserFilter) -> None:
     row.no_commission = flt.no_commission
     row.interval_min = flt.clamp_interval()
     row.active = flt.active
+    row.include_backlog = flt.include_backlog
 
 
 def _row_to_filter(row: UserFilterRow) -> UserFilter:
@@ -377,5 +378,7 @@ def _row_to_filter(row: UserFilterRow) -> UserFilter:
         no_commission=bool(row.no_commission),
         interval_min=row.interval_min,
         active=bool(row.active),
+        # NULL у старых строк → True (по умолчанию показываем всё).
+        include_backlog=row.include_backlog if row.include_backlog is not None else True,
         last_checked_at=row.last_checked_at,
     )

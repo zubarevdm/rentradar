@@ -80,6 +80,7 @@ class NewFilter(StatesGroup):
     renovation = State()
     no_commission = State()
     interval = State()
+    backlog = State()
 
 
 def build_router(store: PersonalStore, settings: Settings) -> Router:
@@ -519,8 +520,29 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
 
     @router.callback_query(NewFilter.interval, F.data.startswith("int:"))
     async def set_interval(cq: CallbackQuery, state: FSMContext) -> None:
-        data = await state.get_data()
         interval = int(cq.data.split(":", 1)[1])
+        await state.update_data(interval_min=interval)
+        await cq.message.edit_text("Присылаю: " + _interval_label(interval).lstrip("🔔 "))
+        await state.set_state(NewFilter.backlog)
+        await cq.message.answer(
+            "Показывать те, что уже на рынке, или только новые?\n"
+            "📋 Все подходящие: и то, что есть сейчас, и новое.\n"
+            "🔔 Только новые: пару свежих сейчас, дальше лишь то, что появится.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="📋 Все подходящие", callback_data="bl:1"),
+                        InlineKeyboardButton(text="🔔 Только новые", callback_data="bl:0"),
+                    ]
+                ]
+            ),
+        )
+        await cq.answer()
+
+    @router.callback_query(NewFilter.backlog, F.data.startswith("bl:"))
+    async def set_backlog(cq: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        include_backlog = cq.data.split(":", 1)[1] == "1"
         flt = UserFilter(
             user_id=cq.from_user.id,
             city=data.get("city", "Москва"),
@@ -531,17 +553,23 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             max_metro_min=data.get("max_metro_min"),
             renovation_min=data.get("renovation_min"),
             no_commission=data.get("no_commission", False),
-            interval_min=interval,
+            interval_min=data.get("interval_min", 30),
+            include_backlog=include_backlog,
         )
         await store.upsert_filter(flt)
         await state.clear()
         since = _utcnow() - timedelta(hours=settings.personal_lookback_hours)
         found = await store.count_new_matches(flt, since)
-        if found:
+        if found and include_backlog:
             tail = (
                 f"\n\n🔔 Уже нашёл за неделю подходящих: <b>{found}</b>. "
                 "Свежие покажу сразу, остальные пришлю постепенно, а новые, "
                 "как только появятся."
+            )
+        elif found:
+            tail = (
+                f"\n\n🔔 Покажу пару свежих из <b>{found}</b> на рынке, а дальше буду "
+                "присылать только новые, как появятся."
             )
         else:
             tail = (
@@ -737,6 +765,8 @@ def _describe(flt: UserFilter) -> str:
     if flt.no_commission:
         parts.append("без посредников")
     parts.append("присылаю: " + _interval_label(flt.clamp_interval()).lstrip("🔔 ").lower())
+    if not flt.include_backlog:
+        parts.append("режим: только новые")
     return "\n".join(parts)
 
 

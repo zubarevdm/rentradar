@@ -144,6 +144,7 @@ class UserFilterRow(Base):
 
     interval_min: Mapped[int] = mapped_column(Integer, default=30)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_backlog: Mapped[bool] = mapped_column(Boolean, default=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

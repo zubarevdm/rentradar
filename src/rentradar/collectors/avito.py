@@ -264,6 +264,7 @@ class AvitoCollector(HttpCollector):
                 address=c.get("address") or None,
                 metro=c.get("metro"),
                 metro_distance_min=c.get("metro_time_min"),
+                metro_line_color=c.get("metro_color"),
                 floor=floor,
                 floors_total=floors_total,
                 photos=c.get("photos", [])[:10],
@@ -301,9 +302,8 @@ def _extract_card(c: object) -> dict | None:
     title_el = c.css_first("[data-marker='item-title']")  # type: ignore[attr-defined]
     if not iid or title_el is None:
         return None
-    street, house, metro, metro_min = _address_parts(
-        c.css_first("[data-marker='item-address']")  # type: ignore[attr-defined]
-    )
+    addr_el = c.css_first("[data-marker='item-address']")  # type: ignore[attr-defined]
+    street, house, metro, metro_min = _address_parts(addr_el)
     # Промо-карусель наверху выдачи — без адреса. Пропускаем: их content_key
     # вырождается (нет адреса) → ломается дедуп, лоты дублируются в 2 поста.
     if not street and not house:
@@ -319,9 +319,22 @@ def _extract_card(c: object) -> dict | None:
         "address": ", ".join(p for p in (street, house) if p) or None,
         "metro": metro,
         "metro_time_min": metro_min,
+        "metro_color": _metro_line_color(addr_el),
         "photos": _card_photos(c),
         "city": None,
     }
+
+
+# Цвет линии метро у Авито — фон кружка станции: <... style="background-color:#RRGGBB">.
+_METRO_COLOR_RE = re.compile(r"background-color:\s*#([0-9a-fA-F]{6})")
+
+
+def _metro_line_color(addr_el: object) -> str | None:
+    """Hex цвета ветки метро из кружка станции в карточке Авито (первая станция)."""
+    if addr_el is None:
+        return None
+    m = _METRO_COLOR_RE.search(addr_el.html or "")  # type: ignore[attr-defined]
+    return f"#{m.group(1)}" if m else None
 
 
 def _card_photos(c: object) -> list[str]:

@@ -177,3 +177,23 @@ async def test_fresh_not_blocked_by_backlog(env) -> None:
     ids = {s.listing.external_id for _, s in pub.sent}
     assert "hot" in ids  # свежий ушёл сразу, несмотря на бэклог
     assert sent >= 1
+
+
+async def test_only_new_mode_suppresses_backlog(env) -> None:
+    # include_backlog=False: холодный старт показывает cold_start, остальной бэклог
+    # глушим (помечаем показанным) → потом не капает, только новые.
+    st, ps = env
+    await st.upsert_listings([_listing(str(i)) for i in range(6)])
+    await ps.get_or_create_subscriber(700)
+    await ps.set_paid_until(700, NOW + timedelta(days=30))
+    await ps.upsert_filter(
+        UserFilter(user_id=700, rooms=[1], interval_min=5, include_backlog=False)
+    )
+    pub = FakePublisher()
+    disp = _dispatcher(st, ps, pub, cold_start=2, backlog=5)
+
+    assert await disp.run_due(NOW) == 2  # холодный старт: 2
+    assert await disp.run_due(NOW + timedelta(minutes=6)) == 0  # бэклог заглушён
+    # А свежий всё равно придёт.
+    await st.upsert_listings([_listing("hot", collected=NOW + timedelta(minutes=7))])
+    assert await disp.run_due(NOW + timedelta(minutes=12)) == 1
