@@ -91,9 +91,13 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
 
     # ── общие действия (используются и командами, и кнопками меню) ──────
     async def _do_new(message: Message, state: FSMContext, user_id: int, bot: Bot) -> None:
-        # Гейт: настроить поиск можно только с подпиской на канал.
-        if not await _is_subscribed(bot, user_id):
-            await _ask_subscribe(message)
+        # Гейт: настроить поиск можно только с АКТИВНЫМ доступом (бесплатный период
+        # за подписку/рефералов или платная подписка). Нет доступа → зовём получить.
+        if not await store.is_active(user_id, _utcnow()):
+            if not await _is_subscribed(bot, user_id):
+                await _ask_subscribe(message)  # подписка на канал → бесплатный период
+            else:
+                await _ask_upgrade(message)  # период кончился → пригласить/оформить
             return
         existing = await store.list_filters(user_id)
         if len(existing) >= settings.max_filters_per_user:
@@ -211,9 +215,8 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             return
         await message.answer(
             header
-            + "💳 Оплата картой скоро будет подключена.\n"
-            + f"Чтобы {verb} подписку сейчас — напиши администратору "
-            + f"{settings.admin_contact} для ручной активации.\n\n"
+            + f"Чтобы {verb} подписку, напишите администратору "
+            + f"{settings.admin_contact} — активируем доступ вручную.\n\n"
             + price_line,
             disable_web_page_preview=True,
         )
@@ -249,6 +252,18 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             "Подпишитесь и нажмите «Я подписался».",
             reply_markup=_subscribe_kb(),
             disable_web_page_preview=True,
+        )
+
+    async def _ask_upgrade(message: Message) -> None:
+        """Подписан на канал, но бесплатный период кончился — как получить доступ."""
+        await message.answer(
+            "Чтобы настроить поиск, нужен активный доступ, а бесплатный период "
+            "закончился.\n\nКак получить доступ:\n"
+            f"🎁 Пригласите друга — +{settings.referral_activation_days} дн. за каждого, "
+            "кто настроит поиск (кнопка «Пригласить» снизу).\n"
+            f"💳 Или оформите подписку: {settings.sub_price_rub} ₽ / {settings.sub_days} "
+            "дн. (кнопка «Подписка» снизу).",
+            reply_markup=_main_menu(),
         )
 
     async def _welcome_ready(message: Message, name: str, granted: bool) -> None:

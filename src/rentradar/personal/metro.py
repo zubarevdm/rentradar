@@ -11,23 +11,22 @@ import difflib
 from ..models import _normalize_text
 
 
-def suggest_metros(query: str, candidates: list[str], limit: int = 8) -> list[str]:
-    """Станции, подходящие под запрос: сначала подстрока, затем нечёткие (опечатки)."""
+def suggest_metros(query: str, candidates: list[str], limit: int = 6) -> list[str]:
+    """Станции под запрос, компактно и по релевантности: сначала те, что НАЧИНАЮТСЯ
+    с введённого (самое ожидаемое, сокращает ввод), затем подстрока, затем нечёткие
+    (опечатки) — и только если точных мало и запрос от 3 букв. Не спамим всю ветку."""
     q = _normalize_text(query)
     if not q:
         return []
     norm = {c: _normalize_text(c) for c in candidates}
 
-    substring = [c for c in candidates if q in norm[c]]
+    prefix = [c for c in candidates if norm[c].startswith(q)]
+    substring = [c for c in candidates if q in norm[c] and c not in prefix]
+    out: list[str] = [*prefix, *substring]
 
-    # Нечёткое совпадение — ловит опечатки («прафсаюзная» → «Профсоюзная»).
-    close = set(difflib.get_close_matches(q, list(norm.values()), n=limit * 2, cutoff=0.55))
-    fuzzy = [c for c in candidates if norm[c] in close and c not in substring]
+    # Нечёткое (опечатки «прафсаюзная»→«Профсоюзная») — добираем, если точных мало.
+    if len(out) < limit and len(q) >= 3:
+        close = set(difflib.get_close_matches(q, list(norm.values()), n=limit, cutoff=0.6))
+        out.extend(c for c in candidates if norm[c] in close and c not in out)
 
-    out: list[str] = []
-    seen: set[str] = set()
-    for c in (*substring, *fuzzy):
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
     return out[:limit]
