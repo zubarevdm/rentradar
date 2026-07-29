@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -87,7 +88,11 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
     router = Router()
 
     # ── общие действия (используются и командами, и кнопками меню) ──────
-    async def _do_new(message: Message, state: FSMContext, user_id: int) -> None:
+    async def _do_new(message: Message, state: FSMContext, user_id: int, bot: Bot) -> None:
+        # Гейт: настроить поиск можно только с подпиской на канал.
+        if not await _is_subscribed(bot, user_id):
+            await _ask_subscribe(message)
+            return
         existing = await store.list_filters(user_id)
         if len(existing) >= settings.max_filters_per_user:
             await message.answer(
@@ -211,33 +216,88 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             disable_web_page_preview=True,
         )
 
-    # ── онбординг ───────────────────────────────────────────────────────
-    @router.message(CommandStart())
-    async def start(message: Message) -> None:
-        await store.get_or_create_subscriber(
-            message.from_user.id, message.from_user.username
+    # ── обязательная подписка на канал (гейт) ───────────────────────────
+    async def _is_subscribed(bot: Bot, uid: int) -> bool:
+        """Подписан ли пользователь на наш канал. Канал не настроен → гейт выкл."""
+        chan = settings.public_channel
+        if not chan:
+            return True
+        try:
+            member = await bot.get_chat_member(chan, uid)
+            return member.status in ("creator", "administrator", "member", "restricted")
+        except Exception:  # noqa: BLE001 — бот не админ канала / приватный и т.п.
+            return False
+
+    def _subscribe_kb() -> InlineKeyboardMarkup:
+        chan = settings.public_channel
+        url = f"https://t.me/{chan.lstrip('@')}" if chan.startswith("@") else chan
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Открыть канал", url=url)],
+                [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
+            ]
         )
-        # Реферальный диплинк: /start ref_<id>.
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) == 2 and parts[1].startswith("ref_") and parts[1][4:].isdigit():
-            await store.set_referred_by(message.from_user.id, int(parts[1][4:]))
+
+    async def _ask_subscribe(message: Message, name: str = "") -> None:
+        hello = f"Здравствуйте, {html.escape(name)}!\n\n" if name else ""
         await message.answer(
-            "👋 Помогу найти квартиру в Москве, чтобы вы не сидели в лентах сами.\n\n"
-            "Как это устроено:\n"
-            "🔎 вы говорите, что ищете: метро, бюджет, комнаты, ремонт\n"
-            "📲 я смотрю Циан, Яндекс и Авито и, как появится что-то ваше, сразу "
-            "пришлю сюда\n"
-            "⚡️ часто раньше, чем за квартиру возьмётся весь город\n\n"
-            f"Первые <b>{settings.free_sends_limit}</b> вариантов бесплатно, а "
-            "понравится, оформите подписку.\n\n"
-            "Нажмите «🔍 Новый поиск» внизу, это займёт минуту.",
+            f"{hello}Чтобы пользоваться ботом, подпишитесь на наш канал "
+            f"{settings.public_channel}. За подписку дарим "
+            f"<b>{settings.channel_bonus_days} дней</b> бесплатного доступа.\n\n"
+            "Подпишитесь и нажмите «Я подписался».",
+            reply_markup=_subscribe_kb(),
+            disable_web_page_preview=True,
+        )
+
+    async def _welcome_ready(message: Message, name: str, granted: bool) -> None:
+        bonus = (
+            f" Начислили <b>{settings.channel_bonus_days} дней</b> бесплатно."
+            if granted
+            else ""
+        )
+        await message.answer(
+            f"Здравствуйте, {html.escape(name)}!{bonus}\n\n"
+            "Чтобы продолжить, настройте параметры поиска: метро, бюджет, комнаты, "
+            "ремонт.\nНажмите «🔍 Новый поиск» внизу.",
             reply_markup=_main_menu(),
         )
 
+    # ── онбординг ───────────────────────────────────────────────────────
+    @router.message(CommandStart())
+    async def start(message: Message, bot: Bot) -> None:
+        uid = message.from_user.id
+        await store.get_or_create_subscriber(uid, message.from_user.username)
+        # Реферальный диплинк: /start ref_<id>.
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) == 2 and parts[1].startswith("ref_") and parts[1][4:].isdigit():
+            await store.set_referred_by(uid, int(parts[1][4:]))
+        name = message.from_user.first_name or "друг"
+        # Гейт: без подписки на канал ботом не пользуемся (и это даёт бесплатные дни).
+        if not await _is_subscribed(bot, uid):
+            await _ask_subscribe(message, name)
+            return
+        granted = await store.claim_channel_bonus(uid, _utcnow(), settings.channel_bonus_days)
+        await _welcome_ready(message, name, granted)
+
+    @router.callback_query(F.data == "check_sub")
+    async def cb_check_sub(cq: CallbackQuery, bot: Bot) -> None:
+        uid = cq.from_user.id
+        name = cq.from_user.first_name or "друг"
+        if not await _is_subscribed(bot, uid):
+            await cq.answer(
+                "Пока не вижу вашу подписку. Подпишитесь и нажмите ещё раз.",
+                show_alert=True,
+            )
+            return
+        granted = await store.claim_channel_bonus(uid, _utcnow(), settings.channel_bonus_days)
+        await cq.message.edit_text("✅ Доступ открыт, спасибо за подписку!")
+        await _welcome_ready(cq.message, name, granted)
+        await cq.answer()
+
     # ── кнопки меню (регистрируем ДО FSM, чтобы работали и в диалоге) ────
     @router.message(F.text == BTN_NEW)
-    async def btn_new(message: Message, state: FSMContext) -> None:
-        await _do_new(message, state, message.from_user.id)
+    async def btn_new(message: Message, state: FSMContext, bot: Bot) -> None:
+        await _do_new(message, state, message.from_user.id, bot)
 
     @router.message(F.text == BTN_LIST)
     async def btn_list(message: Message) -> None:
@@ -253,8 +313,8 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
 
     # ── команды (дублируют кнопки) ──────────────────────────────────────
     @router.message(Command("new"))
-    async def cmd_new(message: Message, state: FSMContext) -> None:
-        await _do_new(message, state, message.from_user.id)
+    async def cmd_new(message: Message, state: FSMContext, bot: Bot) -> None:
+        await _do_new(message, state, message.from_user.id, bot)
 
     @router.message(Command("myfilters"))
     async def cmd_list(message: Message) -> None:
@@ -581,9 +641,9 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
 
     # ── кнопка «Добавить» / удаление фильтра / оплата ───────────────────
     @router.callback_query(F.data == "new_filter")
-    async def cb_new_filter(cq: CallbackQuery, state: FSMContext) -> None:
+    async def cb_new_filter(cq: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await cq.answer()
-        await _do_new(cq.message, state, cq.from_user.id)
+        await _do_new(cq.message, state, cq.from_user.id, bot)
 
     @router.callback_query(F.data.startswith("del:"))
     async def delete_filter(cq: CallbackQuery) -> None:
