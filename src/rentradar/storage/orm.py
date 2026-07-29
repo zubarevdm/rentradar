@@ -111,7 +111,9 @@ class SubscriberRow(Base):
     paid_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # пауза (заморозка)
     referred_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # кто пригласил
-    referral_credited: Mapped[bool] = mapped_column(Boolean, default=False)  # награда уже начислена
+    # награды рефереру начислены: за оплату / за активацию приглашённого
+    referral_credited: Mapped[bool] = mapped_column(Boolean, default=False)
+    referral_activated: Mapped[bool] = mapped_column(Boolean, default=False)
     # Lifecycle: какие напоминания уже отправлены (чтобы не спамить).
     nudged_trial: Mapped[bool] = mapped_column(Boolean, default=False)
     nudged_expiry: Mapped[bool] = mapped_column(Boolean, default=False)

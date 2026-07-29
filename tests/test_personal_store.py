@@ -206,3 +206,20 @@ async def test_admin_stats(ps: PersonalStore) -> None:
     assert s["trial"] == 1  # #1 (никогда не платил)
     assert s["expired"] == 1  # #3
     assert s["active_filters"] == 1
+
+
+async def test_referral_activation_credit_once(ps: PersonalStore) -> None:
+    now = datetime(2026, 6, 21, 12, 0, 0)
+    await ps.get_or_create_subscriber(100)  # реферер
+    await ps.get_or_create_subscriber(200)  # приглашённый
+    await ps.set_referred_by(200, 100)
+
+    # Приглашённый активировался (настроил поиск) → рефереру +1 день.
+    ref = await ps.credit_referral_activation(200, now, days=1)
+    assert ref == 100
+    assert await ps.is_active(100, now) is True
+    assert await ps.is_active(100, now + timedelta(days=2)) is False
+    # Повторно за активацию не начисляем.
+    assert await ps.credit_referral_activation(200, now, days=1) is None
+    # А награда за ОПЛАТУ — отдельная, её всё ещё можно начислить.
+    assert await ps.credit_referral(200, now, days=7) == 100

@@ -309,6 +309,24 @@ class PersonalStore:
             await session.commit()
             return row.referred_by
 
+    async def credit_referral_activation(
+        self, telegram_id: int, now: datetime, days: int
+    ) -> int | None:
+        """Начислить рефереру +days при АКТИВАЦИИ приглашённого (подписался на канал
+        и настроил первый поиск). Разово. Возвращает id реферера или None."""
+        async with self._session() as session:
+            row = await session.get(SubscriberRow, telegram_id)
+            if row is None or row.referred_by is None or row.referral_activated:
+                return None
+            ref = await session.get(SubscriberRow, row.referred_by)
+            if ref is None:
+                return None
+            base = ref.paid_until if (ref.paid_until and ref.paid_until > now) else now
+            ref.paid_until = base + timedelta(days=days)
+            row.referral_activated = True
+            await session.commit()
+            return row.referred_by
+
     # ── справочник станций из реальных данных ───────────────────────────
     async def distinct_metros(self, city: str) -> list[str]:
         """Уникальные станции метро города из собранных лотов (для подсказок)."""

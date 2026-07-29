@@ -59,6 +59,8 @@ BTN_NEW = "🔍 Новый поиск"
 BTN_LIST = "📋 Мои фильтры"
 BTN_STATUS = "ℹ️ Статус"
 BTN_BUY = "💳 Подписка"
+BTN_INVITE = "🎁 Пригласить"
+BTN_SUPPORT = "🆘 Поддержка"
 
 _METRO_INTRO = (
     "🚇 <b>Метро</b>\n"
@@ -311,6 +313,34 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
     async def btn_buy(message: Message) -> None:
         await _do_buy(message)
 
+    async def _do_invite(message: Message, bot: Bot) -> None:
+        me = await bot.get_me()
+        link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
+        await message.answer(
+            "🎁 <b>Приглашайте друзей и получайте дни бесплатно</b>\n\n"
+            f"Друг перейдёт по вашей ссылке и настроит поиск — вам "
+            f"<b>+{settings.referral_activation_days} дн.</b>\n"
+            f"Друг оформит подписку — вам ещё <b>+{settings.referral_days} дн.</b>\n\n"
+            f"Ваша ссылка:\n{link}",
+            disable_web_page_preview=True,
+        )
+
+    async def _do_support(message: Message) -> None:
+        await message.answer(
+            "🆘 <b>Поддержка</b>\n\n"
+            "Если что-то не работает или есть вопрос, напишите нам: "
+            f"{settings.admin_contact}. Поможем.",
+            disable_web_page_preview=True,
+        )
+
+    @router.message(F.text == BTN_INVITE)
+    async def btn_invite(message: Message, bot: Bot) -> None:
+        await _do_invite(message, bot)
+
+    @router.message(F.text == BTN_SUPPORT)
+    async def btn_support(message: Message) -> None:
+        await _do_support(message)
+
     # ── команды (дублируют кнопки) ──────────────────────────────────────
     @router.message(Command("new"))
     async def cmd_new(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -339,14 +369,11 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
 
     @router.message(Command("invite"))
     async def cmd_invite(message: Message, bot: Bot) -> None:
-        me = await bot.get_me()
-        link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
-        await message.answer(
-            "🎁 <b>Приглашай друзей</b>\n"
-            f"Друг оформит подписку по твоей ссылке — тебе <b>+{settings.referral_days} дней</b>."
-            f"\n\nТвоя ссылка:\n{link}",
-            disable_web_page_preview=True,
-        )
+        await _do_invite(message, bot)
+
+    @router.message(Command("support"))
+    async def cmd_support(message: Message) -> None:
+        await _do_support(message)
 
     @router.message(Command("bonus"))
     async def cmd_bonus(message: Message, bot: Bot) -> None:
@@ -600,7 +627,7 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         await cq.answer()
 
     @router.callback_query(NewFilter.backlog, F.data.startswith("bl:"))
-    async def set_backlog(cq: CallbackQuery, state: FSMContext) -> None:
+    async def set_backlog(cq: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         data = await state.get_data()
         include_backlog = cq.data.split(":", 1)[1] == "1"
         flt = UserFilter(
@@ -616,8 +643,24 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             interval_min=data.get("interval_min", 30),
             include_backlog=include_backlog,
         )
+        first_filter = not await store.list_filters(cq.from_user.id)
         await store.upsert_filter(flt)
         await state.clear()
+        # Активация по реферальной ссылке: первый настроенный поиск → пригласившему
+        # начисляем дни (разово). Это и есть «друг запустил и настроил бота».
+        if first_filter:
+            ref_id = await store.credit_referral_activation(
+                cq.from_user.id, _utcnow(), settings.referral_activation_days
+            )
+            if ref_id:
+                try:
+                    await bot.send_message(
+                        ref_id,
+                        "🎉 Ваш друг настроил поиск по вашей ссылке. Вам "
+                        f"<b>+{settings.referral_activation_days} дн.</b> бесплатно!",
+                    )
+                except Exception:  # noqa: BLE001 — заблокировал бота и т.п.
+                    logger.debug("не уведомил реферера %s об активации", ref_id)
         since = _utcnow() - timedelta(hours=settings.personal_lookback_hours)
         found = await store.count_new_matches(flt, since)
         if found and include_backlog:
@@ -705,6 +748,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_LIST)],
             [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_BUY)],
+            [KeyboardButton(text=BTN_INVITE), KeyboardButton(text=BTN_SUPPORT)],
         ],
         resize_keyboard=True,
         is_persistent=True,
