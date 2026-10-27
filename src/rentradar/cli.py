@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -28,11 +29,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import ccagent
 from .collectors import AvitoCollector, CianCollector, YandexCollector
-from .collectors.avito import fetch_detail
+from .collectors.avito import fetch_detail, set_request_cooldown
 from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .errors import CollectorBlockedError
 from .models import ScoredListing, Source, source_rank
 from .personal import PersonalStore
+from .personal.access import access_of, moscow
 from .personal.bot import build_router
 from .personal.dispatcher import PersonalDispatcher
 from .personal.filters import matches
@@ -50,31 +52,28 @@ def _lifecycle_nudge(
     sub: SubscriberRow, now: datetime, settings: Settings
 ) -> tuple[str | None, str]:
     """Какое напоминание (если есть) отправить подписчику. (kind, текст) или (None, '')."""
-    if sub.paused_at is not None:  # на паузе — не трогаем
+    access = access_of(sub, now, settings.pause_max_days)
+    if access.paused:
         return None, ""
-    pu = sub.paid_until
-    if pu is not None and pu > now:  # подписка активна
-        if not sub.nudged_expiry and (pu - now).days <= settings.lifecycle_expiry_days:
-            days = max(1, (pu - now).days)
-            return "expiry", (
-                f"⏳ Подписка заканчивается через <b>{days} дн.</b>\n"
-                "Продли, чтобы не пропускать свежие варианты — кнопка «💳 Подписка»."
-            )
+    pu = access.until
+    if access.active(now) and pu:
+        # No expiry/winback about a trial while another entitlement continues.
+        if sub.paid_until and not sub.nudged_expiry and (
+            pu - now <= timedelta(days=settings.lifecycle_expiry_days)
+        ):
+            return "expiry", (f"⏳ Доступ действует до {moscow(pu)}.\n"
+                              "Продли доступ — кнопка «💳 Подписка».")
         return None, ""
-    if pu is not None and pu <= now:  # истекла
-        if not sub.nudged_winback and (now - pu).days <= settings.lifecycle_winback_days:
-            return "winback", (
-                "👋 Подписка закончилась, а рынок не стоит — по твоему фильтру "
-                "появляются новые варианты. Вернись: кнопка «💳 Подписка»."
-            )
-        return None, ""
-    # Никогда не платил → триал. Бесплатные кончились — момент для конверсии.
-    if not sub.nudged_trial and sub.free_sends_used >= settings.free_sends_limit:
-        return "trial", (
-            "🔓 Бесплатные показы закончились.\nОформи подписку — и снова буду "
-            "присылать все подходящие варианты первым. Кнопка «💳 Подписка»."
-        )
+    if sub.trial_until and pu == sub.trial_until and pu <= now and not sub.nudged_trial:
+        return "trial", ("Пробные 24 часа закончились. Фильтры сохранены.\n"
+                         "Чтобы продолжить получать варианты, открой «💳 Подписка» "
+                         "или «🎁 Пригласить».")
+    if pu and pu <= now and not sub.nudged_winback and (
+        now - pu <= timedelta(days=settings.lifecycle_winback_days)
+    ):
+        return "winback", "Доступ закончился. Фильтры сохранены. Продлить — «💳 Подписка»."
     return None, ""
+
 
 
 def _dedupe_scored(scored: list[ScoredListing]) -> list[ScoredListing]:
@@ -132,7 +131,7 @@ def _load_profiles_or_warn(settings: Settings) -> list[SearchProfile]:
 
 async def _init_db(settings: Settings) -> None:
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
-    await storage.init()
+    await storage.init(pause_max_days=settings.pause_max_days)
     await storage.dispose()
     log.info("БД инициализирована: %s", settings.db_path)
 
@@ -143,7 +142,7 @@ async def _collect(settings: Settings) -> None:
     if not profiles:
         return
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
-    await storage.init()
+    await storage.init(pause_max_days=settings.pause_max_days)
     collectors = _build_collectors(settings)
     try:
         for profile in profiles:
@@ -174,7 +173,7 @@ async def _collect(settings: Settings) -> None:
 
 async def _recompute_stats(settings: Settings) -> None:
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
-    await storage.init()
+    await storage.init(pause_max_days=settings.pause_max_days)
     try:
         segments = await storage.recompute_market_stats(window_days=settings.market_window_days)
         log.info("Пересчитаны медианы по %d сегментам", segments)
@@ -185,6 +184,7 @@ async def _recompute_stats(settings: Settings) -> None:
 def _build_collectors(settings: Settings) -> list:
     """Все активные коллекторы площадок. Добавление площадки = строка здесь.
     Авито — через прокси (если задан в .env), т.к. на VPS его банят напрямую."""
+    set_request_cooldown(settings.avito_collect_interval_min * 60)
     return [
         CianCollector(),
         YandexCollector(),
@@ -197,7 +197,7 @@ def _build_collectors(settings: Settings) -> list:
 
 
 def _build_pipeline(settings: Settings, storage: SqlStorage) -> tuple[Pipeline, TelegramPublisher]:
-    publisher = TelegramPublisher.from_settings(settings)
+    publisher = TelegramPublisher.from_settings(settings, storage=storage)
     pipeline = Pipeline(
         collectors=_build_collectors(settings),
         storage=storage,
@@ -232,7 +232,7 @@ async def _run(settings: Settings) -> None:
     if not profiles:
         return
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
-    await storage.init()
+    await storage.init(pause_max_days=settings.pause_max_days)
     pipeline, publisher = _build_pipeline(settings, storage)
     try:
         await _run_cycle(storage, pipeline, profiles, settings.market_window_days)
@@ -255,14 +255,20 @@ async def _serve(settings: Settings) -> None:
     if not profiles:
         return
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
-    await storage.init()
+    await storage.init(pause_max_days=settings.pause_max_days)
 
     # Один общий Telegram-бот: и постинг в канал, и личные чаты подписчиков.
     bot: Bot | None = None
     if settings.bot_token and not settings.dry_run:
-        bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        session = AiohttpSession(proxy=settings.telegram_proxy) if settings.telegram_proxy else None
+        bot = Bot(
+            settings.bot_token,
+            session=session,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
         publisher = TelegramPublisher(
             dry_run=False,
+            storage=storage,
             bot=bot,
             max_photos_personal=settings.max_photos_personal,
             max_photos_public=settings.max_photos_public,
@@ -279,6 +285,7 @@ async def _serve(settings: Settings) -> None:
     else:
         publisher = TelegramPublisher(
             dry_run=True,
+            storage=storage,
             max_photos_personal=settings.max_photos_personal,
             max_photos_public=settings.max_photos_public,
             show_renovation=settings.show_renovation_in_post,
@@ -370,8 +377,16 @@ async def _serve(settings: Settings) -> None:
                     description=detail.description,
                     deposit_rub=detail.deposit_rub,
                     commission_pct=detail.commission_pct,
+                    commission_rub=detail.commission_rub,
+                    deposit_due_rub=detail.deposit_due_rub,
+                    deposit_installments=detail.deposit_installments,
+                    upfront_payments=detail.upfront_payments,
+                    utilities_rub=detail.utilities_rub,
+                    utilities_included=detail.utilities_included,
                     meters_included=detail.meters_included,
                     photos=detail.photos,
+                    deposit_present=detail.deposit_present,
+                    commission_present=detail.commission_present,
                 )
                 done += 1
             if done:
@@ -794,7 +809,7 @@ async def _serve(settings: Settings) -> None:
                 await message.answer(
                     "📊 <b>Подписчики</b>\n"
                     f"Всего: {s['subscribers']}\n"
-                    f"Платных активных: {s['paid']} (из них на паузе: {s['paused']})\n"
+                    f"Активный доступ по оплате/бонусам: {s['paid']}; на паузе: {s['paused']}\n"
                     f"На триале: {s['trial']}\n"
                     f"Истёкших: {s['expired']}\n"
                     f"Активных фильтров: {s['active_filters']}"
@@ -812,8 +827,13 @@ async def _serve(settings: Settings) -> None:
                     "/stats — подписчики\n"
                     "/collectnow — собрать сейчас\n"
                     "/postnow — опубликовать топ в канал\n"
+                    "/paid &lt;telegram_id&gt; &lt;24h|3d|7d|30d&gt; "
+                    "&lt;operation_id&gt; — оплата\n"
+                    "operation_id — уникальный номер подтверждения, "
+                    "например pay_20261025_001.\n"
+                    "Повтор вернёт сохранённый результат; для другой оплаты нужен новый номер.\n"
+                    "/grant &lt;telegram_id&gt; [дней] — подарок, без награды за оплату.\n"
                     "/pausepublic · /resumepublic — пауза канала\n"
-                    "/grant &lt;id&gt; [дней] — выдать подписку"
                     + (cc if ccagent.is_configured(settings.claude_token) else "")
                 )
 
@@ -931,7 +951,7 @@ async def _vision_test(settings: Settings) -> None:
         log.error("Vision выключен: задай RENTRADAR_VISION_API_KEY в .env")
         return
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
-    await storage.init()
+    await storage.init(pause_max_days=settings.pause_max_days)
     try:
         since = _utcnow() - timedelta(hours=72)
         listings = await storage.recent_listings("Москва", since)

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -21,6 +22,18 @@ from rentradar.models import (
     Source,
 )
 from rentradar.publisher import TelegramPublisher
+
+
+@pytest.fixture(autouse=True)
+def offline_photos(monkeypatch):
+    # Delivery tests exercise Bot API fallbacks; CDN/image conversion has its
+    # own transport-level tests in test_cian_photo_delivery.py.
+    from aiogram.types import BufferedInputFile
+
+    async def download(self, urls, **kwargs):
+        return [BufferedInputFile(b"jpeg", filename=f"{i}.jpg") for i, _ in enumerate(urls)]
+
+    monkeypatch.setattr(TelegramPublisher, "_download_photos", download)
 
 
 def _bad_request(msg: str) -> TelegramBadRequest:
@@ -41,6 +54,7 @@ class FakeBot:
         self.photo_calls: list[dict] = []
         self.message_calls: list[dict] = []
         self.album_calls: list[dict] = []
+        self.markup_calls: list[dict] = []
 
     async def _maybe_fail(self, kind: str) -> None:
         if kind in self.retry_once and kind not in self._retried:
@@ -57,9 +71,14 @@ class FakeBot:
         await self._maybe_fail("message")
         self.message_calls.append(kwargs)
 
-    async def send_media_group(self, **kwargs: object) -> None:
+    async def send_media_group(self, **kwargs: object) -> list[SimpleNamespace]:
         await self._maybe_fail("album")
         self.album_calls.append(kwargs)
+        return [SimpleNamespace(message_id=i + 100) for i, _ in enumerate(kwargs["media"])]
+
+    async def edit_message_reply_markup(self, **kwargs: object) -> None:
+        await self._maybe_fail("markup")
+        self.markup_calls.append(kwargs)
 
 
 def _scored(*, photos: list[str]) -> ScoredListing:
@@ -156,3 +175,73 @@ async def test_dry_run_returns_true_without_calls() -> None:
     ok = await pub.publish(_scored(photos=["https://img/1.jpg"]), channel="@ch")
     assert ok is True
     assert not bot.photo_calls and not bot.message_calls and not bot.album_calls
+
+
+async def test_personal_album_has_visible_menu_and_source_buttons():
+    bot = FakeBot()
+    pub = TelegramPublisher(dry_run=False, bot=bot)
+    assert await pub.publish(
+        _scored(photos=["a.jpg", "b.jpg"]), channel="42", use_custom_emoji=True
+    )
+    assert len(bot.album_calls) == 1 and len(bot.markup_calls) == 1
+    edit = bot.markup_calls[0]
+    assert edit["message_id"] == 101
+    buttons = [b for row in edit["reply_markup"].inline_keyboard for b in row]
+    assert any(b.callback_data == "nav:menu" for b in buttons)
+    assert any(b.url == "https://cian.ru/1" for b in buttons)
+
+
+async def test_keyboard_failure_does_not_resend_delivered_album():
+    bot = FakeBot(fail={"markup"})
+    pub = TelegramPublisher(dry_run=False, bot=bot)
+    assert await pub.publish(
+        _scored(photos=["a.jpg", "b.jpg"]), channel="42", use_custom_emoji=True
+    )
+    assert len(bot.album_calls) == 1
+    assert not bot.photo_calls and not bot.message_calls
+
+
+async def test_keyboard_flood_retry_does_not_resend_album(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import rentradar.publisher.telegram as tg
+
+    monkeypatch.setattr(tg.asyncio, "sleep", AsyncMock())
+    bot = FakeBot(retry_once={"markup"})
+    pub = TelegramPublisher(dry_run=False, bot=bot)
+    assert await pub.publish(
+        _scored(photos=["a.jpg", "b.jpg"]), channel="42", use_custom_emoji=True
+    )
+    assert len(bot.album_calls) == 1 and len(bot.markup_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "file_name,notice", [("photo-preview.jpg", True), ("photo-large.jpg", False)]
+)
+async def test_original_photo_bytes_are_not_resized_or_recompressed(file_name, notice, monkeypatch):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from aiogram.types import BufferedInputFile
+
+    data = (Path(__file__).parent / "fixtures" / file_name).read_bytes()
+    uploaded = BufferedInputFile(data, filename="photo.jpg")
+    bot = FakeBot()
+    pub = TelegramPublisher(dry_run=False, bot=bot)
+    monkeypatch.setattr(pub, "_download_photos", AsyncMock(return_value=[uploaded]))
+    scored = _scored(photos=["https://img/original.jpg"])
+    scored = scored.model_copy(
+        update={
+            "listing": scored.listing.model_copy(
+                update={
+                    "source": Source.AVITO,
+                    "enriched_at": datetime(2026, 10, 25),
+                }
+            )
+        }
+    )
+    assert await pub.publish(scored, channel="42", use_custom_emoji=True)
+    sent = bot.photo_calls[0]
+    assert sent["photo"].data == data
+    assert ("Полные фото — в объявлении" in sent["caption"]) is notice
+    assert "https://cian.ru/1" in sent["caption"]

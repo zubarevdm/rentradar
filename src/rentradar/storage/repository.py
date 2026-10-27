@@ -13,6 +13,7 @@ from pathlib import Path
 from statistics import median
 
 from sqlalchemy import func, select
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from ..interfaces import MarketStatsProvider, Storage
@@ -35,10 +36,15 @@ class SqlStorage(Storage):
         self._engine: AsyncEngine = create_async_engine(db_url, future=True)
         self._session = async_sessionmaker(self._engine, expire_on_commit=False)
 
-    async def init(self) -> None:
+    async def init(self, *, migration_now: datetime | None = None, pause_max_days: int = 2) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_migrate_add_missing_columns)
+            await conn.run_sync(_migrate_rental_terms)
+            await conn.run_sync(_migrate_walking_metro)
+            await conn.run_sync(
+                lambda connection: _migrate_access(connection, migration_now, pause_max_days)
+            )
 
     async def upsert_listings(self, listings: Sequence[Listing]) -> list[Listing]:
         """Сохранить НОВЫЕ лоты; вернуть их. Дубль определяется по (source,
@@ -58,18 +64,70 @@ class SqlStorage(Storage):
                     )
                 )
                 if row is not None:
-                    # Лот уже известен — но дозаполняем поля, пустые в старой
-                    # строке (собрана кодом без них), если теперь они пришли.
-                    # Иначе лоты, собранные до апдейта парсера, навсегда остаются
-                    # без минут до метро и постятся с «дырой».
-                    if row.metro_distance_min is None and listing.metro_distance_min:
-                        row.metro_distance_min = listing.metro_distance_min
+                    if row.price != listing.price:
+                        row.price = listing.price
+                        row.fingerprint = listing.fingerprint
+                        row.collected_at = listing.collected_at
+                        if listing.source == Source.AVITO:
+                            # An old deposit expressed in monthly rents was
+                            # computed against the previous price. Re-read the
+                            # same detail through the existing bounded queue.
+                            row.deposit_rub = None
+                            row.commission_pct = None
+                            row.commission_rub = None
+                            row.deposit_due_rub = None
+                            row.deposit_installments = False
+                            row.upfront_payments = {}
+                            row.enriched_at = None
+                        else:
+                            # These collectors provide payment fields on each
+                            # search card, so use their current snapshot.
+                            row.deposit_rub = listing.deposit_rub
+                            row.commission_pct = listing.commission_pct
+                            row.commission_rub = listing.commission_rub
+                    # Collectors now guarantee walking minutes for this station.
+                    # Replace even with None: a newly unknown/transport-only time
+                    # must not retain a stale walking value from a previous card.
+                    row.metro = listing.metro
+                    row.metro_distance_min = listing.metro_distance_min
+                    row.metro_line = listing.metro_line
+                    row.metro_line_color = listing.metro_line_color
+                    if listing.photos:
+                        row.photos = listing.photos
+                    if listing.source == Source.AVITO and row.enriched_at is None:
+                        # A repeated search card can add terms even when its price
+                        # did not change. Keep a richer detail snapshot if present.
+                        for field in (
+                            "deposit_rub", "commission_pct", "commission_rub",
+                            "deposit_due_rub", "deposit_installments", "upfront_payments",
+                            "utilities_rub", "utilities_included", "meters_included",
+                            "description",
+                        ):
+                            if field in listing.model_fields_set:
+                                setattr(row, field, getattr(listing, field))
+                    elif listing.source == Source.AVITO:
+                        # Older partial details may have been marked enriched.
+                        # Fresh explicit search fields can fill their missing terms.
+                        if row.deposit_rub is None and listing.deposit_rub is not None:
+                            row.deposit_rub = listing.deposit_rub
+                        if (row.commission_pct is None and row.commission_rub is None
+                                and listing.commission_amount is not None):
+                            row.commission_pct = listing.commission_pct
+                            row.commission_rub = listing.commission_rub
                     continue
                 seen_keys.add(key)
                 session.add(_to_row(listing))
                 new_items.append(listing)
             await session.commit()
         return new_items
+
+    async def get_listing(self, source: str, external_id: str) -> Listing | None:
+        """Read the latest cached conditions before sending a queued candidate."""
+        async with self._session() as session:
+            row = await session.scalar(select(ListingRow).where(
+                ListingRow.source == source, ListingRow.external_id == external_id,
+            ))
+            return _row_to_listing(row) if row is not None else None
 
     async def was_posted(self, fingerprint: str) -> bool:
         async with self._session() as session:
@@ -105,9 +163,7 @@ class SqlStorage(Storage):
             ).scalars()
             return [_row_to_listing(r) for r in rows]
 
-    async def unanalyzed_listings(
-        self, city: str, since: datetime, limit: int
-    ) -> list[Listing]:
+    async def unanalyzed_listings(self, city: str, since: datetime, limit: int) -> list[Listing]:
         """Свежие (по `since`) лоты города, ещё не прошедшие vision-анализ.
         Старейшие сначала — чтобы очередь анализа двигалась честно (FIFO)."""
         async with self._session() as session:
@@ -123,9 +179,7 @@ class SqlStorage(Storage):
             ).scalars()
             return [_row_to_listing(r) for r in rows]
 
-    async def unenriched_listings(
-        self, source: str, since: datetime, limit: int
-    ) -> list[Listing]:
+    async def unenriched_listings(self, source: str, since: datetime, limit: int) -> list[Listing]:
         """Свежие лоты площадки, ещё не дообогащённые с детальной страницы.
         Новейшие сначала — свежак важнее для постинга, хвост догоним позже."""
         async with self._session() as session:
@@ -150,10 +204,24 @@ class SqlStorage(Storage):
         description: str | None = None,
         deposit_rub: int | None = None,
         commission_pct: int | None = None,
+        commission_rub: int | None = None,
+        deposit_due_rub: int | None = None,
+        deposit_installments: bool = False,
+        upfront_payments: dict[str, int | None] | None = None,
+        utilities_rub: int | None = None,
+        utilities_included: bool | None = None,
         meters_included: bool | None = None,
         photos: list[str] | None = None,
+        deposit_present: bool = True,
+        commission_present: bool = True,
     ) -> None:
-        """Записать данные с детальной страницы. None-поля не затирают имеющиеся."""
+        """Save a successfully fetched detail's payment snapshot, including unknowns.
+
+        An explicit unknown payment clears an earlier amount. An absent field in
+        partial detail markup retains the search-card value, including zero.
+        Network failures never call this method.
+        Missing description/photos and utility information retain their old values.
+        """
         async with self._session() as session:
             row = await session.scalar(
                 select(ListingRow)
@@ -164,15 +232,34 @@ class SqlStorage(Storage):
                 return
             if description is not None:
                 row.description = description[:4000]
-            if deposit_rub is not None:
+            if deposit_present:
                 row.deposit_rub = deposit_rub
-            if commission_pct is not None:
+                row.deposit_due_rub = deposit_due_rub
+                row.deposit_installments = deposit_installments
+            # The two representations describe the same payment. A fresh value
+            # must supersede its old representation (including an explicit zero).
+            if commission_present and commission_rub is not None:
+                row.commission_rub = commission_rub
+                row.commission_pct = None
+            elif commission_present:
                 row.commission_pct = commission_pct
+                row.commission_rub = None
+            for field, value in {
+                "utilities_rub": utilities_rub, "utilities_included": utilities_included,
+            }.items():
+                if value is not None:
+                    setattr(row, field, value)
+            row.upfront_payments = upfront_payments or {}
             if meters_included is not None:
                 row.meters_included = meters_included
             if photos:
                 row.photos = photos
-            row.enriched_at = enriched_at
+            incomplete = (
+                (not deposit_present and row.deposit_rub is None)
+                or (not commission_present and row.commission_pct is None
+                    and row.commission_rub is None)
+            )
+            row.enriched_at = None if incomplete else enriched_at
             await session.commit()
 
     async def save_photo_analysis(
@@ -278,7 +365,89 @@ class SqlMarketStatsProvider(MarketStatsProvider):
         return row.sample_size if row else 0
 
 
-def _migrate_add_missing_columns(connection: object) -> None:
+def _migrate_access(connection: Connection, now: datetime | None, pause_max_days: int) -> None:
+    from sqlalchemy import text
+
+    stamp = now or datetime.now(UTC).replace(tzinfo=None)
+    version = "access_20261025"
+    execute = connection.execute
+    if execute(text("SELECT name FROM data_versions WHERE name=:v"), {"v": version}).first():
+        return
+    from ..personal.access import access_of
+    from .orm import SubscriberRow
+
+    # SQLite julianday rounds sub-millisecond dates. Compare typed UTC datetimes
+    # with the same policy as delivery, including frozen remnants at migration.
+    rows = execute(
+        select(SubscriberRow.telegram_id, SubscriberRow.paid_until, SubscriberRow.paused_at)
+    )
+    eligibility = []
+    for uid, paid_until, paused_at in rows:
+        old = SubscriberRow(telegram_id=uid, paid_until=paid_until, paused_at=paused_at)
+        access = access_of(old, stamp, pause_max_days)
+        eligible = not access.active(stamp) and access.frozen_seconds <= 0
+        eligibility.append({"uid": uid, "eligible": eligible})
+    # Explicit backfill: ALTER TABLE does not apply ORM Python defaults.
+    if eligibility:
+        execute(
+            text("UPDATE subscribers SET trial_eligible=:eligible WHERE telegram_id=:uid"),
+            eligibility,
+        )
+    # Existing pause remnants are preserved conservatively, never gifted over.
+    for field in (
+        "free_sends_used",
+        "referral_credited",
+        "referral_activated",
+        "nudged_trial",
+        "nudged_expiry",
+        "nudged_winback",
+        "channel_bonus_claimed",
+    ):
+        execute(text(f'UPDATE subscribers SET "{field}"=0 WHERE "{field}" IS NULL'))
+    execute(text("INSERT INTO data_versions(name) VALUES (:v)"), {"v": version})
+
+
+def _migrate_rental_terms(connection: Connection) -> None:
+    """Reparse legacy Avito details once, within normal enrichment limits.
+
+    Even filled values may be wrong: older extraction confused monthly deposit
+    multiples with rubles and could read recommended cards. Mark those amounts
+    unknown until the fixed parser has successfully read the actual conditions.
+    """
+    from sqlalchemy import text
+
+    version = "rental_terms_v3"
+    if connection.execute(text("SELECT 1 FROM data_versions WHERE name=:v"),
+                          {"v": version}).first():
+        return
+    connection.execute(text(
+        "UPDATE listings SET enriched_at=NULL, deposit_rub=NULL, commission_pct=NULL, "
+        "commission_rub=NULL, deposit_due_rub=NULL, deposit_installments=0, "
+        "upfront_payments='{}' WHERE source='avito'"
+    ))
+    connection.execute(text("INSERT INTO data_versions (name) VALUES (:v)"), {"v": version})
+
+
+def _migrate_walking_metro(connection: Connection) -> None:
+    """Discard legacy minutes whose walking mode/upper bound was not recorded.
+
+    Saved user filters remain intact. Normal collection restores verified values;
+    unknown durations cannot accidentally pass a maximum-time filter meanwhile.
+    """
+    from sqlalchemy import text
+
+    version = "walking_metro_v1"
+    if connection.execute(text("SELECT 1 FROM data_versions WHERE name=:v"),
+                          {"v": version}).first():
+        return
+    connection.execute(text(
+        "UPDATE listings SET metro_distance_min=NULL "
+        "WHERE source IN ('avito', 'cian', 'yandex')"
+    ))
+    connection.execute(text("INSERT INTO data_versions (name) VALUES (:v)"), {"v": version})
+
+
+def _migrate_add_missing_columns(connection: Connection) -> None:
     """Лёгкая миграция SQLite: добавить недостающие колонки в существующие таблицы.
 
     `create_all` не меняет существующие таблицы, поэтому при эволюции схемы старая
@@ -296,8 +465,8 @@ def _migrate_add_missing_columns(connection: object) -> None:
         for column in table.columns:
             if column.name in have:
                 continue
-            col_type = column.type.compile(dialect=connection.dialect)  # type: ignore[attr-defined]
-            connection.execute(  # type: ignore[attr-defined]
+            col_type = column.type.compile(dialect=connection.dialect)
+            connection.execute(
                 text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}')
             )
 
@@ -319,6 +488,7 @@ def _to_row(listing: Listing) -> ListingRow:
         address=listing.address,
         metro=listing.metro,
         metro_distance_min=listing.metro_distance_min,
+        metro_line=listing.metro_line,
         metro_line_color=listing.metro_line_color,
         segment_key=listing.segment_key,
         lat=listing.lat,
@@ -328,8 +498,13 @@ def _to_row(listing: Listing) -> ListingRow:
         building_material=listing.building_material,
         description=listing.description,
         commission_pct=listing.commission_pct,
+        commission_rub=listing.commission_rub,
+        deposit_due_rub=listing.deposit_due_rub,
+        deposit_installments=listing.deposit_installments,
+        upfront_payments=listing.upfront_payments,
         deposit_rub=listing.deposit_rub,
         meters_included=listing.meters_included,
+        utilities_included=listing.utilities_included,
         utilities_rub=listing.utilities_rub,
         renovation=listing.renovation,
         has_furniture=listing.has_furniture,
@@ -361,6 +536,7 @@ def _row_to_listing(row: ListingRow) -> Listing:
         address=row.address,
         metro=row.metro,
         metro_distance_min=row.metro_distance_min,
+        metro_line=row.metro_line,
         metro_line_color=row.metro_line_color,
         lat=row.lat,
         lon=row.lon,
@@ -369,8 +545,13 @@ def _row_to_listing(row: ListingRow) -> Listing:
         building_material=row.building_material,
         description=row.description,
         commission_pct=row.commission_pct,
+        commission_rub=row.commission_rub,
+        deposit_due_rub=row.deposit_due_rub,
+        deposit_installments=bool(row.deposit_installments),
+        upfront_payments=row.upfront_payments or {},
         deposit_rub=row.deposit_rub,
         meters_included=row.meters_included,
+        utilities_included=row.utilities_included,
         utilities_rub=row.utilities_rub,
         renovation=row.renovation,
         has_furniture=row.has_furniture,

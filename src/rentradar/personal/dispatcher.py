@@ -2,8 +2,8 @@
 
 Раз в N минут (по интервалу каждого фильтра) подбирает новые лоты из уже
 собранной БД под критерии пользователя и шлёт в личку. Площадки НЕ дёргаются —
-матчинг идёт по `recent_listings`. Триал-гейт: первые `free_limit` отправок
-бесплатно, дальше нужна активная подписка. Скам отсекается скорингом.
+матчинг идёт по `recent_listings`. Для отправки нужен действующий доступ
+по времени (пробник, оплата или бонусы). Скам отсекается скорингом.
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ class PersonalDispatcher:
         return total
 
     async def _dispatch_one(self, filter_id: int, flt: UserFilter, now: datetime) -> int:
+        if not await self._ps.is_active(flt.user_id, now):
+            return 0
         since = now - timedelta(hours=self._settings.personal_lookback_hours)
         listings = await self._storage.recent_listings(flt.city, since)  # newest first
         # Одна квартира с 2-3 площадок → шлём только одну (дешевле; при равной цене
@@ -76,6 +78,7 @@ class PersonalDispatcher:
         ordered = sorted(matched, key=lambda lst: not _is_fresh(lst))  # свежие первыми
 
         sent = sent_fresh = sent_backlog = 0
+        access_lost = False
         handled: set[str] = set()  # content_key, которые уже пометили показанными
         for listing in ordered:
             fresh = _is_fresh(listing)
@@ -89,13 +92,9 @@ class PersonalDispatcher:
             if await self._ps.was_sent(flt.user_id, content_key):
                 continue
 
-            # Триал-гейт: бесплатные отправки исчерпаны и подписка не активна.
-            active = await self._ps.is_active(flt.user_id, now)
-            if not active:
-                used = await self._ps.free_sends_used(flt.user_id)
-                if used >= self._settings.free_sends_limit:
-                    logger.debug("user %s: триал исчерпан, нужна подписка", flt.user_id)
-                    break
+            if not await self._ps.is_active(flt.user_id, now):
+                access_lost = True
+                break
 
             score = await self._scoring.score(listing, profile)
             if not score.is_publishable:  # отсекаем скам/мусор
@@ -112,8 +111,6 @@ class PersonalDispatcher:
             handled.add(content_key)
             if not ok:
                 continue
-            if not active:
-                await self._ps.increment_free_sends(flt.user_id)
             sent += 1
             if fresh:
                 sent_fresh += 1
@@ -122,7 +119,7 @@ class PersonalDispatcher:
 
         # Режим «только новые» на холодном старте: остальной бэклог помечаем
         # показанным, чтобы он не капал потом (пользователь выбрал не показывать его).
-        if cold and not flt.include_backlog:
+        if cold and not flt.include_backlog and not access_lost:
             for listing in ordered:
                 if listing.content_key not in handled:
                     await self._ps.mark_sent(flt.user_id, listing.content_key)

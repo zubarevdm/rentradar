@@ -99,6 +99,7 @@ class Listing(BaseModel):
     address: str | None = None
     metro: str | None = None
     metro_distance_min: int | None = Field(default=None, ge=0)
+    metro_line: str | None = None  # canonical route number, e.g. 7 or D4
     metro_line_color: str | None = None  # hex цвета линии (для кружка в посте)
 
     lat: float | None = None
@@ -111,8 +112,13 @@ class Listing(BaseModel):
 
     # Условия заезда (для «суммы на заезд» в посте).
     commission_pct: int | None = Field(default=None, ge=0, description="Комиссия с клиента, %")
+    commission_rub: int | None = Field(default=None, ge=0)
+    deposit_due_rub: int | None = Field(default=None, ge=0)
+    deposit_installments: bool = False
+    upfront_payments: dict[str, int | None] = Field(default_factory=dict)
     deposit_rub: int | None = Field(default=None, ge=0, description="Залог, ₽")
     meters_included: bool | None = None  # счётчики/коммуналка включены в цену?
+    utilities_included: bool | None = None
     utilities_rub: int | None = None  # фикс. ЖКУ сверх аренды, ₽/мес (если не включены)
 
     # Анализ фото нейросетью (vision) — заполняется отдельным проходом, кэшируется.
@@ -158,10 +164,25 @@ class Listing(BaseModel):
         Считается только когда известны И комиссия, И залог — иначе цифра врала бы
         (например, у Яндекса залог обычно не указан).
         """
-        if self.commission_pct is None or self.deposit_rub is None:
+        if self.commission_amount is None or self.deposit_due is None:
             return None
-        commission = round(self.price * self.commission_pct / 100)
-        return self.price + commission + self.deposit_rub
+        if any(v is None for v in self.upfront_payments.values()):
+            return None
+        return (self.price + self.commission_amount + self.deposit_due
+                + sum(v for v in self.upfront_payments.values() if v is not None))
+
+    @property
+    def commission_amount(self) -> int | None:
+        if self.commission_rub is not None:
+            return self.commission_rub
+        return (round(self.price * self.commission_pct / 100)
+                if self.commission_pct is not None else None)
+
+    @property
+    def deposit_due(self) -> int | None:
+        if self.deposit_due_rub is not None:
+            return self.deposit_due_rub
+        return None if self.deposit_installments else self.deposit_rub
 
     @property
     def fingerprint(self) -> str:

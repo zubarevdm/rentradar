@@ -6,12 +6,17 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import AsyncIterator, Collection
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..storage import SqlStorage
-from ..storage.orm import ListingRow, SubscriberRow, UserFilterRow, UserSentRow
+from ..storage.orm import ListingRow, ManualPaymentRow, SubscriberRow, UserFilterRow, UserSentRow
+from .access import TARIFFS, Access, access_of, add_hours, normalize_pause, utcnow
 from .filters import UserFilter, matches
 
 
@@ -26,33 +31,41 @@ class PersonalStore:
         listings = await self._storage.recent_listings(flt.city, since)
         cnt = 0
         for listing in listings:
-            if matches(listing, flt) and not await self.was_sent(
-                flt.user_id, listing.content_key
-            ):
+            if matches(listing, flt) and not await self.was_sent(flt.user_id, listing.content_key):
                 cnt += 1
         return cnt
 
     # ── фильтры ─────────────────────────────────────────────────────────
-    async def upsert_filter(self, flt: UserFilter, filter_id: int | None = None) -> int:
-        async with self._session() as session:
-            row = (
-                await session.get(UserFilterRow, filter_id) if filter_id is not None else None
-            )
+    async def upsert_filter(
+        self, flt: UserFilter, filter_id: int | None = None, *, now: datetime | None = None
+    ) -> int:
+        saved_id, _ = await self.save_filter(flt, filter_id, now=now)
+        return saved_id
+
+    async def save_filter(
+        self, flt: UserFilter, filter_id: int | None = None, *, now: datetime | None = None
+    ) -> tuple[int, int | None]:
+        """Save and activate atomically; return a referrer to notify after commit."""
+        async with self._write() as session:
+            row = await session.get(UserFilterRow, filter_id) if filter_id is not None else None
             if row is None:
                 row = UserFilterRow(user_id=flt.user_id)
                 session.add(row)
             _apply_filter(row, flt)
             await session.flush()
             new_id = row.id
-            await session.commit()
-            return new_id
+            subscriber = await session.get(SubscriberRow, flt.user_id)
+            ref_id = (
+                await self._activation(session, subscriber, now or utcnow())
+                if subscriber is not None
+                else None
+            )
+            return new_id, ref_id
 
     async def list_filters(self, user_id: int) -> list[tuple[int, UserFilter]]:
         async with self._session() as session:
             rows = (
-                await session.execute(
-                    select(UserFilterRow).where(UserFilterRow.user_id == user_id)
-                )
+                await session.execute(select(UserFilterRow).where(UserFilterRow.user_id == user_id))
             ).scalars()
             return [(r.id, _row_to_filter(r)) for r in rows]
 
@@ -74,9 +87,7 @@ class PersonalStore:
         """Активные фильтры, у которых прошёл их интервал с последней проверки."""
         async with self._session() as session:
             rows = (
-                await session.execute(
-                    select(UserFilterRow).where(UserFilterRow.active.is_(True))
-                )
+                await session.execute(select(UserFilterRow).where(UserFilterRow.active.is_(True)))
             ).scalars()
             due: list[tuple[int, UserFilter]] = []
             for r in rows:
@@ -93,53 +104,31 @@ class PersonalStore:
         кому-то нужны (для адресного запуска vision)."""
         async with self._session() as session:
             rows = (
-                await session.execute(
-                    select(UserFilterRow).where(UserFilterRow.active.is_(True))
-                )
+                await session.execute(select(UserFilterRow).where(UserFilterRow.active.is_(True)))
             ).scalars()
             return [_row_to_filter(r) for r in rows]
 
     async def admin_stats(self, now: datetime) -> dict[str, int]:
-        """Сводка для админской команды /stats: подписчики и фильтры."""
+        rows = await self.lifecycle_candidates()
+        states = [access_of(r, now, self._pause_max) for r in rows]
         async with self._session() as session:
-            total = await session.scalar(
-                select(func.count()).select_from(SubscriberRow)
-            ) or 0
-            paid = await session.scalar(
-                select(func.count())
-                .select_from(SubscriberRow)
-                .where(SubscriberRow.paid_until.is_not(None))
-                .where(SubscriberRow.paid_until > now)
-            ) or 0
-            paused = await session.scalar(
-                select(func.count())
-                .select_from(SubscriberRow)
-                .where(SubscriberRow.paused_at.is_not(None))
-            ) or 0
-            trial = await session.scalar(
-                select(func.count())
-                .select_from(SubscriberRow)
-                .where(SubscriberRow.paid_until.is_(None))
-            ) or 0
-            expired = await session.scalar(
-                select(func.count())
-                .select_from(SubscriberRow)
-                .where(SubscriberRow.paid_until.is_not(None))
-                .where(SubscriberRow.paid_until <= now)
-            ) or 0
-            active_filters = await session.scalar(
-                select(func.count())
-                .select_from(UserFilterRow)
-                .where(UserFilterRow.active.is_(True))
-            ) or 0
-        # paid + trial + expired = subscribers; paused — оверлей (подмножество paid).
+            filters = (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(UserFilterRow)
+                    .where(UserFilterRow.active.is_(True))
+                )
+                or 0
+            )
         return {
-            "subscribers": total,
-            "paid": paid,
-            "trial": trial,
-            "expired": expired,
-            "paused": paused,
-            "active_filters": active_filters,
+            "subscribers": len(rows),
+            "paid": sum(
+                a.active(now) and not (a.trial_until and a.trial_until > now) for a in states
+            ),
+            "trial": sum(bool(a.trial_until and a.trial_until > now) for a in states),
+            "paused": sum(a.paused for a in states),
+            "expired": sum(not a.active(now) for a in states),
+            "active_filters": filters,
         }
 
     async def touch_filter(self, filter_id: int, now: datetime) -> None:
@@ -150,44 +139,48 @@ class PersonalStore:
                 await session.commit()
 
     # ── подписка / триал ────────────────────────────────────────────────
-    async def get_or_create_subscriber(
-        self, telegram_id: int, username: str | None = None
-    ) -> SubscriberRow:
+    @asynccontextmanager
+    async def _write(self) -> AsyncIterator[AsyncSession]:
+        # SQLite serializes the entire read/modify/write operation across processes.
         async with self._session() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                yield session
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
+
+    async def get_or_create_subscriber(
+        self, telegram_id: int, username: str | None = None, *, referred_by: int | None = None
+    ) -> SubscriberRow:
+        async with self._write() as session:
             row = await session.get(SubscriberRow, telegram_id)
             if row is None:
-                row = SubscriberRow(telegram_id=telegram_id, username=username)
+                ref = (
+                    await session.get(SubscriberRow, referred_by)
+                    if referred_by and 0 < referred_by < 2**63 and referred_by != telegram_id
+                    else None
+                )
+                row = SubscriberRow(
+                    telegram_id=telegram_id,
+                    username=username,
+                    referred_by=ref.telegram_id if ref else None,
+                )
                 session.add(row)
-                await session.commit()
-                row = await session.get(SubscriberRow, telegram_id)
-            assert row is not None
+                await session.flush()
             return row
 
-    async def is_active(self, telegram_id: int, now: datetime) -> bool:
-        """Подписка действует: оплачена, не истекла и НЕ на паузе. Если пауза длится
-        дольше лимита — авто-возобновляем (добавляем замороженные дни)."""
+    async def access(self, telegram_id: int, now: datetime) -> Access:
         async with self._session() as session:
             row = await session.get(SubscriberRow, telegram_id)
-            if row is None:
-                return False
-            if row.paused_at is not None:
-                cap = timedelta(days=self._pause_max)
-                if now - row.paused_at >= cap:  # пауза выдохлась → возобновляем
-                    row.paid_until = (row.paid_until or now) + cap
-                    row.paused_at = None
-                    await session.commit()
-            active = row.paused_at is None and row.paid_until is not None
-            return bool(active and row.paid_until > now)
+            return access_of(row, now, self._pause_max) if row else Access(None, None, False)
+
+    async def is_active(self, telegram_id: int, now: datetime) -> bool:
+        return (await self.access(telegram_id, now)).active(now)
 
     async def is_paused(self, telegram_id: int, now: datetime) -> bool:
-        """На паузе и лимит паузы ещё не вышел."""
-        async with self._session() as session:
-            row = await session.get(SubscriberRow, telegram_id)
-            return bool(
-                row
-                and row.paused_at is not None
-                and now - row.paused_at < timedelta(days=self._pause_max)
-            )
+        return (await self.access(telegram_id, now)).paused
 
     async def paid_until_of(self, telegram_id: int) -> datetime | None:
         async with self._session() as session:
@@ -195,7 +188,6 @@ class PersonalStore:
             return row.paid_until if row else None
 
     async def frozen_days_left(self, telegram_id: int) -> int:
-        """Сколько оплаченных дней заморожено на паузе (для показа в статусе)."""
         async with self._session() as session:
             row = await session.get(SubscriberRow, telegram_id)
             if row and row.paused_at and row.paid_until:
@@ -203,26 +195,34 @@ class PersonalStore:
             return 0
 
     async def pause(self, telegram_id: int, now: datetime) -> bool:
-        """Поставить активную подписку на паузу (заморозить дни). True — если поставили."""
-        async with self._session() as session:
+        async with self._write() as session:
             row = await session.get(SubscriberRow, telegram_id)
-            if row and row.paused_at is None and row.paid_until and row.paid_until > now:
-                row.paused_at = now
-                await session.commit()
-                return True
-            return False
+            if row is None:
+                return False
+            normalize_pause(row, now, self._pause_max)
+            if row.paused_at is not None or row.paid_until is None or row.paid_until <= now:
+                return False
+            # Deferred paid time starts after trial; never freeze the trial itself.
+            remaining = row.paid_until - max(now, row.access_starts_at or now)
+            if remaining <= timedelta(0):
+                return False
+            row.paid_until = now + remaining
+            row.access_starts_at = None
+            row.paused_at = now
+            return True
 
     async def resume(self, telegram_id: int, now: datetime) -> bool:
-        """Снять с паузы: вернуть замороженные дни (не более лимита). True — если сняли."""
-        async with self._session() as session:
+        async with self._write() as session:
             row = await session.get(SubscriberRow, telegram_id)
-            if row and row.paused_at is not None:
-                frozen = min(now - row.paused_at, timedelta(days=self._pause_max))
-                row.paid_until = (row.paid_until or now) + frozen
-                row.paused_at = None
-                await session.commit()
-                return True
-            return False
+            if row is None or row.paused_at is None:
+                return False
+            frozen = min(now - row.paused_at, timedelta(days=self._pause_max))
+            resumed_at = row.paused_at + frozen
+            remaining = max(timedelta(0), (row.paid_until or row.paused_at) - row.paused_at)
+            row.access_starts_at = max(resumed_at, row.trial_until or resumed_at)
+            row.paid_until = row.access_starts_at + remaining
+            row.paused_at = None
+            return True
 
     async def free_sends_used(self, telegram_id: int) -> int:
         async with self._session() as session:
@@ -267,65 +267,111 @@ class PersonalStore:
                 setattr(row, attr, True)
                 await session.commit()
 
-    async def claim_channel_bonus(self, telegram_id: int, now: datetime, days: int) -> bool:
-        """Разово начислить бонус за подписку на канал. False, если уже получал."""
-        async with self._session() as session:
+    async def verify_channel(self, telegram_id: int, now: datetime) -> bool:
+        """Call only after successful membership verification (or explicit dev mode)."""
+        granted, _ = await self.verify_channel_with_reward(telegram_id, now)
+        return granted
+
+    async def verify_channel_with_reward(
+        self, telegram_id: int, now: datetime
+    ) -> tuple[bool, int | None]:
+        async with self._write() as session:
             row = await session.get(SubscriberRow, telegram_id)
             if row is None:
                 row = SubscriberRow(telegram_id=telegram_id)
                 session.add(row)
-            if row.channel_bonus_claimed:
-                return False
-            base = row.paid_until if (row.paid_until and row.paid_until > now) else now
-            row.paid_until = base + timedelta(days=days)
-            row.channel_bonus_claimed = True
-            await session.commit()
-            return True
+                await session.flush()
+            row.channel_verified_at = row.channel_verified_at or now
+            granted = bool(row.trial_eligible and row.trial_until is None)
+            if granted:
+                normalize_pause(row, now, self._pause_max)
+                row.trial_until = now + timedelta(hours=24)
+                row.trial_eligible = False
+                row.channel_bonus_claimed = True
+                row.nudged_trial = False
+                if row.paused_at is None and row.paid_until and row.paid_until > now:
+                    remaining = row.paid_until - max(now, row.access_starts_at or now)
+                    row.access_starts_at = row.trial_until
+                    row.paid_until = row.trial_until + remaining
+            ref_id = await self._activation(session, row, now)
+            return granted, ref_id
 
-    # ── реферальная программа ───────────────────────────────────────────
-    async def set_referred_by(self, telegram_id: int, referrer_id: int) -> None:
-        """Запомнить, кто пригласил (только при первом /start и не сам себя)."""
-        if referrer_id == telegram_id:
-            return
-        async with self._session() as session:
+    async def grant_hours(self, telegram_id: int, now: datetime, hours: float) -> datetime:
+        if hours <= 0:
+            raise ValueError("Срок должен быть положительным")
+        async with self._write() as session:
             row = await session.get(SubscriberRow, telegram_id)
-            if row is not None and row.referred_by is None and row.free_sends_used == 0:
-                row.referred_by = referrer_id
-                await session.commit()
+            if row is None:
+                raise ValueError("Пользователь не найден: сначала нужен /start")
+            add_hours(row, now, hours, self._pause_max)
+            assert row.paid_until is not None
+            return row.paid_until
 
-    async def credit_referral(self, telegram_id: int, now: datetime, days: int) -> int | None:
-        """Начислить рефереру +days при первой оплате приглашённого. Возвращает id
-        реферера (чтобы уведомить) или None, если начислять некому/уже начислено."""
-        async with self._session() as session:
+    async def confirm_payment(
+        self,
+        telegram_id: int,
+        tariff: str,
+        operation_id: str,
+        admin_id: int,
+        admins: Collection[int],
+        now: datetime,
+    ) -> ManualPaymentRow:
+        if admin_id not in admins:
+            raise PermissionError("Только для администратора")
+        if tariff not in TARIFFS:
+            raise ValueError("Неизвестный тариф")
+        if telegram_id <= 0 or not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", operation_id):
+            raise ValueError("Некорректный ID пользователя или операции")
+        plan = TARIFFS[tariff]
+        async with self._write() as session:
+            previous = await session.get(ManualPaymentRow, operation_id)
+            if previous:
+                if previous.user_id != telegram_id or previous.tariff != tariff:
+                    raise ValueError("Этот operation_id уже использован для другой оплаты")
+                return previous
             row = await session.get(SubscriberRow, telegram_id)
-            if row is None or row.referred_by is None or row.referral_credited:
-                return None
-            ref = await session.get(SubscriberRow, row.referred_by)
-            if ref is None:
-                return None
-            base = ref.paid_until if (ref.paid_until and ref.paid_until > now) else now
-            ref.paid_until = base + timedelta(days=days)
-            row.referral_credited = True
-            await session.commit()
-            return row.referred_by
+            if row is None:
+                raise ValueError("Пользователь не найден: сначала нужен /start")
+            add_hours(row, now, plan.hours, self._pause_max)
+            ref_id = None
+            if row.referred_by is not None and not row.referral_credited:
+                ref = await session.get(SubscriberRow, row.referred_by)
+                if ref is not None:
+                    add_hours(ref, now, 48, self._pause_max)
+                    row.referral_credited = True
+                    ref_id = ref.telegram_id
+            assert row.paid_until is not None
+            payment = ManualPaymentRow(
+                operation_id=operation_id,
+                user_id=telegram_id,
+                tariff=tariff,
+                admin_id=admin_id,
+                price_rub=plan.price,
+                hours=plan.hours,
+                confirmed_at=now,
+                result_until=row.paid_until,
+                referrer_id=ref_id,
+            )
+            session.add(payment)
+            await session.flush()
+            return payment
 
-    async def credit_referral_activation(
-        self, telegram_id: int, now: datetime, days: int
+    async def _activation(
+        self, session: AsyncSession, row: SubscriberRow, now: datetime
     ) -> int | None:
-        """Начислить рефереру +days при АКТИВАЦИИ приглашённого (подписался на канал
-        и настроил первый поиск). Разово. Возвращает id реферера или None."""
-        async with self._session() as session:
-            row = await session.get(SubscriberRow, telegram_id)
-            if row is None or row.referred_by is None or row.referral_activated:
-                return None
-            ref = await session.get(SubscriberRow, row.referred_by)
-            if ref is None:
-                return None
-            base = ref.paid_until if (ref.paid_until and ref.paid_until > now) else now
-            ref.paid_until = base + timedelta(days=days)
-            row.referral_activated = True
-            await session.commit()
-            return row.referred_by
+        if row.referred_by is None or row.referral_activated or not row.channel_verified_at:
+            return None
+        has_filter = await session.scalar(
+            select(UserFilterRow.id).where(UserFilterRow.user_id == row.telegram_id).limit(1)
+        )
+        if has_filter is None:
+            return None
+        ref = await session.get(SubscriberRow, row.referred_by)
+        if ref is None:
+            return None
+        add_hours(ref, now, 12, self._pause_max)
+        row.referral_activated = True
+        return ref.telegram_id
 
     # ── справочник станций из реальных данных ───────────────────────────
     async def distinct_metros(self, city: str) -> list[str]:

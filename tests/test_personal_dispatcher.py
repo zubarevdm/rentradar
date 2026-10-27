@@ -98,19 +98,25 @@ async def test_sends_matches_and_dedups(env) -> None:
 
 async def test_trial_gate_then_subscription(env) -> None:
     st, ps = env
-    await st.upsert_listings([_listing(str(i)) for i in range(5)])
+    await st.upsert_listings([_listing(str(i)) for i in range(8)])
     await ps.get_or_create_subscriber(200)  # не подписан
     await ps.upsert_filter(UserFilter(user_id=200, rooms=[1], interval_min=5))
     pub = FakePublisher()
     disp = _dispatcher(st, ps, pub, free=3)
 
-    # Триал: только 3 бесплатные отправки.
-    assert await disp.run_due(NOW) == 3
-    assert await ps.free_sends_used(200) == 3
-
-    # Оформляем подписку → остальные 2 доезжают.
-    await ps.set_paid_until(200, NOW + timedelta(days=30))
-    assert await disp.run_due(NOW + timedelta(minutes=6)) == 2
+    # Until successful verification even unused legacy sends give no access.
+    assert await disp.run_due(NOW) == 0
+    assert not await ps.was_sent(200, _listing("0").content_key)
+    await ps.verify_channel(200, NOW)
+    assert await disp.run_due(NOW + timedelta(minutes=6)) == 5
+    assert await disp.run_due(NOW + timedelta(minutes=12)) == 3
+    assert await ps.free_sends_used(200) == 0
+    await st.upsert_listings(
+        [_listing("new").model_copy(update={"collected_at": NOW + timedelta(hours=25)})]
+    )
+    assert await disp.run_due(NOW + timedelta(hours=25)) == 0
+    await ps.grant_hours(200, NOW + timedelta(hours=25), 2)
+    assert await disp.run_due(NOW + timedelta(hours=25, minutes=6)) == 1
 
 
 async def test_scam_filtered_not_sent(env) -> None:
@@ -197,3 +203,17 @@ async def test_only_new_mode_suppresses_backlog(env) -> None:
     # А свежий всё равно придёт.
     await st.upsert_listings([_listing("hot", collected=NOW + timedelta(minutes=7))])
     assert await disp.run_due(NOW + timedelta(minutes=12)) == 1
+
+
+async def test_access_lost_does_not_acknowledge_cold_backlog(env, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    st, ps = env
+    listing = _listing("lost")
+    await st.upsert_listings([listing])
+    await ps.get_or_create_subscriber(900)
+    await ps.upsert_filter(UserFilter(user_id=900, include_backlog=False))
+    # A pause between the first gate and the per-listing gate.
+    monkeypatch.setattr(ps, "is_active", AsyncMock(side_effect=[True, False]))
+    assert await _dispatcher(st, ps, FakePublisher()).run_due(NOW) == 0
+    assert not await ps.was_sent(900, listing.content_key)

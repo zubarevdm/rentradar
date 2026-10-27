@@ -29,7 +29,7 @@ def _sub(**kw: object) -> SubscriberRow:
 def test_expiry_soon() -> None:
     kind, text = _lifecycle_nudge(_sub(paid_until=NOW + timedelta(days=2)), NOW, S)
     assert kind == "expiry"
-    assert "2 дн" in text
+    assert "23.06.2026 15:00 МСК" in text
 
 
 def test_active_far_from_expiry_silent() -> None:
@@ -45,11 +45,11 @@ def test_winback_window_passed() -> None:
 
 
 def test_trial_exhausted() -> None:
-    assert _lifecycle_nudge(_sub(free_sends_used=5), NOW, S)[0] == "trial"
+    assert _lifecycle_nudge(_sub(trial_until=NOW), NOW, S)[0] == "trial"
 
 
 def test_trial_not_exhausted_silent() -> None:
-    assert _lifecycle_nudge(_sub(free_sends_used=2), NOW, S)[0] is None
+    assert _lifecycle_nudge(_sub(trial_until=NOW + timedelta(hours=1)), NOW, S)[0] is None
 
 
 def test_paused_never_nudged() -> None:

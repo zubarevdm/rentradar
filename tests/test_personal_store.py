@@ -100,39 +100,33 @@ async def test_pause_auto_resume_after_cap(ps: PersonalStore) -> None:
     after = now + timedelta(days=13)
     assert await ps.is_active(9, after) is True
     assert await ps.is_paused(9, after) is False
-    assert await ps.paid_until_of(9) == now + timedelta(days=32)
+    assert (await ps.access(9, after)).until == now + timedelta(days=32)
 
 
-async def test_channel_bonus_once(ps: PersonalStore) -> None:
-    now = datetime(2026, 6, 21, 12, 0, 0)
+async def test_trial_once(ps: PersonalStore) -> None:
+    now = datetime(2026, 6, 21, 12)
     await ps.get_or_create_subscriber(11)
-    assert await ps.claim_channel_bonus(11, now, days=7) is True
-    assert await ps.is_active(11, now) is True
-    assert await ps.is_active(11, now + timedelta(days=8)) is False
-    # Повторно — нельзя.
-    assert await ps.claim_channel_bonus(11, now, days=7) is False
+    assert not await ps.is_active(11, now)
+    assert await ps.verify_channel(11, now)
+    assert await ps.is_active(11, now + timedelta(hours=23, minutes=59))
+    assert not await ps.is_active(11, now + timedelta(hours=24))
+    assert not await ps.verify_channel(11, now + timedelta(days=3))
 
 
 async def test_referral_credit_once(ps: PersonalStore) -> None:
-    now = datetime(2026, 6, 21, 12, 0, 0)
-    await ps.get_or_create_subscriber(100)  # реферер
-    await ps.get_or_create_subscriber(200)  # приглашённый
-    await ps.set_referred_by(200, 100)
-
-    # Приглашённый оплатил → рефереру +7 дней (с нуля).
-    ref = await ps.credit_referral(200, now, days=7)
-    assert ref == 100
-    assert await ps.is_active(100, now) is True
-    assert await ps.is_active(100, now + timedelta(days=8)) is False
-
-    # Повторно не начисляем.
-    assert await ps.credit_referral(200, now, days=7) is None
+    now = datetime(2026, 6, 21, 12)
+    await ps.get_or_create_subscriber(100)
+    await ps.get_or_create_subscriber(200, referred_by=100)
+    result = await ps.confirm_payment(200, "24h", "first", 9, [9], now)
+    assert result.referrer_id == 100
+    assert await ps.paid_until_of(100) == now + timedelta(hours=48)
+    await ps.confirm_payment(200, "7d", "second", 9, [9], now)
+    assert await ps.paid_until_of(100) == now + timedelta(hours=48)
 
 
 async def test_referral_no_self_invite(ps: PersonalStore) -> None:
-    await ps.get_or_create_subscriber(300)
-    await ps.set_referred_by(300, 300)  # сам себя — игнор
-    assert await ps.credit_referral(300, datetime(2026, 6, 21), days=7) is None
+    row = await ps.get_or_create_subscriber(300, referred_by=300)
+    assert row.referred_by is None
 
 
 async def test_payment_resets_lifecycle_flags(ps: PersonalStore) -> None:
@@ -191,7 +185,8 @@ async def test_recent_listings_roundtrip(storage: SqlStorage) -> None:
 # ── админ-статистика ─────────────────────────────────────────────────────────
 async def test_admin_stats(ps: PersonalStore) -> None:
     now = datetime(2026, 7, 9, 12, 0, 0)
-    await ps.get_or_create_subscriber(1)  # триал (не платил)
+    await ps.get_or_create_subscriber(1)
+    await ps.verify_channel(1, now)
     await ps.get_or_create_subscriber(2)
     await ps.set_paid_until(2, now + timedelta(days=10))  # платный активный
     await ps.pause(2, now)  # его же на паузу (пауза только для активной подписки)
@@ -201,25 +196,24 @@ async def test_admin_stats(ps: PersonalStore) -> None:
 
     s = await ps.admin_stats(now)
     assert s["subscribers"] == 3
-    assert s["paid"] == 1  # только #2 активен
+    assert s["paid"] == 0  # оплата #2 на паузе, доступ даёт только триал #1
     assert s["paused"] == 1  # #2
     assert s["trial"] == 1  # #1 (никогда не платил)
-    assert s["expired"] == 1  # #3
+    assert s["expired"] == 2  # #2 на паузе и #3 без доступа
     assert s["active_filters"] == 1
 
 
 async def test_referral_activation_credit_once(ps: PersonalStore) -> None:
-    now = datetime(2026, 6, 21, 12, 0, 0)
-    await ps.get_or_create_subscriber(100)  # реферер
-    await ps.get_or_create_subscriber(200)  # приглашённый
-    await ps.set_referred_by(200, 100)
-
-    # Приглашённый активировался (настроил поиск) → рефереру +1 день.
-    ref = await ps.credit_referral_activation(200, now, days=1)
-    assert ref == 100
-    assert await ps.is_active(100, now) is True
-    assert await ps.is_active(100, now + timedelta(days=2)) is False
-    # Повторно за активацию не начисляем.
-    assert await ps.credit_referral_activation(200, now, days=1) is None
-    # А награда за ОПЛАТУ — отдельная, её всё ещё можно начислить.
-    assert await ps.credit_referral(200, now, days=7) == 100
+    now = datetime(2026, 6, 21, 12)
+    await ps.get_or_create_subscriber(100)
+    await ps.get_or_create_subscriber(200, referred_by=100)
+    await ps.verify_channel(200, now)
+    assert await ps.paid_until_of(100) is None
+    fid = await ps.upsert_filter(UserFilter(user_id=200), now=now)
+    assert await ps.paid_until_of(100) == now + timedelta(hours=12)
+    await ps.upsert_filter(UserFilter(user_id=200), now=now)
+    await ps.delete_filter(fid, 200)
+    await ps.upsert_filter(UserFilter(user_id=200), now=now)
+    assert await ps.paid_until_of(100) == now + timedelta(hours=12)
+    await ps.confirm_payment(200, "24h", "payment", 9, [9], now)
+    assert await ps.paid_until_of(100) == now + timedelta(hours=60)

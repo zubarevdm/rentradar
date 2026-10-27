@@ -88,7 +88,8 @@ def test_parse_detail_extracts_all_fields() -> None:
     d = parse_detail(html, price=50_000)
     assert d.photos == ["https://img.example/1.jpg"]
     assert d.deposit_rub == 50000
-    assert d.commission_pct == 80
+    assert d.commission_rub == 40000
+    assert d.commission_pct is None
     assert "Сдаётся уютная квартира." in (d.description or "")
     assert "От собственника." in (d.description or "")
 

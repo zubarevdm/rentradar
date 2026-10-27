@@ -50,6 +50,7 @@ class ListingRow(Base):
     address: Mapped[str | None] = mapped_column(String(512), nullable=True)
     metro: Mapped[str | None] = mapped_column(String(128), nullable=True)
     metro_distance_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metro_line: Mapped[str | None] = mapped_column(String(16), nullable=True)
     metro_line_color: Mapped[str | None] = mapped_column(String(16), nullable=True)
     segment_key: Mapped[str] = mapped_column(String(256), index=True)
     content_key: Mapped[str] = mapped_column(String(24), index=True)
@@ -61,8 +62,13 @@ class ListingRow(Base):
     building_material: Mapped[str | None] = mapped_column(String(64), nullable=True)
     description: Mapped[str | None] = mapped_column(String(4000), nullable=True)
     commission_pct: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    commission_rub: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    deposit_due_rub: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    deposit_installments: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    upfront_payments: Mapped[dict[str, int | None] | None] = mapped_column(JSON, nullable=True)
     deposit_rub: Mapped[int | None] = mapped_column(Integer, nullable=True)
     meters_included: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    utilities_included: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     utilities_rub: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Анализ фото (vision)
     renovation: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
@@ -101,7 +107,7 @@ class PostedRow(Base):
 
 
 class SubscriberRow(Base):
-    """Подписчик персонального бота: триал-счётчик + статус оплаты."""
+    """Подписчик: пробник, общий остаток оплаты/бонусов и исторические флаги."""
 
     __tablename__ = "subscribers"
 
@@ -119,7 +125,29 @@ class SubscriberRow(Base):
     nudged_expiry: Mapped[bool] = mapped_column(Boolean, default=False)
     nudged_winback: Mapped[bool] = mapped_column(Boolean, default=False)
     channel_bonus_claimed: Mapped[bool] = mapped_column(Boolean, default=False)  # бонус за канал
+    trial_eligible: Mapped[bool] = mapped_column(Boolean, default=True)
+    trial_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    channel_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    access_starts_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DataVersionRow(Base):
+    __tablename__ = "data_versions"
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+
+class ManualPaymentRow(Base):
+    __tablename__ = "manual_payments"
+    operation_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer)
+    admin_id: Mapped[int] = mapped_column(Integer)
+    tariff: Mapped[str] = mapped_column(String(8))
+    price_rub: Mapped[int] = mapped_column(Integer)
+    hours: Mapped[int] = mapped_column(Integer)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime)
+    result_until: Mapped[datetime] = mapped_column(DateTime)
+    referrer_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class UserFilterRow(Base):

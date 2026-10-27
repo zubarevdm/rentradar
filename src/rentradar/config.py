@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     )
 
     bot_token: str = ""
+    telegram_proxy: str = ""
     public_channel: str = ""
     private_channel: str = ""
     # Годовой OAuth-токен Claude Code (claude setup-token) — для админ-команды /cc.
@@ -94,7 +95,7 @@ class Settings(BaseSettings):
     cta_public_url: str = "https://t.me/flatslike"
 
     # ── Персональный (платный) бот ─────────────────────────────────────
-    # Бесплатных отправок до пайвола.
+    # Устаревшая настройка: не даёт доступ. Триал — 24 часа после проверки канала.
     free_sends_limit: int = 5
     # Максимум активных фильтров на пользователя.
     max_filters_per_user: int = 3
@@ -119,21 +120,20 @@ class Settings(BaseSettings):
     # по умолчанию выключено — включай, только если защита важнее виральности.
     protect_content_bot: bool = True
     protect_content_public: bool = False
-    # Оплата ЮKassa: provider-token из @BotFather (пусто = оплата выключена).
+    # Legacy provider-token: новый сценарий всегда использует ручную оплату.
     yookassa_provider_token: str = ""
-    # Контакт админа для ручной активации подписки (пока оплата картой не подключена).
+    # Контакт поддержки и ручной активации подписки.
     admin_contact: str = "@ol1nn4"
-    # Цена подписки, ₽, и срок, дней.
-    sub_price_rub: int = 499
+    # Legacy-настройки, не используются каталогом personal.access.TARIFFS.
+    sub_price_rub: int = 590
     sub_days: int = 30
-    # Сколько дней получает пригласивший, когда приглашённый ОПЛАТИЛ подписку.
-    referral_days: int = 7
-    # Сколько дней получает пригласивший, когда приглашённый АКТИВИРОВАЛСЯ (подписался
-    # на канал и настроил первый поиск). Скромно — действие лёгкое, защита от фарма.
-    referral_activation_days: int = 1
+    # Legacy: актуальная награда за первую подтверждённую оплату — 48 часов.
+    referral_days: int = 2
+    # Legacy: актуальная награда за активацию — 12 часов, без округления до дня.
+    referral_activation_days: float = 0.5
     # Максимум дней паузы (заморозки) подписки — потом авто-возобновление.
     pause_max_days: int = 2
-    # Разовый бонус за подписку на публичный канал, дней.
+    # Legacy: отдельный бонус отменён; единый пробник — ровно 24 часа.
     channel_bonus_days: int = 1
     # Lifecycle: за сколько дней до конца подписки напомнить; сколько дней после
     # истечения слать win-back. Час суточного прогона напоминаний (MSK).

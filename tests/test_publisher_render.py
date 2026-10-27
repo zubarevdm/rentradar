@@ -20,9 +20,7 @@ def test_render_contains_key_fields(sample_listing: Listing) -> None:
 
 
 def test_render_cta_link(sample_listing: Listing) -> None:
-    pub = TelegramPublisher(
-        dry_run=True, cta_text="FlatLikeThat — найти", cta_url="https://t.me/x"
-    )
+    pub = TelegramPublisher(dry_run=True, cta_text="FlatLikeThat — найти", cta_url="https://t.me/x")
     scored = ScoredListing(listing=sample_listing, score=ScoreBreakdown(total=70.0, signals=[]))
     text = pub.render(scored)
     assert '<a href="https://t.me/x">FlatLikeThat — найти</a>' in text
@@ -43,9 +41,7 @@ def test_render_omits_tasty_line_without_data(sample_listing: Listing) -> None:
                 SignalScore(
                     name="below_market", value=0.5, weight=0.45, detail="нет рыночных данных"
                 ),
-                SignalScore(
-                    name="price_per_m2", value=0.5, weight=0.25, detail="нет данных ₽/м²"
-                ),
+                SignalScore(name="price_per_m2", value=0.5, weight=0.25, detail="нет данных ₽/м²"),
             ],
         ),
     )
@@ -68,15 +64,15 @@ def test_move_in_block(sample_listing: Listing) -> None:
         score=ScoreBreakdown(total=70.0, signals=[]),
     )
     text = TelegramPublisher(dry_run=True).render(scored)
-    assert "Заехать: 125 000 ₽" in text
-    assert "1-й месяц" in text
-    assert "100% залог" in text
-    assert "комиссия 50%" in text
+    assert "При заезде: 125 000 ₽" in text
+    assert "первый месяц 50 000 ₽" in text
+    assert "залог 50 000 ₽" in text
+    assert "комиссия 25 000 ₽" in text
     # Счётчики — в строке цены/мес, НЕ в «Заехать» (ежемесячная доплата, не разовая).
-    assert "/ мес. + счётчики" in text
+    assert "/ мес. счётчики оплачиваются отдельно" in text
     assert "(+ залог)" not in text  # залог только в «Заехать», не в строке цены
     # Разбивка «Заехать» без счётчиков.
-    move_in_line = next(ln for ln in text.splitlines() if "Заехать" in ln)
+    move_in_line = next(ln for ln in text.splitlines() if "При заезде" in ln)
     assert "счётчики" not in move_in_line
 
 
@@ -96,7 +92,7 @@ def test_move_in_block_omitted_without_terms(sample_listing: Listing) -> None:
         ScoredListing(listing=sample_listing, score=ScoreBreakdown(total=70.0, signals=[]))
     )
     assert "Заехать" not in text
-    assert "комиссия" not in text
+    assert "Не указаны: залог, комиссия" in text
 
 
 def test_renovation_line_shown_when_enabled(sample_listing: Listing) -> None:

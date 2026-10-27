@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from math import ceil, isfinite
 
 from ..config import SearchProfile
 from ..models import (
@@ -252,11 +253,15 @@ def _metro(geo: dict) -> tuple[str | None, int | None, str | None]:
     undergrounds = geo.get("undergrounds") or []
     if not undergrounds:
         return None, None, None
-    # Берём ближайшее пешком, иначе первое.
+    # Поле metro_distance_min используется как время ПЕШКОМ во всех фильтрах
+    # и подписях. У транспортного метро сохраняем станцию, но не его минуты.
     walk = [u for u in undergrounds if u.get("transportType") == "walk"]
     chosen = (walk or undergrounds)[0]
     line = chosen.get("lineColor") or chosen.get("color")
-    return chosen.get("name"), chosen.get("time"), line
+    value = chosen.get("time") if walk else None
+    minutes = (ceil(value) if isinstance(value, (int, float))
+               and not isinstance(value, bool) and isfinite(value) and value >= 0 else None)
+    return chosen.get("name"), minutes, line
 
 
 def _int_or_none(value: object) -> int | None:

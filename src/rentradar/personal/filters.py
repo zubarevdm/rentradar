@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..models import Listing, Renovation, _normalize_text
 from ..text_signals import looks_like_agent
+from .metro import station_matches
 
 # Допустимые интервалы опроса (минуты) — от частого (платно) к редкому.
 MIN_INTERVAL_MIN = 5
@@ -76,10 +77,11 @@ def matches(listing: Listing, flt: UserFilter, *, ignore_renovation: bool = Fals
     if flt.area_max is not None and (listing.area is None or listing.area > flt.area_max):
         return False
 
-    if flt.metros:
-        wanted = {_norm(m) for m in flt.metros}
-        if listing.metro is None or _norm(listing.metro) not in wanted:
-            return False
+    if flt.metros and (listing.metro is None or not any(
+        station_matches(m, listing.metro, listing.metro_line, listing.metro_line_color)
+        for m in flt.metros
+    )):
+        return False
 
     if flt.districts:
         wanted = {_norm(d) for d in flt.districts}
@@ -103,7 +105,7 @@ def matches(listing: Listing, flt: UserFilter, *, ignore_renovation: bool = Fals
     # тоже агент (даже если комиссия «0»). Неизвестная комиссия (None) допускается,
     # если текст чистый — иначе отсеяли бы весь Авито (у него комиссии нет в данных).
     if flt.no_commission:
-        if listing.commission_pct is not None and listing.commission_pct > 0:
+        if listing.commission_amount is not None and listing.commission_amount > 0:
             return False
         if looks_like_agent(listing.description):
             return False

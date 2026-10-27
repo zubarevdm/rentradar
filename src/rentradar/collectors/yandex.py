@@ -16,6 +16,7 @@ import json
 import logging
 import re
 from datetime import UTC, datetime
+from math import ceil, isfinite
 
 from ..config import SearchProfile
 from ..errors import CollectorBlockedError
@@ -278,7 +279,14 @@ def _metro(location: dict) -> tuple[str | None, int | None]:
         return None, None
     # Время считаем только для пешей доступности — иначе оно вводит в заблуждение.
     if metro.get("metroTransport") == "ON_FOOT":
-        return name, _int_or_none(metro.get("timeToMetro") or metro.get("minTimeToMetro"))
+        # Для диапазона нужна верхняя граница, иначе «от 5 минут» ошибочно
+        # проходит фильтр «до 5». Явный ноль не заменяем другим значением.
+        value = metro.get("maxTimeToMetro")
+        if value is None:
+            value = metro.get("timeToMetro")
+        minutes = (ceil(value) if isinstance(value, (int, float))
+                   and not isinstance(value, bool) and isfinite(value) and value >= 0 else None)
+        return name, minutes
     return name, None
 
 
