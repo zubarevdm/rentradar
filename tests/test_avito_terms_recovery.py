@@ -86,8 +86,11 @@ async def test_failed_fetch_is_not_claimed_to_be_missing_in_ad(sample_listing, m
         ScoredListing(listing=listing, score=ScoreBreakdown(total=70)), channel="test",
     )
     caption = bot.message_calls[0]["text"]
-    assert "Авито временно не отдал условия аренды" in caption
-    assert "Не указаны: залог" not in caption and "<b>При заезде:" not in caption
+    # Not «не указаны»: the author may have stated them, we just could not read them.
+    move_in = next(line for line in caption.splitlines() if "При заезде" in line)
+    assert "залог и комиссия — в объявлении" in move_in
+    assert "не указан" not in move_in and "<b>При заезде:" not in caption
+    assert "Авито" not in caption  # no internal fetch details in the post
 
 
 async def test_partial_detail_remains_eligible_for_enrichment(storage, sample_listing):

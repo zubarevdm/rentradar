@@ -122,6 +122,7 @@ class SubscriberRow(Base):
     referral_activated: Mapped[bool] = mapped_column(Boolean, default=False)
     # Lifecycle: какие напоминания уже отправлены (чтобы не спамить).
     nudged_trial: Mapped[bool] = mapped_column(Boolean, default=False)
+    nudged_trial_soon: Mapped[bool | None] = mapped_column(Boolean, default=False, nullable=True)
     nudged_expiry: Mapped[bool] = mapped_column(Boolean, default=False)
     nudged_winback: Mapped[bool] = mapped_column(Boolean, default=False)
     channel_bonus_claimed: Mapped[bool] = mapped_column(Boolean, default=False)  # бонус за канал
@@ -189,3 +190,6 @@ class UserSentRow(Base):
     user_id: Mapped[int] = mapped_column(Integer, index=True)
     content_key: Mapped[str] = mapped_column(String(24), index=True)
     sent_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # Реально доставлено (а не отсеяно скорингом/помечено пропущенным бэклогом).
+    # NULL у строк до миграции — «неизвестно», в счётчики доставок не входят.
+    delivered: Mapped[bool | None] = mapped_column(Boolean, default=False, nullable=True)

@@ -78,7 +78,7 @@ def matches(listing: Listing, flt: UserFilter, *, ignore_renovation: bool = Fals
         return False
 
     if flt.metros and (listing.metro is None or not any(
-        station_matches(m, listing.metro, listing.metro_line, listing.metro_line_color)
+        station_matches(m, listing.metro)
         for m in flt.metros
     )):
         return False

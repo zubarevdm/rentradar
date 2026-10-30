@@ -217,3 +217,26 @@ async def test_access_lost_does_not_acknowledge_cold_backlog(env, monkeypatch):
     monkeypatch.setattr(ps, "is_active", AsyncMock(side_effect=[True, False]))
     assert await _dispatcher(st, ps, FakePublisher()).run_due(NOW) == 0
     assert not await ps.was_sent(900, listing.content_key)
+
+
+class FlakyPublisher(FakePublisher):
+    """Telegram refused one of the posts (e.g. all photo fallbacks failed)."""
+
+    async def publish(
+        self, scored: ScoredListing, *, channel: str, use_custom_emoji: bool = False
+    ) -> bool:
+        await super().publish(scored, channel=channel, use_custom_emoji=use_custom_emoji)
+        return scored.listing.external_id != "bad"
+
+
+async def test_only_real_deliveries_are_counted(env) -> None:
+    st, ps = env
+    await ps.get_or_create_subscriber(1)
+    await ps.grant_hours(1, NOW - timedelta(hours=2), 24)
+    await st.upsert_listings([_listing("a"), _listing("b"), _listing("bad")])
+    await ps.upsert_filter(UserFilter(user_id=1, metros=["Парк культуры"]))
+    pub = FlakyPublisher()
+    assert await _dispatcher(st, ps, pub).run_due(NOW) == 2
+    assert len(pub.sent) == 3
+    assert await ps.count_delivered(1, NOW - timedelta(hours=1)) == 2
+    assert await ps.count_delivered(1, NOW + timedelta(minutes=1)) == 0

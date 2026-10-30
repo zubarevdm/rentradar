@@ -153,6 +153,19 @@ async def test_paid_command_arguments_and_admin_gate(env):
     assert await ps.paid_until_of(1) == NOW + timedelta(hours=72)
 
 
+async def test_paid_notifies_buyer_and_referrer_and_reminds_receipt(env):
+    ps, router, _ = env
+    await ps.get_or_create_subscriber(2)
+    await ps.get_or_create_subscriber(1, referred_by=2)
+    bot = SimpleNamespace(send_message=AsyncMock())
+    admin = message(uid=9, text="/paid 1 3d op_1")
+    await handler(router, "manual_paid")(admin, bot)
+    assert "«Мой налог»: 129 ₽" in admin.answer.call_args.args[0]
+    sent = {c.args[0]: c for c in bot.send_message.call_args_list}
+    assert "Оплата подтверждена" in sent[1].args[1] and sent[1].kwargs["reply_markup"]
+    assert "+48 часов" in sent[2].args[1]
+
+
 async def test_metro_groups_toggle_remove_stale_and_cancel(env):
     _, router, state = env
     await state.set_state(NewFilter.metro)

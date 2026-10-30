@@ -169,3 +169,15 @@ async def test_fraud_min_price_and_photos(profile: SearchProfile) -> None:
 
     assert cheap.rejected
     assert no_photo.rejected
+
+
+async def test_beautiful_bargain_is_kept_for_bot_but_flagged_for_showcase(
+    profile: SearchProfile,
+) -> None:
+    # 55k против медианы 95k (−42%): для лички это сделка, для витрины — приманка.
+    engine = TastyScoringEngine(FakeMarket(price=95_000, ppm=3_000, sample=20))
+    bargain = await engine.score(_listing(), profile)
+    assert bargain.is_publishable and "too_cheap_for_showcase" in bargain.flags
+    # Около рынка (−8%) — обычный лот, витрине не мешает.
+    near = TastyScoringEngine(FakeMarket(price=60_000, ppm=1_550, sample=20))
+    assert "too_cheap_for_showcase" not in (await near.score(_listing(price=55_000), profile)).flags

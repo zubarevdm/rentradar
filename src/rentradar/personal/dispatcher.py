@@ -107,7 +107,7 @@ class PersonalDispatcher:
                 channel=str(flt.user_id),
                 use_custom_emoji=True,  # личка — можно кастом-эмодзи
             )
-            await self._ps.mark_sent(flt.user_id, content_key)
+            await self._ps.mark_sent(flt.user_id, content_key, delivered=ok, now=now)
             handled.add(content_key)
             if not ok:
                 continue

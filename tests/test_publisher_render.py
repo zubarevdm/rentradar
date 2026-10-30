@@ -69,7 +69,7 @@ def test_move_in_block(sample_listing: Listing) -> None:
     assert "залог 50 000 ₽" in text
     assert "комиссия 25 000 ₽" in text
     # Счётчики — в строке цены/мес, НЕ в «Заехать» (ежемесячная доплата, не разовая).
-    assert "/ мес. счётчики оплачиваются отдельно" in text
+    assert "/ мес. ЖКУ не указаны, счётчики отдельно" in text
     assert "(+ залог)" not in text  # залог только в «Заехать», не в строке цены
     # Разбивка «Заехать» без счётчиков.
     move_in_line = next(ln for ln in text.splitlines() if "При заезде" in ln)
@@ -91,8 +91,8 @@ def test_move_in_block_omitted_without_terms(sample_listing: Listing) -> None:
     text = TelegramPublisher(dry_run=True).render(
         ScoredListing(listing=sample_listing, score=ScoreBreakdown(total=70.0, signals=[]))
     )
-    assert "Заехать" not in text
-    assert "Не указаны: залог, комиссия" in text
+    assert "Заехать" not in text and "<b>При заезде" not in text
+    assert "залог и комиссия не указаны" in text
 
 
 def test_renovation_line_shown_when_enabled(sample_listing: Listing) -> None:

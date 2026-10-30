@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..storage import SqlStorage
 from ..storage.orm import ListingRow, ManualPaymentRow, SubscriberRow, UserFilterRow, UserSentRow
-from .access import TARIFFS, Access, access_of, add_hours, normalize_pause, utcnow
+from .access import TARIFFS, TRIAL, Access, access_of, add_hours, normalize_pause, utcnow
 from .filters import UserFilter, matches
 
 
@@ -257,7 +257,12 @@ class PersonalStore:
 
     async def mark_nudged(self, telegram_id: int, kind: str) -> None:
         """Отметить, что напоминание вида kind (trial/expiry/winback) отправлено."""
-        field = {"trial": "nudged_trial", "expiry": "nudged_expiry", "winback": "nudged_winback"}
+        field = {
+            "trial_soon": "nudged_trial_soon",
+            "trial": "nudged_trial",
+            "expiry": "nudged_expiry",
+            "winback": "nudged_winback",
+        }
         attr = field.get(kind)
         if attr is None:
             return
@@ -285,10 +290,11 @@ class PersonalStore:
             granted = bool(row.trial_eligible and row.trial_until is None)
             if granted:
                 normalize_pause(row, now, self._pause_max)
-                row.trial_until = now + timedelta(hours=24)
+                row.trial_until = now + TRIAL
                 row.trial_eligible = False
                 row.channel_bonus_claimed = True
                 row.nudged_trial = False
+                row.nudged_trial_soon = False
                 if row.paused_at is None and row.paid_until and row.paid_until > now:
                     remaining = row.paid_until - max(now, row.access_starts_at or now)
                     row.access_starts_at = row.trial_until
@@ -397,10 +403,33 @@ class PersonalStore:
             )
             return found is not None
 
-    async def mark_sent(self, user_id: int, content_key: str) -> None:
+    async def mark_sent(
+        self,
+        user_id: int,
+        content_key: str,
+        *,
+        delivered: bool = False,
+        now: datetime | None = None,
+    ) -> None:
         async with self._session() as session:
-            session.add(UserSentRow(user_id=user_id, content_key=content_key))
+            row = UserSentRow(user_id=user_id, content_key=content_key, delivered=delivered)
+            if now is not None:
+                row.sent_at = now
+            session.add(row)
             await session.commit()
+
+    async def count_delivered(self, user_id: int | None, since: datetime) -> int:
+        """Сколько объявлений реально доставлено с момента since (None — всем)."""
+        query = (
+            select(func.count())
+            .select_from(UserSentRow)
+            .where(UserSentRow.delivered.is_(True))
+            .where(UserSentRow.sent_at >= since)
+        )
+        if user_id is not None:
+            query = query.where(UserSentRow.user_id == user_id)
+        async with self._session() as session:
+            return await session.scalar(query) or 0
 
 
 # ── конвертеры ───────────────────────────────────────────────────────────

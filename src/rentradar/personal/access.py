@@ -34,12 +34,34 @@ TARIFFS = {
 }
 
 
+TRIAL = timedelta(hours=24)
+_MSK = timedelta(hours=3)
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
 def moscow(value: datetime) -> str:
-    return (value + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M МСК")
+    return (value + _MSK).strftime("%d.%m.%Y %H:%M МСК")
+
+
+def moscow_when(value: datetime, now: datetime) -> str:
+    """«сегодня в 18:40 МСК» / «завтра в 09:15 МСК» / «31.10 в 12:00 МСК»."""
+    local, today = value + _MSK, (now + _MSK).date()
+    day = {today: "сегодня", today + timedelta(days=1): "завтра"}.get(
+        local.date(), local.strftime("%d.%m")
+    )
+    return f"{day} в {local:%H:%M} МСК"
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Русское склонение по числу: 1 вариант, 3 варианта, 5 вариантов."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
 
 
 @dataclass(frozen=True)

@@ -93,6 +93,8 @@ class TastyScoringEngine(ScoringEngine):
                     f"подозрительный дисконт {discount:.0%} (> {fraud.suspicious_discount:.0%})",
                     flags=["suspicious_discount"],
                 )
+            if discount > fraud.showcase_max_discount:
+                flags.append("too_cheap_for_showcase")
 
         # ── сигналы ──────────────────────────────────────────────────────
         weights = profile.weights

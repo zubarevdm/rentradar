@@ -45,6 +45,7 @@ class SqlStorage(Storage):
             await conn.run_sync(
                 lambda connection: _migrate_access(connection, migration_now, pause_max_days)
             )
+            await conn.run_sync(_backfill_flags)
 
     async def upsert_listings(self, listings: Sequence[Listing]) -> list[Listing]:
         """Сохранить НОВЫЕ лоты; вернуть их. Дубль определяется по (source,
@@ -445,6 +446,15 @@ def _migrate_walking_metro(connection: Connection) -> None:
         "WHERE source IN ('avito', 'cian', 'yandex')"
     ))
     connection.execute(text("INSERT INTO data_versions (name) VALUES (:v)"), {"v": version})
+
+
+def _backfill_flags(connection: Connection) -> None:
+    """Flags added by ALTER TABLE arrive as NULL; make «not nudged» explicit."""
+    from sqlalchemy import text
+
+    connection.execute(
+        text("UPDATE subscribers SET nudged_trial_soon=0 WHERE nudged_trial_soon IS NULL")
+    )
 
 
 def _migrate_add_missing_columns(connection: Connection) -> None:

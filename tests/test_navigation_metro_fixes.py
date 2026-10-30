@@ -143,6 +143,24 @@ async def test_pause_has_unfreeze_and_menu_and_resume_has_main_menu(env):
     assert resume.message.edit_text.call_args.kwargs["reply_markup"] == main_menu()
 
 
+async def test_status_offers_pause_only_when_paid_time_can_freeze(env):
+    personal, router, state = env
+    await personal.get_or_create_subscriber(5)
+    await personal.verify_channel_with_reward(5, NOW)  # trial only: nothing to freeze
+
+    async def status_actions(uid):
+        cq = callback("nav:status")
+        cq.from_user = SimpleNamespace(id=uid)
+        await handler(router, "navigate")(cq, state, SimpleNamespace())
+        keyboard = cq.message.answer.call_args.kwargs["reply_markup"]
+        return {b.callback_data for row in keyboard.inline_keyboard for b in row}
+
+    assert await status_actions(5) == {"nav:menu"}
+    assert await status_actions(1) == {"sub_pause", "nav:menu"}
+    assert await personal.pause(1, NOW)
+    assert await status_actions(1) == {"sub_resume", "nav:menu"}
+
+
 @pytest.mark.parametrize("action", ["support", "invite", "status", "buy", "filters"])
 async def test_menu_screens_offer_working_back_to_menu(env, action):
     _, router, state = env

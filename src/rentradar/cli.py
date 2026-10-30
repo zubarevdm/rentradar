@@ -22,6 +22,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
@@ -34,10 +35,11 @@ from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .errors import CollectorBlockedError
 from .models import ScoredListing, Source, source_rank
 from .personal import PersonalStore
-from .personal.access import access_of, moscow
+from .personal.access import TARIFFS, TRIAL, access_of, moscow_when, plural
 from .personal.bot import build_router
 from .personal.dispatcher import PersonalDispatcher
 from .personal.filters import matches
+from .personal.navigation import nudge_keyboard
 from .pipeline import Pipeline
 from .publisher import TelegramPublisher
 from .scoring import TastyScoringEngine
@@ -48,31 +50,96 @@ from .vision import VisionQuotaError, build_analyzer
 log = logging.getLogger("rentradar")
 
 
+def _lifecycle_kind(sub: SubscriberRow, now: datetime, settings: Settings) -> str | None:
+    """Какое напоминание положено сейчас: trial_soon / trial / expiry / winback.
+
+    Конец пробника и конец оплаты — разные события: после пробника не шлём ещё и
+    «доступ закончился». Дедуп — флагами nudged_*.
+    """
+    access = access_of(sub, now, settings.pause_max_days)
+    until = access.until
+    if access.paused or until is None:
+        return None
+    on_trial = sub.trial_until is not None and until == sub.trial_until
+    if until > now:
+        if on_trial:
+            soon = until - now <= timedelta(hours=settings.lifecycle_trial_soon_hours)
+            return "trial_soon" if soon and not sub.nudged_trial_soon else None
+        if not sub.nudged_expiry and until - now <= _expiry_lead(sub, until, settings):
+            return "expiry"
+        return None
+    if now - until > timedelta(days=settings.lifecycle_winback_days):
+        return None
+    if on_trial:
+        return None if sub.nudged_trial else "trial"
+    return None if sub.nudged_winback else "winback"
+
+
+def _expiry_lead(sub: SubscriberRow, until: datetime, settings: Settings) -> timedelta:
+    """За сколько напомнить о конце оплаты: ~15% срока, от 3 ч до N дней. Иначе
+    тарифы на 24 ч и 3 дня просили бы продлить сразу после покупки."""
+    cap = timedelta(days=settings.lifecycle_expiry_days)
+    start = sub.access_starts_at
+    if start is None or start >= until:
+        return cap
+    return min(cap, max(timedelta(hours=3), (until - start) * 0.15))
+
+
+def _lifecycle_text(
+    kind: str,
+    sub: SubscriberRow,
+    now: datetime,
+    settings: Settings,
+    *,
+    delivered: int = 0,
+    has_filters: bool = True,
+) -> str:
+    until = access_of(sub, now, settings.pause_max_days).until or now
+    price = min(t.price for t in TARIFFS.values())
+    found = (
+        f"За это время я прислал тебе {delivered} "
+        f"{plural(delivered, 'вариант', 'варианта', 'вариантов')}.\n"
+        if delivered
+        else ""
+    )
+    if kind == "trial_soon":
+        if not has_filters:
+            return (
+                f"⏳ Пробный доступ закончится {moscow_when(until, now)}, а поиск ещё "
+                "не настроен. Это займёт минуту — и я начну присылать варианты."
+            )
+        return (
+            f"⏳ Пробный доступ закончится {moscow_when(until, now)}.\n{found}"
+            f"Чтобы не пропустить новые, выбери тариф — от {price} ₽ за сутки."
+        )
+    if kind == "trial":
+        return (
+            f"Пробные сутки закончились.\n{found}Фильтры сохранены — продолжить можно "
+            f"с любого тарифа, от {price} ₽ за сутки."
+        )
+    if kind == "expiry":
+        return (
+            f"⏳ Доступ закончится {moscow_when(until, now)}. "
+            "Продли, чтобы не пропустить новые варианты."
+        )
+    return "Доступ закончился. Фильтры сохранены — продлить можно в пару нажатий."
+
+
 def _lifecycle_nudge(
-    sub: SubscriberRow, now: datetime, settings: Settings
+    sub: SubscriberRow,
+    now: datetime,
+    settings: Settings,
+    *,
+    delivered: int = 0,
+    has_filters: bool = True,
 ) -> tuple[str | None, str]:
     """Какое напоминание (если есть) отправить подписчику. (kind, текст) или (None, '')."""
-    access = access_of(sub, now, settings.pause_max_days)
-    if access.paused:
+    kind = _lifecycle_kind(sub, now, settings)
+    if kind is None:
         return None, ""
-    pu = access.until
-    if access.active(now) and pu:
-        # No expiry/winback about a trial while another entitlement continues.
-        if sub.paid_until and not sub.nudged_expiry and (
-            pu - now <= timedelta(days=settings.lifecycle_expiry_days)
-        ):
-            return "expiry", (f"⏳ Доступ действует до {moscow(pu)}.\n"
-                              "Продли доступ — кнопка «💳 Подписка».")
-        return None, ""
-    if sub.trial_until and pu == sub.trial_until and pu <= now and not sub.nudged_trial:
-        return "trial", ("Пробные 24 часа закончились. Фильтры сохранены.\n"
-                         "Чтобы продолжить получать варианты, открой «💳 Подписка» "
-                         "или «🎁 Пригласить».")
-    if pu and pu <= now and not sub.nudged_winback and (
-        now - pu <= timedelta(days=settings.lifecycle_winback_days)
-    ):
-        return "winback", "Доступ закончился. Фильтры сохранены. Продлить — «💳 Подписка»."
-    return None, ""
+    return kind, _lifecycle_text(
+        kind, sub, now, settings, delivered=delivered, has_filters=has_filters
+    )
 
 
 
@@ -104,6 +171,11 @@ def _passes_public_gate(scored: ScoredListing, settings: Settings) -> bool:
     if settings.public_require_analyzed and listing.analyzed_at is None:
         return False
     if listing.flagged:  # скам-оверлей на фото
+        return False
+    # Красиво и намного дешевле рынка — приманка мошенника (флаг ставит скоринг).
+    if "too_cheap_for_showcase" in scored.score.flags:
+        return False
+    if settings.public_max_price and listing.price > settings.public_max_price:
         return False
     if listing.renovation in settings.public_block_renovations:
         return False
@@ -642,21 +714,37 @@ async def _serve(settings: Settings) -> None:
             )
 
     async def lifecycle_job() -> None:
-        """Раз в сутки: триал-кончился / подписка-истекает / win-back. Дедуп по флагам."""
+        """Ежечасно днём: конец пробника скоро/наступил, конец оплаты, win-back."""
         if bot is None:
             return
         try:
             now = _utcnow()
             sent = 0
             for sub in await personal_store.lifecycle_candidates():
-                kind, text = _lifecycle_nudge(sub, now, settings)
+                kind = _lifecycle_kind(sub, now, settings)
                 if kind is None:
                     continue
+                delivered, has_filters = 0, True
+                if kind in ("trial_soon", "trial") and sub.trial_until is not None:
+                    delivered = await personal_store.count_delivered(
+                        sub.telegram_id, sub.trial_until - TRIAL
+                    )
+                    has_filters = bool(await personal_store.list_filters(sub.telegram_id))
+                text = _lifecycle_text(
+                    kind, sub, now, settings, delivered=delivered, has_filters=has_filters
+                )
                 try:
-                    await bot.send_message(sub.telegram_id, text)
+                    await bot.send_message(
+                        sub.telegram_id,
+                        text,
+                        reply_markup=nudge_keyboard(setup=kind == "trial_soon" and not has_filters),
+                    )
                     await personal_store.mark_nudged(sub.telegram_id, kind)
                     sent += 1
-                except Exception:  # noqa: BLE001 — заблокировал бота и т.п.
+                except TelegramForbiddenError:
+                    # Бот заблокирован: ежечасный повтор только засорял бы лог.
+                    await personal_store.mark_nudged(sub.telegram_id, kind)
+                except Exception:  # noqa: BLE001 — сеть/флуд: повторим в следующий час
                     log.warning("lifecycle: не уведомил %s", sub.telegram_id)
             if sent:
                 log.info("Lifecycle: отправлено напоминаний %d", sent)
@@ -691,12 +779,12 @@ async def _serve(settings: Settings) -> None:
     scheduler.add_job(personal_job, "interval", minutes=1)
     if analyzer is not None:
         scheduler.add_job(vision_job, "interval", minutes=max(1, settings.vision_interval_min))
-    if bot is not None:  # lifecycle-напоминания — раз в сутки в lifecycle_hour MSK
+    if bot is not None:  # lifecycle-напоминания — ежечасно в lifecycle_hours MSK
         scheduler.add_job(
             lifecycle_job,
             "cron",
-            hour=settings.lifecycle_hour,
-            minute=0,
+            hour=settings.lifecycle_hours,
+            minute=5,
             timezone=ZoneInfo("Europe/Moscow"),
         )
     scheduler.start()
@@ -805,14 +893,17 @@ async def _serve(settings: Settings) -> None:
                 """Админ: метрики подписчиков."""
                 if not _is_admin(message):
                     return
-                s = await personal_store.admin_stats(_utcnow())
+                now = _utcnow()
+                s = await personal_store.admin_stats(now)
+                delivered = await personal_store.count_delivered(None, now - timedelta(hours=24))
                 await message.answer(
                     "📊 <b>Подписчики</b>\n"
                     f"Всего: {s['subscribers']}\n"
                     f"Активный доступ по оплате/бонусам: {s['paid']}; на паузе: {s['paused']}\n"
                     f"На триале: {s['trial']}\n"
                     f"Истёкших: {s['expired']}\n"
-                    f"Активных фильтров: {s['active_filters']}"
+                    f"Активных фильтров: {s['active_filters']}\n"
+                    f"Доставлено объявлений за 24 ч: {delivered}"
                 )
 
             @dp.message(Command("admin"))

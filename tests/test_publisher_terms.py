@@ -17,12 +17,12 @@ from tests.test_publisher_send import FakeBot
     "deposit,commission,expected",
     [
         (50000, 50, "При заезде: 125 000 ₽"),
-        (None, 50, "Не указаны: залог"),
-        (50000, None, "Не указаны: комиссия"),
-        (None, None, "Не указаны: залог, комиссия"),
+        (None, 50, "от 75 000 ₽ — первый месяц + комиссия 25 000 ₽, залог не указан"),
+        (50000, None, "от 100 000 ₽ — первый месяц + залог 50 000 ₽, комиссия не указана"),
+        (None, None, "При заезде: от 50 000 ₽, залог и комиссия не указаны"),
         (0, 0, "без залога + без комиссии"),
-        (0, None, "без залога"),
-        (None, 0, "без комиссии"),
+        (0, None, "от 50 000 ₽, без залога, комиссия не указана"),
+        (None, 0, "от 50 000 ₽, без комиссии, залог не указан"),
     ],
 )
 def test_move_in_unknowns(sample_listing, personal, deposit, commission, expected):
@@ -44,11 +44,11 @@ def test_move_in_unknowns(sample_listing, personal, deposit, commission, expecte
 @pytest.mark.parametrize(
     "utilities,meters,expected",
     [
-        (None, None, "Условия оплаты ЖКУ и счётчиков не указаны"),
-        (5500, False, "+ 5 500 ₽ ЖКУ; счётчики оплачиваются отдельно"),
-        (0, True, "ЖКУ включены; счётчики включены"),
-        (None, True, "счётчики включены; условия ЖКУ не указаны"),
-        (5500, None, "условия счётчиков не указаны"),
+        (None, None, "/ мес. ЖКУ и счётчики не указаны"),
+        (5500, False, "+ 5 500 ₽ ЖКУ, счётчики отдельно"),
+        (0, True, "ЖКУ и счётчики включены"),
+        (None, True, "ЖКУ не указаны, счётчики включены"),
+        (5500, None, "+ 5 500 ₽ ЖКУ, счётчики не указаны"),
     ],
 )
 def test_utility_states(sample_listing, utilities, meters, expected):

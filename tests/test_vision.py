@@ -111,3 +111,15 @@ def test_parse_analysis_no_interior_clears_best() -> None:
     assert a is not None
     assert a.no_interior is True
     assert a.best_photos == []
+
+
+def test_public_gate_price_cap_and_bait(sample_listing: Listing) -> None:
+    s = Settings(_env_file=None)
+    ok = sample_listing.model_copy(update={"analyzed_at": _AN, "appeal": 90, "price": 100_000})
+    assert _passes_public_gate(_scored(ok), s) is True  # cap is inclusive
+    pricey = ok.model_copy(update={"price": 170_000})
+    assert _passes_public_gate(_scored(pricey), s) is False
+    assert _passes_public_gate(_scored(pricey), Settings(_env_file=None, public_max_price=0))
+    bait = ScoredListing(listing=ok, score=ScoreBreakdown(
+        total=80.0, signals=[], flags=["too_cheap_for_showcase"]))
+    assert _passes_public_gate(bait, s) is False

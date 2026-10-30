@@ -74,39 +74,38 @@ def search_stations(query: str) -> list[Station]:
                               if name in (s.name, *s.aliases)))
 
 
-def station_matches(
-    selected: str, name: str, line: str | None = None, color: str | None = None,
-) -> bool:
-    """Legacy unqualified filters keep their behavior; new keys retain the line."""
-    q = _normalize_text(selected)
-    name_part, _, qualified_line = name.partition(" · ")
-    line = line or qualified_line or None
-    n = _normalize_text(name_part)
-    candidates = [s for s in STATIONS.values()
-                  if n in {_normalize_text(v) for v in (s.name, *s.aliases)}]
-    if " · " not in selected:
-        return q == n or any(q in {_normalize_text(v) for v in (s.name, *s.aliases)}
-                             for s in candidates)
-    selected_name, _, selected_line = selected.partition(" · ")
-    matches = [s for s in candidates if s.line == selected_line
-               and _normalize_text(selected_name) == _normalize_text(s.name)]
-    if not line and color:
-        # Exact source palette values only: do not guess a line from a nearby color.
-        palette = {
-            "ed1b35": "1", "e42313": "1", "44b85c": "2", "4fb04f": "2",
-            "0078be": "3", "0572b9": "3", "00bfff": "4", "24bcef": "4",
-            "894e35": "5", "915133": "5", "f58220": "6", "ef7e24": "6",
-            "8e479c": "7", "943e90": "7", "a1a2a3": "9", "acadaf": "9",
-            "9aca3c": "10", "b4d445": "10", "79cdcd": "11", "82c0c0": "11",
-            "a1b3d4": "12", "ffa8af": "14", "de64a1": "15",
-            "f6a800": "D1", "efb71d": "D1", "e74280": "D2", "ea5b0c": "D3",
-            "e95b0c": "D3", "40b280": "D4", "47b485": "D4",
-        }
-        line = palette.get(color.lower().lstrip("#"))
-    if line:
-        return bool(matches) and line.upper().replace("МЦД-", "D") == selected_line.upper()
-    # A source without line information cannot identify an ambiguous station.
-    return bool(matches) and len({s.line for s in candidates}) == 1
+def _name_index() -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+    """Normalized name/alias → all names of the stations it denotes."""
+    by_name: dict[str, set[str]] = {}
+    by_alias: dict[str, set[str]] = {}
+    for s in STATIONS.values():
+        names = {_normalize_text(v) for v in (s.name, *s.aliases)}
+        by_name.setdefault(_normalize_text(s.name), set()).update(names)
+        for alias in s.aliases:
+            by_alias.setdefault(_normalize_text(alias), set()).update(names)
+    return (
+        {k: frozenset(v) for k, v in by_name.items()},
+        {k: frozenset(v) for k, v in by_alias.items()},
+    )
+
+
+_BY_NAME, _BY_ALIAS = _name_index()
+
+
+def station_matches(selected: str, name: str) -> bool:
+    """Match a listing's station by name, ignoring the line of a selected key.
+
+    For renting, same-name stations of different lines are one place (an
+    interchange or a short walk). Sources almost never report the line, so
+    requiring it lost every listing at «Текстильщики», «Белорусская» and other
+    interchanges. Legacy filters saved by a former name keep matching.
+    """
+    selected_name, qualified, _ = selected.partition(" · ")
+    q = _normalize_text(selected_name)
+    wanted = {q} | _BY_NAME.get(q, frozenset())
+    if not qualified:
+        wanted |= _BY_ALIAS.get(q, frozenset())
+    return _normalize_text(name.partition(" · ")[0]) in wanted
 
 
 def neighbours(station_id: str) -> list[tuple[Station, str]]:

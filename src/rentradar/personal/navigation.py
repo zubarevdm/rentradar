@@ -19,6 +19,18 @@ def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[buttons[i : i + 2] for i in range(0, 6, 2)])
 
 
+def nudge_keyboard(*, setup: bool = False) -> InlineKeyboardMarkup:
+    """Buttons under lifecycle reminders: one tap to the next useful step."""
+    if setup:
+        rows = [[InlineKeyboardButton(text="🔍 Настроить поиск", callback_data="nav:new")]]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="nav:buy")],
+            [InlineKeyboardButton(text="🎁 Пригласить друга", callback_data="nav:invite")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def listing_keyboard(url: str, *, personal: bool) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="Открыть объявление →", url=url)]]
     if personal:

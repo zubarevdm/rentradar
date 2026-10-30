@@ -47,7 +47,7 @@ def test_rental_conditions(sample_listing, terms, deposit, pct, fixed, total):
         listing=listing, score=ScoreBreakdown(total=70, signals=[])
     ))
     if total is None:
-        assert 'Известные платежи при заезде:' in text and 'Не указаны:' in text
+        assert 'При заезде: от ' in text and 'не указан' in text
         assert '<b>При заезде:' not in text
 
 
@@ -116,7 +116,8 @@ async def test_search_save_and_apply_station(tmp_path, sample_listing, query, li
     assert saved.metros == [station.key]
     listing = sample_listing.model_copy(update={'metro': station.name, 'metro_line': line})
     assert matches(listing, saved)
-    assert not matches(listing.model_copy(update={'metro_line': 'wrong'}), saved)
+    assert matches(listing.model_copy(update={'metro_line': None}), saved)
+    assert not matches(listing.model_copy(update={'metro': 'Тверская'}), saved)
     await storage.dispose()
 
 
@@ -142,13 +143,33 @@ def test_catalogue_search_and_topology():
     assert not search_stations('Дмитровская · D1')  # future node must not be offered
 
 
-def test_ambiguous_station_and_legacy_filter(sample_listing):
+def test_same_name_station_matches_regardless_of_line(sample_listing):
+    # Sources rarely report the line; a same-name station is the same place to rent.
     flt = UserFilter(user_id=1, metros=['Перово · D3'])
     assert matches(sample_listing.model_copy(update={'metro':'Перово', 'metro_line':'D3'}), flt)
-    assert not matches(sample_listing.model_copy(update={'metro':'Перово', 'metro_line':'8'}), flt)
-    assert not matches(sample_listing.model_copy(update={'metro':'Перово'}), flt)
+    assert matches(sample_listing.model_copy(update={'metro':'Перово', 'metro_line':'8'}), flt)
+    assert matches(sample_listing.model_copy(update={'metro':'Перово'}), flt)
+    assert not matches(sample_listing.model_copy(update={'metro':'Новогиреево'}), flt)
     flt.metros = ['Перово']
     assert matches(sample_listing.model_copy(update={'metro':'Перово'}), flt)
+
+
+@pytest.mark.parametrize('selected', ['Текстильщики · 7', 'Текстильщики · D2'])
+@pytest.mark.parametrize('color', [None, 'cf0000', 'e4402d', 'ff8103'])  # real Cian/Yandex values
+def test_interchange_listing_without_known_line_is_not_lost(sample_listing, selected, color):
+    flt = UserFilter(user_id=1, metros=[selected, 'Кузьминки · 7'])
+    listing = sample_listing.model_copy(update={'metro': 'Текстильщики', 'metro_line_color': color})
+    assert matches(listing, flt)
+
+
+def test_former_names_match_only_their_station(sample_listing):
+    renamed = sample_listing.model_copy(update={'metro': 'Выставочная'})
+    assert matches(renamed, UserFilter(user_id=1, metros=['Деловой центр · 4']))
+    assert matches(sample_listing.model_copy(update={'metro': 'Деловой центр'}),
+                   UserFilter(user_id=1, metros=['Выставочная']))  # legacy name filter
+    # «Планерная» is a former name of the D3 stop, not of metro line 7.
+    assert not matches(sample_listing.model_copy(update={'metro': 'Молжаниново'}),
+                       UserFilter(user_id=1, metros=['Планерная · 7']))
 
 
 async def test_legacy_terms_migration_once(tmp_path, sample_listing):

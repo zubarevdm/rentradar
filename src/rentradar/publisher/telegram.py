@@ -416,21 +416,6 @@ def _select_photos(listing: Listing, max_photos: int) -> list[str]:
     return chosen[:max_photos]
 
 
-def _move_in_breakdown(listing: Listing) -> str:
-    """Расшифровка разовой суммы на заезд: «1-й месяц + 100% залог, без комиссии».
-    Ежемесячные доплаты (счётчики/ЖКУ) сюда НЕ входят — они в строке цены/мес."""
-    parts = "1-й месяц"
-    if listing.deposit_pct:
-        parts += f" + {listing.deposit_pct}% залог"
-    elif listing.deposit_rub:
-        parts += " + залог"
-    if listing.commission_pct == 0:
-        parts += ", без комиссии"
-    elif listing.commission_pct:
-        parts += f", комиссия {listing.commission_pct}%"
-    return parts
-
-
 def _telegram_length(value: str) -> int:
     # Telegram counts text after HTML parsing; UTF-16 units are conservative for emoji.
     plain = html.unescape(re.sub(r"<[^>]*>", "", value))
@@ -438,70 +423,81 @@ def _telegram_length(value: str) -> int:
 
 
 def _move_in_line(listing: Listing, *, unavailable: bool = False) -> str:
+    """Разовые платежи при заезде. None — неизвестно, 0 — «без». Неполную сумму не
+    выдаём за итог: «от X ₽» и что не указано. ЖКУ сюда не входят (они помесячно)."""
     deposit = listing.deposit_due
     commission = listing.commission_amount
-    extra = sum(v for v in listing.upfront_payments.values() if v is not None)
-    extra_text = "".join(
-        f" + {html.escape(k)} {_money(v)} ₽"
-        for k, v in listing.upfront_payments.items() if v is not None
-    )
-    missing_extra = [k for k, v in listing.upfront_payments.items() if v is None]
+    extras = {k: v for k, v in listing.upfront_payments.items() if v is not None}
+    extra_text = "".join(f" + {html.escape(k)} {_money(v)} ₽" for k, v in extras.items())
     if listing.move_in_total is not None:
         dep = f"залог {_money(deposit)} ₽" if deposit else "без залога"
         com = f"комиссия {_money(commission)} ₽" if commission else "без комиссии"
-        if listing.commission_pct is not None and listing.commission_rub is None:
+        if commission and listing.commission_pct is not None and listing.commission_rub is None:
             com += f" ({listing.commission_pct}%)"
         if listing.deposit_installments:
             dep += (f" сейчас (всего {_money(listing.deposit_rub)} ₽)"
                     if listing.deposit_rub else " сейчас")
         return (f"🔑 <b>При заезде: {_money(listing.move_in_total)} ₽</b> "
                 f"— первый месяц {_money(listing.price)} ₽ + {dep} + {com}{extra_text}")
-    known = listing.price + (deposit or 0) + (commission or 0) + extra
-    missing = []
-    if deposit is None:
-        missing.append("платёж залога сейчас" if listing.deposit_installments else "залог")
-    if commission is None:
+    amounts, zeros, missing = ["первый месяц"], [], []
+    if deposit:
+        amounts.append(f"залог {_money(deposit)} ₽")
+    elif deposit == 0:
+        zeros.append("без залога")
+    elif listing.deposit_installments and listing.deposit_rub is not None:
+        amounts.append(f"залог всего {_money(listing.deposit_rub)} ₽ (платёж сейчас неизвестен)")
+    else:
+        missing.append("залог")
+    if commission:
+        amounts.append(f"комиссия {_money(commission)} ₽")
+    elif commission == 0:
+        zeros.append("без комиссии")
+    else:
         missing.append("комиссия")
-    missing.extend(missing_extra)
-    parts = [f"первый месяц {_money(listing.price)} ₽"]
-    if deposit is not None:
-        parts.append(f"залог {_money(deposit)} ₽" if deposit else "без залога")
-    elif listing.deposit_rub is not None:
-        parts.append(f"залог всего {_money(listing.deposit_rub)} ₽ (платёж сейчас неизвестен)")
-    if commission is not None:
-        parts.append(f"комиссия {_money(commission)} ₽" if commission else "без комиссии")
+    missing.extend(k for k, v in listing.upfront_payments.items() if v is None)
+    known = listing.price + (deposit or 0) + (commission or 0) + sum(extras.values())
+    line = f"🔑 При заезде: от {_money(known)} ₽"
+    if len(amounts) > 1 or extras:
+        line += " — " + " + ".join(amounts) + extra_text
+    tail = [*zeros, _missing_text(missing, unavailable=unavailable)] if missing else zeros
+    return ", ".join([line, *tail])
+
+
+def _missing_text(items: list[str], *, unavailable: bool) -> str:
+    """«залог не указан», «залог и комиссия не указаны»; если площадка не отдала
+    страницу условий — «… — в объявлении» (автор мог их и указать)."""
+    names = items[0] if len(items) == 1 else ", ".join(items[:-1]) + " и " + items[-1]
+    names = html.escape(names)
     if unavailable:
-        return ("🔑 Авито временно не отдал условия аренды. "
-                "Полную стоимость заезда определить не удалось. "
-                + "Известно: " + " + ".join(parts) + extra_text
-                + ". Не удалось получить: " + html.escape(", ".join(missing))
-                + ". Условия можно посмотреть по ссылке на объявление.")
-    return ("🔑 Полную стоимость заезда определить не удалось. "
-            f"Известные платежи при заезде: {_money(known)} ₽ — "
-            + " + ".join(parts) + extra_text + ". Не указаны: "
-            + html.escape(", ".join(missing)) + " — уточни у автора объявления")
+        return f"{names} — в объявлении"
+    if len(items) > 1:
+        return f"{names} не указаны"
+    return f"{names} " + {"залог": "не указан", "комиссия": "не указана"}.get(
+        items[0], "не указано"
+    )
 
 
 def _utilities_suffix(listing: Listing) -> str:
-    bits: list[str] = []
-    if listing.utilities_rub is not None:
-        bits.append(f"+ {_money(listing.utilities_rub)} ₽ ЖКУ" if listing.utilities_rub
-                    else "ЖКУ включены")
-    if listing.meters_included is False:
-        bits.append("счётчики оплачиваются отдельно")
-    elif listing.meters_included is True:
-        bits.append("счётчики включены")
-    if listing.utilities_rub is None and listing.utilities_included is not None:
-        bits.insert(0, "ЖКУ включены" if listing.utilities_included
-                    else "ЖКУ оплачиваются отдельно (сумма не указана)")
-    if (listing.utilities_rub is None and listing.utilities_included is None
-            and listing.meters_included is None):
-        return "Условия оплаты ЖКУ и счётчиков не указаны"
-    if listing.utilities_rub is None and listing.utilities_included is None:
-        bits.append("условия ЖКУ не указаны")
-    if listing.meters_included is None:
-        bits.append("условия счётчиков не указаны")
-    return "; ".join(bits)
+    """Ежемесячные доплаты к аренде; неизвестное помечаем кратко, не додумываем."""
+    utilities: str | None = None
+    if listing.utilities_rub:
+        utilities = f"+ {_money(listing.utilities_rub)} ₽ ЖКУ"
+    elif listing.utilities_rub == 0 or listing.utilities_included is True:
+        utilities = "ЖКУ включены"
+    elif listing.utilities_included is False:
+        utilities = "ЖКУ отдельно"
+    meters: str | None = None
+    if listing.meters_included is True:
+        meters = "счётчики включены"
+    elif listing.meters_included is False:
+        meters = "счётчики отдельно"
+    if utilities is None and meters is None:
+        return "ЖКУ и счётчики не указаны"
+    if (utilities, meters) == ("ЖКУ включены", "счётчики включены"):
+        return "ЖКУ и счётчики включены"
+    if (utilities, meters) == ("ЖКУ отдельно", "счётчики отдельно"):
+        return "ЖКУ и счётчики отдельно"
+    return ", ".join([utilities or "ЖКУ не указаны", meters or "счётчики не указаны"])
 
 
 # Ремонт (значение Renovation) → подпись для поста.

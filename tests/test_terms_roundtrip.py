@@ -40,7 +40,7 @@ async def test_zero_commission_survives_partial_detail_in_storage_and_send(
     )
     caption = bot.message_calls[0]["text"]
     if expected is None:
-        assert "Полную стоимость заезда определить не удалось" in caption
+        assert "При заезде: от " in caption and "<b>При заезде:" not in caption
     else:
         assert f"При заезде: {expected:,} ₽".replace(",", " ") in caption
     await terms_storage.upsert_listings([listing])
@@ -73,7 +73,8 @@ async def test_user_zero_commission_listing_8410415010(terms_storage, sample_lis
         ScoredListing(listing=saved, score=ScoreBreakdown(total=70))
     )
     assert saved.move_in_total == 680000
-    assert "При заезде: 680 000 ₽" in caption and "без комиссии (0%)" in caption
+    assert "При заезде: 680 000 ₽" in caption and "без комиссии" in caption
+    assert "(0%)" not in caption
 
 
 @pytest.fixture
@@ -114,13 +115,14 @@ async def test_parser_storage_caption(
         ScoredListing(listing=saved, score=ScoreBreakdown(total=70)),
         use_custom_emoji=personal,
     )
-    assert f"первый месяц {price:,}".replace(",", " ") in caption
+    assert f"{price:,} ₽</b> / мес.".replace(",", " ") in caption
     if total is None:
-        assert "Полную стоимость заезда определить не удалось" in caption
-        assert "Не указаны: комиссия" in caption
+        assert f"При заезде: от {price + deposit:,} ₽".replace(",", " ") in caption
+        assert "комиссия не указана" in caption
         assert "<b>При заезде:" not in caption
     else:
         assert f"При заезде: {total:,} ₽".replace(",", " ") in caption
+        assert f"первый месяц {price:,}".replace(",", " ") in caption
 
 
 async def test_new_payment_representations_replace_stale_values(terms_storage, sample_listing):
@@ -193,7 +195,7 @@ def test_unknown_installment_caption_preserves_full_deposit(sample_listing):
         ScoredListing(listing=listing, score=ScoreBreakdown(total=70))
     )
     assert "залог всего 100 000 ₽ (платёж сейчас неизвестен)" in caption
-    assert "Полную стоимость заезда определить не удалось" in caption
+    assert "При заезде: от 50 000 ₽" in caption and "без комиссии" in caption
     assert "<b>При заезде:" not in caption
 
 

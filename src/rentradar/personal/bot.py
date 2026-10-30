@@ -29,6 +29,7 @@ from aiogram.types import (
 )
 
 from ..config import Settings
+from ..storage.orm import ManualPaymentRow
 from .access import TARIFFS, moscow
 from .filters import MAX_INTERVAL_MIN, MIN_INTERVAL_MIN, UserFilter
 from .metro import STATIONS, neighbours, search_stations
@@ -208,7 +209,11 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         if message.from_user is None:
             return
         uid = user_id or message.from_user.id
-        paused = await store.is_paused(uid, _utcnow())
+        now = _utcnow()
+        access = await store.access(uid, now)
+        paused = access.paused
+        # Пауза замораживает только оплату/бонусы: на одном пробнике кнопка — тупик.
+        pausable = access.active(now) and access.until != access.trial_until
         await message.answer(
             await _status_text(uid),
             reply_markup=_with_back(InlineKeyboardMarkup(
@@ -219,7 +224,7 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
                             callback_data="sub_resume" if paused else "sub_pause",
                         )
                     ]
-                ]
+                ] if paused or pausable else []
             )),
         )
 
@@ -263,6 +268,24 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             reply_markup=_with_back(callback="nav:buy"),
         )
         await cq.answer()
+
+    async def _notify_paid(bot: Bot, payment: ManualPaymentRow) -> None:
+        """Сообщить о подтверждённой оплате. Сбой отправки не трогает начисление."""
+        try:
+            has_filters = bool(await store.list_filters(payment.user_id))
+            await bot.send_message(
+                payment.user_id,
+                "✅ Оплата подтверждена!\n" + await _status_text(payment.user_id) + "\n"
+                + ("Новые варианты пришлю по твоим фильтрам." if has_filters
+                   else "Осталось настроить поиск — нажми «🔍 Новый поиск»."),
+                reply_markup=_main_menu(),
+            )
+            if payment.referrer_id is not None:
+                await bot.send_message(
+                    payment.referrer_id, "🎁 За первую оплату друга сохранена награда +48 часов."
+                )
+        except Exception:
+            logger.warning("Не удалось отправить уведомление об оплате")
 
     # ── обязательная подписка на канал (гейт) ───────────────────────────
     async def _is_subscribed(bot: Bot, uid: int) -> bool:
@@ -614,18 +637,10 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             f"{TARIFFS[result.tariff].duration}, {result.price_rub} ₽. "
             f"Срок на момент операции: {moscow(result.result_until)}.\n"
             + await _status_text(result.user_id)
+            + f"\n🧾 Чек в «Мой налог»: {result.price_rub} ₽ — «Доступ к сервису "
+            f"FlatLikeThat, {TARIFFS[result.tariff].duration}»."
         )
-        try:
-            await bot.send_message(
-                result.user_id,
-                "✅ Администратор подтвердил оплату.\n" + await _status_text(result.user_id),
-            )
-            if result.referrer_id is not None:
-                await bot.send_message(
-                    result.referrer_id, "🎁 За первую оплату друга сохранена награда +48 часов."
-                )
-        except Exception:
-            logger.warning("Не удалось отправить уведомление об оплате")
+        await _notify_paid(bot, result)
 
     # ── создание фильтра (FSM) ──────────────────────────────────────────
     @router.callback_query(NewFilter.rooms, F.data.startswith("r_tg:"))
