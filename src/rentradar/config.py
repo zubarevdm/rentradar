@@ -28,6 +28,8 @@ class Settings(BaseSettings):
 
     bot_token: str = ""
     telegram_proxy: str = ""
+    # Базовый URL relay вместо api.telegram.org (Cloudflare Worker), пусто = напрямую.
+    telegram_api_base: str = ""
     public_channel: str = ""
     private_channel: str = ""
     # Годовой OAuth-токен Claude Code (claude setup-token) — для админ-команды /cc.

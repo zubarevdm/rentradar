@@ -19,9 +19,6 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -45,6 +42,7 @@ from .publisher import TelegramPublisher
 from .scoring import TastyScoringEngine
 from .storage import SqlMarketStatsProvider, SqlStorage
 from .storage.orm import SubscriberRow
+from .tg import make_bot
 from .vision import VisionQuotaError, build_analyzer
 
 log = logging.getLogger("rentradar")
@@ -332,12 +330,7 @@ async def _serve(settings: Settings) -> None:
     # Один общий Telegram-бот: и постинг в канал, и личные чаты подписчиков.
     bot: Bot | None = None
     if settings.bot_token and not settings.dry_run:
-        session = AiohttpSession(proxy=settings.telegram_proxy) if settings.telegram_proxy else None
-        bot = Bot(
-            settings.bot_token,
-            session=session,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        )
+        bot = make_bot(settings)
         publisher = TelegramPublisher(
             dry_run=False,
             storage=storage,

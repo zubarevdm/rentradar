@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 
 import httpx
 from aiogram import Bot
-from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
@@ -107,10 +106,9 @@ class TelegramPublisher(Publisher):
                 protect_bot=settings.protect_content_bot,
                 protect_public=settings.protect_content_public,
             )
-        bot = Bot(
-            token=settings.bot_token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        )
+        from ..tg import make_bot
+
+        bot = make_bot(settings)
         return cls(
             dry_run=False,
             storage=storage,
