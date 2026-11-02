@@ -16,6 +16,10 @@ import logging
 from datetime import UTC, datetime
 from math import ceil, isfinite
 
+import httpx
+from curl_cffi import CurlError
+from curl_cffi.requests import AsyncSession
+
 from ..config import SearchProfile
 from ..models import (
     DealType,
@@ -27,6 +31,56 @@ from ..models import (
 from .base import HttpCollector
 
 logger = logging.getLogger(__name__)
+
+# С датацентровых IP Циан ставит капчу по TLS-отпечатку httpx; curl_cffi
+# с отпечатком Chrome проходит (проверено на сервере 02.11.2026).
+_IMPERSONATE = "chrome"
+
+
+class _CffiResponse:
+    """Ответ curl_cffi в той форме, которую ждёт HttpCollector._request_json."""
+
+    def __init__(self, resp: object) -> None:
+        self._resp = resp
+        self.status_code: int = resp.status_code  # type: ignore[attr-defined]
+        self.headers = resp.headers  # type: ignore[attr-defined]
+        self.is_redirect = 300 <= self.status_code < 400 and "location" in self.headers
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self) -> object:
+        return self._resp.json()  # type: ignore[attr-defined]
+
+
+class _CffiClient:
+    """Минимальная обёртка curl_cffi AsyncSession под интерфейс httpx-клиента."""
+
+    def __init__(self, *, follow_redirects: bool, proxy: str | None) -> None:
+        self._follow = follow_redirects
+        self._session = AsyncSession(
+            impersonate=_IMPERSONATE, proxy=proxy, allow_redirects=follow_redirects
+        )
+
+    async def __aenter__(self) -> _CffiClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self._session.close()
+
+    async def request(self, method: str, url: str, **kwargs: object) -> _CffiResponse:
+        follow = kwargs.pop("follow_redirects", self._follow)
+        try:
+            resp = await self._session.request(  # type: ignore[call-overload]
+                method, url, allow_redirects=follow, **kwargs
+            )
+        except CurlError as exc:
+            raise httpx.HTTPError(str(exc)) from exc
+        return _CffiResponse(resp)
+
+    async def get(self, url: str, **kwargs: object) -> _CffiResponse:
+        return await self.request("GET", url, **kwargs)
 
 API_URL = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
 # Страница для «прогрева» сессии: грузим её, чтобы Циан выдал cookies
@@ -67,6 +121,9 @@ class CianCollector(HttpCollector):
     def __init__(self, *, max_pages: int = 5, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self._max_pages = max_pages
+
+    def _client(self, *, follow_redirects: bool = False) -> _CffiClient:  # type: ignore[override]
+        return _CffiClient(follow_redirects=follow_redirects, proxy=self._proxy)
 
     # ── сбор ─────────────────────────────────────────────────────────────
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
