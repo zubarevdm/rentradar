@@ -255,15 +255,16 @@ def _build_collectors(settings: Settings) -> list:
     """Все активные коллекторы площадок. Добавление площадки = строка здесь.
     Авито — через прокси (если задан в .env), т.к. на VPS его банят напрямую."""
     set_request_cooldown(settings.avito_collect_interval_min * 60)
-    return [
-        CianCollector(),
-        YandexCollector(),
-        AvitoCollector(
-            proxy=settings.avito_proxy or None,
-            max_pages=settings.avito_max_pages,
-            min_interval_sec=settings.avito_collect_interval_min * 60,
-        ),
-    ]
+    collectors: list = [CianCollector(), YandexCollector()]
+    if settings.avito_enabled:
+        collectors.append(
+            AvitoCollector(
+                proxy=settings.avito_proxy or None,
+                max_pages=settings.avito_max_pages,
+                min_interval_sec=settings.avito_collect_interval_min * 60,
+            )
+        )
+    return collectors
 
 
 def _build_pipeline(settings: Settings, storage: SqlStorage) -> tuple[Pipeline, TelegramPublisher]:
@@ -404,7 +405,7 @@ async def _serve(settings: Settings) -> None:
         комиссия, полноразмер-фото (в выдаче их нет — поэтому у Авито не работали
         «Заехать», фильтр «без посредников» и текстовый скам-гейт). Вежливый темп;
         при блоке антибота проход прерывается до следующего сбора."""
-        if settings.avito_detail_max_per_run <= 0:
+        if not settings.avito_enabled or settings.avito_detail_max_per_run <= 0:
             return
         # Гейт частоты: детальные страницы Авито бьют по тому же IP, что и поиск.
         # Не чаще avito_collect_interval_min, иначе не выйти из рейт-лимита 429.
