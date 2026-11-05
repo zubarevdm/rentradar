@@ -142,13 +142,9 @@ class TastyScoringEngine(ScoringEngine):
             )
         )
 
-        # 5. состояние/красота (vision-оценка appeal). Нет оценки → нейтральные 0.5.
-        if listing.appeal is not None:
-            cond_val = _clamp(listing.appeal / 100.0)
-            cond_detail = f"интерьер {listing.appeal}/100"
-        else:
-            cond_val, cond_detail = 0.5, "интерьер не оценён"
-            flags.append("no_appeal")
+        # MVP: old photo scores must not affect ranking. Keep a neutral value
+        # to preserve the scale of the existing score thresholds.
+        cond_val, cond_detail = 0.5, "оценка интерьера отключена"
         signals.append(
             SignalScore(
                 name="condition", value=cond_val, weight=weights.condition, detail=cond_detail

@@ -96,6 +96,59 @@ async def test_sends_matches_and_dedups(env) -> None:
     assert await disp.run_due(NOW + timedelta(minutes=6)) == 0
 
 
+async def test_immediate_checks_complete_filter_without_waiting(env) -> None:
+    st, ps = env
+    for user, interval in ((100, 5), (101, 30)):
+        await ps.get_or_create_subscriber(user)
+        await ps.set_paid_until(user, NOW + timedelta(days=1))
+        await ps.upsert_filter(UserFilter(
+            user_id=user, price_max=60_000, metros=["Парк культуры"],
+            rooms=[1], interval_min=interval, include_backlog=False,
+        ))
+    pub = FakePublisher()
+    disp = _dispatcher(st, ps, pub)
+    assert await disp.run_due(NOW) == 0
+    found = NOW + timedelta(seconds=10)
+    await st.upsert_listings([
+        _listing("1", collected=found),
+        _listing("2", price=65_000, collected=found),
+        _listing("3", collected=found).model_copy(update={"metro": "Сокол"}),
+        _listing("4", collected=found).model_copy(update={"rooms": 2}),
+        _listing("5"),
+    ])
+    assert await disp.run_immediate(found) == 1
+    assert [(ch, s.listing.external_id) for ch, s in pub.sent] == [("100", "1")]
+    assert await disp.run_immediate(found) == 0
+    await disp.run_due(NOW + timedelta(minutes=31))
+    assert [(ch, s.listing.external_id) for ch, s in pub.sent] == [("100", "1"), ("101", "1")]
+
+
+async def test_failed_immediate_delivery_survives_restart(env) -> None:
+    st, ps = env
+    await ps.get_or_create_subscriber(100)
+    await ps.set_paid_until(100, NOW + timedelta(days=1))
+    fid = await ps.upsert_filter(UserFilter(user_id=100, interval_min=5, include_backlog=False))
+
+    class UnavailablePublisher(FakePublisher):
+        async def publish(self, scored, *, channel, use_custom_emoji=False):
+            return False
+
+    disp = _dispatcher(st, ps, UnavailablePublisher())
+    assert await disp.run_due(NOW) == 0
+    found = NOW + timedelta(seconds=10)
+    listing = _listing("1", collected=found)
+    await st.upsert_listings([listing])
+    assert await disp.run_immediate(found) == 0
+    assert await disp.run_due(NOW + timedelta(minutes=6)) == 0
+    assert not await ps.was_sent(100, listing.content_key)
+    saved = await ps.get_filter(fid)
+    assert saved is not None and saved[1].last_checked_at == NOW
+    pub = FakePublisher()
+    restarted = _dispatcher(st, ps, pub)
+    assert await restarted.run_due(NOW + timedelta(minutes=7)) == 1
+    assert await restarted.run_immediate(NOW + timedelta(minutes=8)) == 0
+
+
 async def test_trial_gate_then_subscription(env) -> None:
     st, ps = env
     await st.upsert_listings([_listing(str(i)) for i in range(8)])

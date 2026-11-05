@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlencode
+
 import asyncio
 import html
 import logging
@@ -24,7 +26,6 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     BufferedInputFile,
-    InlineKeyboardMarkup,
     InputMediaPhoto,
 )
 
@@ -32,7 +33,6 @@ from ..collectors.avito import fetch_detail
 from ..config import Settings, load_emoji
 from ..interfaces import Publisher
 from ..models import Listing, ScoreBreakdown, ScoredListing, Source
-from ..personal.navigation import listing_keyboard
 from ..photos import image_dimensions, telegram_photo
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,8 @@ class TelegramPublisher(Publisher):
         avito_proxy: str = "",
         protect_bot: bool = False,
         protect_public: bool = False,
+        via_relay: bool = False,
+        cian_jpeg_proxy_enabled: bool = False,
         storage: SqlStorage | None = None,
     ) -> None:
         self._dry_run = dry_run
@@ -82,6 +84,8 @@ class TelegramPublisher(Publisher):
         # Запрет пересылки/сохранения (protect_content): в личке и/или в канале.
         self._protect_bot = protect_bot
         self._protect_public = protect_public
+        self._via_relay = via_relay
+        self._cian_jpeg_proxy_enabled = cian_jpeg_proxy_enabled
 
     @classmethod
     def from_settings(
@@ -113,12 +117,16 @@ class TelegramPublisher(Publisher):
             dry_run=False,
             storage=storage,
             bot=bot,
+            via_relay=bool(settings.telegram_api_base),
+            cian_jpeg_proxy_enabled=settings.cian_jpeg_proxy_enabled,
             max_photos_personal=settings.max_photos_personal,
             max_photos_public=settings.max_photos_public,
             emoji=emoji,
             show_renovation=show_ren,
             cta_text=settings.cta_text,
             cta_url=settings.cta_url,
+            cta_public_text=settings.cta_public_text,
+            cta_public_url=settings.cta_public_url,
             avito_proxy=settings.avito_proxy,
         )
 
@@ -177,10 +185,8 @@ class TelegramPublisher(Publisher):
 
         # 6) Хэштеги — только в канале (навигация по постам; в личке не нужны)
         if not use_custom_emoji:
-            tags = _hashtags(listing)
-            if tags:
-                lines.append("")
-                lines.append(" ".join(tags))
+            lines.append("")
+            lines.append(" ".join([*_hashtags(listing), "#снятьквартиру"]))
 
         # 7) CTA: в канале → на бота (читатель настроит свой поиск), в личке → на
         # публичный канал (подписчик увидит общий поток / перешлёт друзьям).
@@ -281,7 +287,6 @@ class TelegramPublisher(Publisher):
             logger.info("[DRY-RUN] → %s\n%s", channel, text)
             return True
 
-        kb = listing_keyboard(scored.listing.url, personal=use_custom_emoji)
         photos: list = avito_full or _select_photos(scored.listing, cap)
         # Telegram не может стянуть фото Авито с CDN — скачиваем сами (наш IP
         # работает) и грузим байтами. Полноразмер уже получен выше.
@@ -292,16 +297,44 @@ class TelegramPublisher(Publisher):
                 # A blocked original must not be presented as a sharp full-size image.
                 # The shorter link label keeps caption length and source intact.
                 text = text.replace("Открыть объявление на источнике", "Полные фото — в объявлении")
-        elif photos and scored.listing.source == Source.CIAN:
-            # Cian's CDN rejects Telegram downloads, and .jpg can contain WebP.
-            # Fetch from our host and upload validated JPEG/PNG bytes instead.
-            photos = await self._download_photos(photos, source=Source.CIAN)
         # Защита от кражи контента: в личке (платное) — по protect_bot, в канале —
         # по protect_public (use_custom_emoji=True только в личных чатах).
         protect = self._protect_bot if use_custom_emoji else self._protect_public
-        # Уровни деградации: полный альбом → только первое фото → текст без фото.
+        if photos and scored.listing.source == Source.CIAN:
+            if self._cian_jpeg_proxy_enabled:
+                # Only rehost public image URLs from Cian's known photo CDN.
+                jpeg_urls = [
+                    "https://wsrv.nl/?" + urlencode({
+                        "url": url, "w": 1200, "h": 1200, "we": 1, "output": "jpg", "q": 85,
+                    })
+                    for url in photos[:3]
+                    if url.startswith("https://images.cdn-cian.ru/")
+                ]
+                if jpeg_urls and await self._try_send(
+                    channel, text, jpeg_urls, protect=protect, photo_timeout=12
+                ):
+                    return True
+                if len(jpeg_urls) > 1 and await self._try_send(
+                    channel, text, jpeg_urls[:1], protect=protect, photo_timeout=8
+                ):
+                    return True
+            # Keep the personal queue moving if Telegram cannot fetch a CDN URL.
+            # The relay stalls on multipart uploads, so use text after URL attempts.
+            timeout = 8 if self._via_relay else None
+            if await self._try_send(
+                channel, text, photos[:2], protect=protect, photo_timeout=timeout
+            ):
+                return True
+            if len(photos) > 1 and await self._try_send(
+                channel, text, photos[:1], protect=protect, photo_timeout=timeout
+            ):
+                return True
+            if self._via_relay:
+                return await self._try_send(channel, text, [], protect=protect)
+            photos = await self._download_photos(photos[:2], source=Source.CIAN)
+        # Full album -> first photo -> text.
         for level in (photos, photos[:1], []):
-            if await self._try_send(channel, text, level, kb, protect=protect):
+            if await self._try_send(channel, text, level, protect=protect):
                 return True
         logger.error("Не удалось отправить пост в %s (все фолбэки исчерпаны)", channel)
         return False
@@ -336,9 +369,9 @@ class TelegramPublisher(Publisher):
         channel: str,
         text: str,
         photos: list,
-        kb: InlineKeyboardMarkup,
         *,
         protect: bool = False,
+        photo_timeout: int | None = None,
     ) -> bool:
         """Одна попытка отправки на заданном уровне фолбэка (с учётом флуда).
         `protect` — запрет пересылки/сохранения (Telegram protect_content)."""
@@ -352,19 +385,18 @@ class TelegramPublisher(Publisher):
                         else InputMediaPhoto(media=url)
                         for i, url in enumerate(photos)
                     ]
-                    messages = await self._bot.send_media_group(
-                        chat_id=channel, media=media, protect_content=protect
+                    await self._bot.send_media_group(
+                        chat_id=channel, media=media, protect_content=protect,
+                        request_timeout=photo_timeout
                     )
-                    if messages:
-                        await self._attach_keyboard(channel, messages[-1].message_id, kb)
                 elif photos and _telegram_length(text) <= _CAPTION_LIMIT:
                     await self._bot.send_photo(
                         chat_id=channel, photo=photos[0], caption=text,
-                        reply_markup=kb, protect_content=protect,
+                        protect_content=protect, request_timeout=photo_timeout,
                     )
                 else:
                     await self._bot.send_message(
-                        chat_id=channel, text=text, reply_markup=kb,
+                        chat_id=channel, text=text,
                         disable_web_page_preview=False, protect_content=protect,
                     )
                 return True
@@ -380,23 +412,6 @@ class TelegramPublisher(Publisher):
                 logger.error("Ошибка Telegram при отправке в %s: %s", channel, exc)
                 return False
         return False
-
-    async def _attach_keyboard(
-        self, channel: str, message_id: int, keyboard: InlineKeyboardMarkup
-    ) -> None:
-        # The album is already delivered: retry only this edit, never the media.
-        assert self._bot is not None
-        for _ in range(2):
-            try:
-                await self._bot.edit_message_reply_markup(
-                    chat_id=channel, message_id=message_id, reply_markup=keyboard
-                )
-                return
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 1)
-            except TelegramAPIError:
-                logger.warning("Не удалось прикрепить кнопки к доставленному альбому")
-                return
 
     async def close(self) -> None:
         """Закрыть HTTP-сессию бота (вызывать в finally оркестратора)."""

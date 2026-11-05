@@ -8,14 +8,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
 from ..config import SearchProfile, Settings
 from ..interfaces import Publisher, ScoringEngine
-from ..models import ScoredListing, dedupe_cross_source
+from ..models import Listing, ScoredListing, dedupe_cross_source
 from ..storage import SqlStorage
-from .filters import UserFilter, matches
+from .filters import MIN_INTERVAL_MIN, UserFilter, matches
 from .store import PersonalStore
 
 logger = logging.getLogger(__name__)
@@ -36,23 +37,41 @@ class PersonalDispatcher:
         self._scoring = scoring
         self._publisher = publisher
         self._settings = settings
+        self._dispatch_lock = asyncio.Lock()
 
     async def run_due(self, now: datetime) -> int:
         """Прогнать все фильтры, у которых наступил интервал. Вернуть число отправок."""
-        total = 0
-        for filter_id, flt in await self._ps.due_filters(now):
-            total += await self._dispatch_one(filter_id, flt, now)
-            await self._ps.touch_filter(filter_id, now)
-        return total
+        async with self._dispatch_lock:
+            total = 0
+            for filter_id, flt in await self._ps.due_filters(now):
+                sent, complete = await self._dispatch_one(filter_id, flt, now)
+                total += sent
+                if complete:
+                    await self._ps.touch_filter(filter_id, now)
+            return total
 
-    async def _dispatch_one(self, filter_id: int, flt: UserFilter, now: datetime) -> int:
+    async def run_immediate(self, now: datetime) -> int:
+        """Send new matches after a collection pass, ahead of the periodic check."""
+        async with self._dispatch_lock:
+            total = 0
+            for flt in await self._ps.all_active_filters():
+                if flt.clamp_interval() == MIN_INTERVAL_MIN and flt.last_checked_at is not None:
+                    sent, _ = await self._dispatch_one(None, flt, now, fresh_only=True)
+                    total += sent
+            return total
+
+    async def _dispatch_one(
+        self, filter_id: int | None, flt: UserFilter, now: datetime, *, fresh_only: bool = False,
+    ) -> tuple[int, bool]:
         if not await self._ps.is_active(flt.user_id, now):
-            return 0
+            return 0, True
         since = now - timedelta(hours=self._settings.personal_lookback_hours)
+        if fresh_only and flt.last_checked_at is not None:
+            since = max(since, flt.last_checked_at)
         listings = await self._storage.recent_listings(flt.city, since)  # newest first
         # Одна квартира с 2-3 площадок → шлём только одну (дешевле; при равной цене
         # приоритет Avito>Cian>Yandex), чтобы не дублировать в личке.
-        listings = dedupe_cross_source(listings)
+        listings = dedupe_cross_source(lst for lst in listings if lst.collected_at <= now)
         profile = SearchProfile(name=flt.name, city=flt.city)
         matched = [lst for lst in listings if matches(lst, flt)]  # newest first
 
@@ -72,26 +91,31 @@ class PersonalDispatcher:
                 self._settings.personal_backlog_per_check if flt.include_backlog else 0
             )
 
-        def _is_fresh(lst: object) -> bool:
-            return cold or lst.collected_at > last  # type: ignore[union-attr,operator]
+        def _is_fresh(lst: Listing) -> bool:
+            return last is None or lst.collected_at > last
 
         ordered = sorted(matched, key=lambda lst: not _is_fresh(lst))  # свежие первыми
 
         sent = sent_fresh = sent_backlog = 0
         access_lost = False
+        pending_fresh = False
+        retry_fresh = flt.clamp_interval() == MIN_INTERVAL_MIN
         handled: set[str] = set()  # content_key, которые уже пометили показанными
         for listing in ordered:
             fresh = _is_fresh(listing)
-            # Кап дорожки исчерпан — этот лот пропускаем (свежие капом почти не
-            # режутся; бэклог добираем по чуть-чуть).
-            if fresh and sent_fresh >= fresh_cap:
-                continue
-            if not fresh and sent_backlog >= backlog_cap:
+            if fresh_only and not fresh:
                 continue
             content_key = listing.content_key
             if await self._ps.was_sent(flt.user_id, content_key):
                 continue
-
+            # Кап дорожки исчерпан — этот лот пропускаем (свежие капом почти не
+            # режутся; бэклог добираем по чуть-чуть).
+            if fresh and sent_fresh >= fresh_cap:
+                if retry_fresh and not cold:
+                    pending_fresh = True
+                continue
+            if not fresh and sent_backlog >= backlog_cap:
+                continue
             if not await self._ps.is_active(flt.user_id, now):
                 access_lost = True
                 break
@@ -107,6 +131,9 @@ class PersonalDispatcher:
                 channel=str(flt.user_id),
                 use_custom_emoji=True,  # личка — можно кастом-эмодзи
             )
+            if not ok and fresh and retry_fresh:
+                pending_fresh = True
+                continue
             await self._ps.mark_sent(flt.user_id, content_key, delivered=ok, now=now)
             handled.add(content_key)
             if not ok:
@@ -119,7 +146,7 @@ class PersonalDispatcher:
 
         # Режим «только новые» на холодном старте: остальной бэклог помечаем
         # показанным, чтобы он не капал потом (пользователь выбрал не показывать его).
-        if cold and not flt.include_backlog and not access_lost:
+        if cold and not flt.include_backlog and not access_lost and not pending_fresh:
             for listing in ordered:
                 if listing.content_key not in handled:
                     await self._ps.mark_sent(flt.user_id, listing.content_key)
@@ -133,4 +160,4 @@ class PersonalDispatcher:
                 sent_fresh,
                 sent_backlog,
             )
-        return sent
+        return sent, not pending_fresh

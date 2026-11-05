@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from .config import SearchProfile, Settings
@@ -131,7 +131,9 @@ class Pipeline:
         candidates = await self.collect_and_score(profile)
         return await self.publish_top(candidates)
 
-    async def collect_only(self, profile: SearchProfile) -> tuple[int, dict[str, str]]:
+    async def collect_only(
+        self, profile: SearchProfile, *, on_new: Callable[[], None] | None = None,
+    ) -> tuple[int, dict[str, str]]:
         """Только собрать и сохранить (без скоринга/постинга) — для частого сбора,
         который питает и публичный канал, и персонального бота.
 
@@ -142,7 +144,7 @@ class Pipeline:
         statuses: dict[str, str] = {}
         for collector in self._collectors:
             try:
-                raw_items = await collector.fetch(profile)
+                raw_items = await collector.fetch(profile, limit=profile.collect_limit)
             except CollectorBlockedError as exc:
                 logger.warning(
                     "collect %s [%s]: блок (%s)", profile.name, collector.source_name, exc
@@ -158,6 +160,8 @@ class Pipeline:
             listings = [n for r in raw_items if (n := collector.normalize(r))]
             fresh = await self._storage.upsert_listings(listings)
             new_total += len(fresh)
+            if fresh and on_new is not None:
+                on_new()
             statuses[collector.source_name] = "ok"
         return new_total, statuses
 

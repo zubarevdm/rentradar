@@ -50,16 +50,6 @@ ROOM_OPTIONS: list[tuple[str, str, list[int]]] = [
     ("3plus", "3 и более", [3, 4, 5, 6]),
 ]
 
-# Опции ремонта (одиночный выбор): ключ → (подпись, renovation_min). None = любой.
-# «Только дизайнерский» убран: нейросеть ставит ярлык designer крайне редко (~0.2%
-# рынка), фильтр давал пусто. Верхняя реальная планка — «современный/евро» (modern+),
-# ниже — «без убитого» (simple+, отсекает soviet/needs_repair).
-RENOVATION_OPTIONS: list[tuple[str, str, str | None]] = [
-    ("any", "Любой", None),
-    ("simple", "Приличный", "simple"),
-    ("modern", "Современный", "modern"),
-]
-
 # Подписи кнопок главного меню (reply-клавиатура снизу).
 BTN_NEW = "🔍 Новый поиск"
 BTN_LIST = "📋 Мои фильтры"
@@ -103,7 +93,6 @@ class NewFilter(StatesGroup):
     price = State()
     metro = State()
     max_metro = State()
-    renovation = State()
     no_commission = State()
     interval = State()
     backlog = State()
@@ -708,7 +697,7 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             return
         await state.update_data(max_metro_min=None)
         await cq.message.edit_text("Время пешком до метро: без ограничения")
-        await _ask_renovation(cq.message, state)
+        await _ask_no_commission(cq.message, state)
         await cq.answer()
 
     async def _metro_view(
@@ -878,7 +867,7 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         minutes = int(value)
         await state.update_data(max_metro_min=minutes)
         await cq.message.edit_text(f"До метро: до {minutes} минут пешком")
-        await _ask_renovation(cq.message, state)
+        await _ask_no_commission(cq.message, state)
         await cq.answer()
 
     @router.message(NewFilter.max_metro)
@@ -895,29 +884,9 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
     async def stale_max_metro(cq: CallbackQuery) -> None:
         await cq.answer("Выбор времени уже завершён или отменён. Начни новый поиск.")
 
-    async def _ask_renovation(message: Message, state: FSMContext) -> None:
-        if message.from_user is None:
-            return
-        await state.set_state(NewFilter.renovation)
-        await message.answer(
-            "Какой ремонт ищем?\n"
-            "Оценивает нейросеть по фото — «современный» отсекает убитые и "
-            "«бабушкины» варианты.",
-            reply_markup=_kb_renovation(),
-        )
-
-    @router.callback_query(NewFilter.renovation, F.data.startswith("rv:"))
-    async def set_renovation(cq: CallbackQuery, state: FSMContext) -> None:
-        if not isinstance(cq.message, Message) or cq.data is None:
-            await cq.answer()
-            return
-        key = cq.data.split(":", 1)[1]
-        rmin = next((val for k, _, val in RENOVATION_OPTIONS if k == key), None)
-        label = next((lbl for k, lbl, _ in RENOVATION_OPTIONS if k == key), "Любой")
-        await state.update_data(renovation_min=rmin)
-        await cq.message.edit_text("Ремонт: " + label)
-        await _ask_no_commission(cq.message, state)
-        await cq.answer()
+    @router.callback_query(F.data.startswith("rv:"))
+    async def stale_renovation(cq: CallbackQuery) -> None:
+        await cq.answer("Выбор ремонта больше не нужен. Начни новый поиск через меню.")
 
     async def _ask_no_commission(message: Message, state: FSMContext) -> None:
         await state.set_state(NewFilter.no_commission)
@@ -988,7 +957,7 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             await cq.answer()
             return
         step = cq.data.split(":", 1)[1]
-        steps = ("rooms", "price", "metro", "max_metro", "renovation",
+        steps = ("rooms", "price", "metro", "max_metro",
                  "no_commission", "interval", "backlog")
         if step not in steps or await state.get_state() != getattr(NewFilter, step).state:
             await cq.answer("Этот шаг уже завершён. Используй последнее сообщение.")
@@ -1015,10 +984,8 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             await state.set_state(NewFilter.metro)
             selected = data.get("metros_sel", data.get("metros", []))
             await _metro_view(cq.message, state, "summary", _metro_ids(selected), selected)
-        elif step == "renovation":
-            await _ask_max_metro(cq.message, state)
         elif step == "no_commission":
-            await _ask_renovation(cq.message, state)
+            await _ask_max_metro(cq.message, state)
         elif step == "interval":
             await _ask_no_commission(cq.message, state)
         elif step == "backlog":
@@ -1039,7 +1006,6 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             price_max=data.get("price_max"),
             metros=data.get("metros", []),
             max_metro_min=data.get("max_metro_min"),
-            renovation_min=data.get("renovation_min"),
             no_commission=data.get("no_commission", False),
             interval_min=data.get("interval_min", 30),
             include_backlog=include_backlog,
@@ -1231,24 +1197,6 @@ def _kb_intervals() -> InlineKeyboardMarkup:
     return _filter_keyboard(InlineKeyboardMarkup(inline_keyboard=rows), "interval")
 
 
-def _kb_renovation() -> InlineKeyboardMarkup:
-    return _filter_keyboard(InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=label, callback_data=f"rv:{key}")]
-            for key, label, _ in RENOVATION_OPTIONS
-        ]
-    ), "renovation")
-
-
-def _renovation_filter_label(renovation_min: str) -> str:
-    """renovation_min → подпись для описания фильтра."""
-    return {
-        "simple": "приличный",
-        "modern": "современный",
-        "designer": "дизайнерский",  # legacy — старые фильтры
-    }.get(renovation_min, renovation_min)
-
-
 def _describe(flt: UserFilter) -> str:
     parts = [f"🔎 <b>{flt.name}</b> — {flt.city}"]
     if flt.rooms:
@@ -1261,8 +1209,6 @@ def _describe(flt: UserFilter) -> str:
         parts.append("метро/район: " + ", ".join(flt.metros))
     if flt.max_metro_min is not None:
         parts.append(f"до метро: до {flt.max_metro_min} минут пешком")
-    if flt.renovation_min:
-        parts.append("ремонт: " + _renovation_filter_label(flt.renovation_min))
     if flt.no_commission:
         parts.append("без посредников")
     parts.append("присылаю: " + _interval_label(flt.clamp_interval()).lstrip("🔔 ").lower())

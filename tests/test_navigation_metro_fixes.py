@@ -180,7 +180,7 @@ async def test_menu_screens_offer_working_back_to_menu(env, action):
 
 @pytest.mark.parametrize("step,previous", [
     ("price", "rooms"), ("metro", "price"), ("max_metro", "metro"),
-    ("renovation", "max_metro"), ("no_commission", "renovation"),
+    ("no_commission", "max_metro"),
     ("interval", "no_commission"), ("backlog", "interval"),
 ])
 async def test_filter_back_keeps_draft_and_rejects_stale_button(env, step, previous):
@@ -219,7 +219,6 @@ async def test_back_to_budget_then_forward_preserves_stations_and_saves_correcte
     assert (await state.get_data())["metros_sel"] == [station]
     await handler(router, "metro_search", "message")(message("Пропустить"), state)
     await handler(router, "choose_max_metro")(callback("maxmetro:10"), state)
-    await handler(router, "set_renovation")(callback("rv:any"), state)
     await handler(router, "set_no_commission")(callback("nc:0"), state)
     await handler(router, "set_interval")(callback("int:30"), state)
     finish = callback("bl:1")
@@ -248,11 +247,10 @@ async def test_preset_saves_persists_and_applies_as_inclusive_maximum(env, sampl
     await state.update_data(city="Москва", rooms=[1], price_max=60000, metros=["Парк культуры"])
     cq = callback(f"maxmetro:{limit}")
     await handler(router, "choose_max_metro")(cq, state)
-    assert await state.get_state() == NewFilter.renovation.state
+    assert await state.get_state() == NewFilter.no_commission.state
     assert (await state.get_data())["max_metro_min"] == limit
     assert f"до {limit} минут пешком" in cq.message.edit_text.call_args.args[0]
 
-    await handler(router, "set_renovation")(callback("rv:any"), state)
     await handler(router, "set_no_commission")(callback("nc:0"), state)
     await handler(router, "set_interval")(callback("int:30"), state)
     await handler(router, "set_backlog")(callback("bl:1"), state, SimpleNamespace())
@@ -274,9 +272,8 @@ async def test_skip_only_clears_time_limit_and_persists_other_conditions(env, sa
     await state.update_data(criteria)
     cq = callback("skip:maxmetro")
     await handler(router, "skip_max_metro")(cq, state)
-    assert await state.get_state() == NewFilter.renovation.state
+    assert await state.get_state() == NewFilter.no_commission.state
     assert await state.get_data() == {**criteria, "max_metro_min": None}
-    await handler(router, "set_renovation")(callback("rv:any"), state)
     await handler(router, "set_no_commission")(callback("nc:0"), state)
     await handler(router, "set_interval")(callback("int:30"), state)
     await handler(router, "set_backlog")(callback("bl:1"), state, SimpleNamespace())
@@ -312,3 +309,29 @@ async def test_legacy_arbitrary_limit_survives_storage_and_matches(env, sample_l
     assert matches(sample_listing.model_copy(update={"metro_distance_min": 4}), saved)
     assert not matches(sample_listing.model_copy(update={"metro_distance_min": 5}), saved)
     assert not matches(sample_listing.model_copy(update={"metro_distance_min": None}), saved)
+
+
+async def test_legacy_database_filter_ignores_repair_but_keeps_budget(env, sample_listing):
+    from sqlalchemy import text
+    personal, router, state = env
+    fid = await personal.upsert_filter(UserFilter(user_id=1, price_max=60000, rooms=[1]))
+    async with personal._session() as session:
+        await session.execute(text("UPDATE user_filters SET renovation_min='designer' WHERE id=:id"), {"id": fid})
+        await session.commit()
+    _, saved = (await personal.list_filters(1))[0]
+    assert "ремонт" not in _describe(saved).lower()
+    listing = sample_listing.model_copy(update={"rooms": 1, "price": 50000, "renovation": None})
+    assert matches(listing, saved)
+    assert not matches(listing.model_copy(update={"price": 70000}), saved)
+    assert not matches(listing.model_copy(update={"rooms": 2}), saved)
+
+
+async def test_old_repair_buttons_do_not_change_current_draft(env):
+    _, router, state = env
+    await state.set_state(NewFilter.no_commission)
+    await state.update_data(price_max=60000)
+    cq = callback("rv:modern")
+    await handler(router, "stale_renovation")(cq)
+    assert cq.answer.called
+    assert await state.get_state() == NewFilter.no_commission.state
+    assert await state.get_data() == {"price_max": 60000}

@@ -21,6 +21,11 @@ def make_bot(settings: Settings) -> Bot:
             ),
             proxy=settings.telegram_proxy or None,
         )
+        if settings.telegram_api_base:
+            # Reused TLS connections to the relay stall on this network after
+            # several responses. A fresh connection avoids the 60-70s timeout
+            # for both incoming updates and outgoing messages.
+            session._connector_init["force_close"] = True
     return Bot(
         settings.bot_token,
         session=session,

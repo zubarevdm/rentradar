@@ -216,7 +216,7 @@ class LLMPhotoAnalyzer:
 
 def build_analyzer(settings: Settings) -> PhotoAnalyzer | None:
     """Собрать анализатор из настроек. Нет ключа → None (vision выключен)."""
-    if not settings.vision_api_key:
+    if not settings.vision_enabled or not settings.vision_api_key:
         return None
     return LLMPhotoAnalyzer(
         api_key=settings.vision_api_key,

@@ -123,7 +123,7 @@ async def test_publish_with_multiple_photos_uses_album() -> None:
     assert ok is True
     assert len(bot.album_calls) == 1
     media = bot.album_calls[0]["media"]
-    assert len(media) == 3
+    assert len(media) == 2  # Cian relay-safe album
 
 
 async def test_publish_without_photo_uses_send_message() -> None:
@@ -177,42 +177,23 @@ async def test_dry_run_returns_true_without_calls() -> None:
     assert not bot.photo_calls and not bot.message_calls and not bot.album_calls
 
 
-async def test_personal_album_has_visible_menu_and_source_buttons():
+@pytest.mark.parametrize("photos", [[], ["a.jpg"], ["a.jpg", "b.jpg"]])
+async def test_personal_listing_keeps_source_link_without_buttons(photos):
     bot = FakeBot()
     pub = TelegramPublisher(dry_run=False, bot=bot)
-    assert await pub.publish(
-        _scored(photos=["a.jpg", "b.jpg"]), channel="42", use_custom_emoji=True
-    )
-    assert len(bot.album_calls) == 1 and len(bot.markup_calls) == 1
-    edit = bot.markup_calls[0]
-    assert edit["message_id"] == 101
-    buttons = [b for row in edit["reply_markup"].inline_keyboard for b in row]
-    assert any(b.callback_data == "nav:menu" for b in buttons)
-    assert any(b.url == "https://cian.ru/1" for b in buttons)
-
-
-async def test_keyboard_failure_does_not_resend_delivered_album():
-    bot = FakeBot(fail={"markup"})
-    pub = TelegramPublisher(dry_run=False, bot=bot)
-    assert await pub.publish(
-        _scored(photos=["a.jpg", "b.jpg"]), channel="42", use_custom_emoji=True
-    )
-    assert len(bot.album_calls) == 1
-    assert not bot.photo_calls and not bot.message_calls
-
-
-async def test_keyboard_flood_retry_does_not_resend_album(monkeypatch):
-    from unittest.mock import AsyncMock
-
-    import rentradar.publisher.telegram as tg
-
-    monkeypatch.setattr(tg.asyncio, "sleep", AsyncMock())
-    bot = FakeBot(retry_once={"markup"})
-    pub = TelegramPublisher(dry_run=False, bot=bot)
-    assert await pub.publish(
-        _scored(photos=["a.jpg", "b.jpg"]), channel="42", use_custom_emoji=True
-    )
-    assert len(bot.album_calls) == 1 and len(bot.markup_calls) == 1
+    assert await pub.publish(_scored(photos=photos), channel="42", use_custom_emoji=True)
+    assert not bot.markup_calls
+    if len(photos) == 2:
+        call = bot.album_calls[0]
+        text = call["media"][0].caption
+    elif photos:
+        call = bot.photo_calls[0]
+        text = call["caption"]
+    else:
+        call = bot.message_calls[0]
+        text = call["text"]
+    assert not call.get("reply_markup")
+    assert '<a href="https://cian.ru/1">' in text
 
 
 @pytest.mark.parametrize(

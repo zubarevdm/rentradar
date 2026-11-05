@@ -89,13 +89,14 @@ class Settings(BaseSettings):
     max_posts_per_run: int = 1
     # Сколько фото класть в пост (1..10). В личке больше (5-7), в канале меньше (3-5).
     max_photos_personal: int = 7
+    cian_jpeg_proxy_enabled: bool = False
     max_photos_public: int = 5
     # CTA-ссылка в конце поста. В КАНАЛЕ ведём на бота (читатель настроит свой
     # поиск), в ЛИЧКЕ — на публичный канал (подписчик увидит общий поток и
     # перешлёт друзьям). Пустой URL → строки нет в этом контексте.
-    cta_text: str = "FlatLikeThat — найти квартиру"  # в канале → бот
+    cta_text: str = "FlatsLikeThat — найти квартиру"  # в канале → бот
     cta_url: str = "https://t.me/FlatLike_bot"
-    cta_public_text: str = "FlatLikeThat — найти квартиру"  # в личке → паблик (тот же текст)
+    cta_public_text: str = "FlatsLikeThat — найти квартиру"  # в личке → паблик (тот же текст)
     cta_public_url: str = "https://t.me/flatslike"
 
     # ── Персональный (платный) бот ─────────────────────────────────────
@@ -151,6 +152,7 @@ class Settings(BaseSettings):
     # ── Vision: анализ фото нейросетью (выбор лучших кадров + оценка ремонта) ──
     # Пустой ключ = vision выключен (постим как раньше, без анализа). Эндпоинт по
     # умолчанию — OpenAI-совместимый слой Gemini; модель — самый дешёвый flash-lite.
+    vision_enabled: bool = False  # MVP: no photo analysis, even with a saved key.
     vision_api_key: str = ""
     vision_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     vision_model: str = "gemini-2.5-flash-lite"
@@ -260,6 +262,7 @@ class SearchProfile(BaseModel):
     area_min: float | None = None
     area_max: float | None = None
     metro_only: bool = False
+    collect_limit: int = Field(default=50, ge=1, le=150)
 
     # Порог TastyScore для публикации, [0..100].
     publish_threshold: float = 60.0

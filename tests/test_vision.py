@@ -75,7 +75,7 @@ _AN = datetime(2026, 6, 27, 12, 0, 0)  # метка «проанализиров
 
 
 def test_public_gate_requires_analyzed_and_renovation(sample_listing: Listing) -> None:
-    s = Settings()  # дефолт: блокируем needs_repair/soviet, требуем analyzed, appeal≥75
+    s = Settings(vision_enabled=True)  # legacy vision mode: блокируем needs_repair/soviet, требуем analyzed, appeal≥75
     an = {"analyzed_at": _AN, "appeal": 88}  # красивый интерьер, проходит WOW-порог
     soviet = sample_listing.model_copy(update={"renovation": "soviet", **an})
     designer = sample_listing.model_copy(update={"renovation": "designer", **an})
@@ -96,7 +96,7 @@ def test_public_gate_min_appeal() -> None:
         source="cian", external_id="1", url="http://x", price=50000, city="Москва",
         collected_at=_AN, analyzed_at=_AN,
     )
-    s = Settings(public_min_appeal=50)
+    s = Settings(vision_enabled=True, public_min_appeal=50)
     assert _passes_public_gate(_scored(base.model_copy(update={"appeal": 30})), s) is False
     assert _passes_public_gate(_scored(base.model_copy(update={"appeal": 70})), s) is True
     # appeal неизвестен (нет фото квартиры) → в WOW-канал НЕ пускаем.
@@ -123,3 +123,20 @@ def test_public_gate_price_cap_and_bait(sample_listing: Listing) -> None:
     bait = ScoredListing(listing=ok, score=ScoreBreakdown(
         total=80.0, signals=[], flags=["too_cheap_for_showcase"]))
     assert _passes_public_gate(bait, s) is False
+
+
+def test_mvp_disables_analyzer_even_with_saved_key():
+    from rentradar.vision import build_analyzer
+    settings = Settings(_env_file=None, vision_api_key="saved-key")
+    assert settings.vision_enabled is False
+    assert build_analyzer(settings) is None
+
+
+def test_mvp_public_gate_accepts_unanalyzed_and_any_renovation(sample_listing):
+    settings = Settings(_env_file=None, public_require_analyzed=True, public_min_appeal=99)
+    for renovation in (None, "soviet", "needs_repair", "designer"):
+        listing = sample_listing.model_copy(update={
+            "renovation": renovation, "analyzed_at": None, "appeal": None,
+            "price": 50000, "flagged": False,
+        })
+        assert _passes_public_gate(_scored(listing), settings)

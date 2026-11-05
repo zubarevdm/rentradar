@@ -52,18 +52,83 @@ async def test_cian_cdn_webp_delivered_as_uploaded_album(monkeypatch):
 
     monkeypatch.setattr(module.httpx, "AsyncClient", client)
     bot = FakeBot()
+    original_send = bot.send_media_group
+    async def reject_urls(**kwargs):
+        if isinstance(kwargs["media"][0].media, str):
+            from aiogram.exceptions import TelegramBadRequest
+            from aiogram.methods import SendMediaGroup
+            raise TelegramBadRequest(method=SendMediaGroup(chat_id="test", media=kwargs["media"]),
+                                     message="invalid photo URL")
+        return await original_send(**kwargs)
+    bot.send_media_group = reject_urls
+    async def reject_single_url(**kwargs):
+        from aiogram.exceptions import TelegramBadRequest
+        from aiogram.methods import SendPhoto
+        raise TelegramBadRequest(method=SendPhoto(chat_id="test", photo=kwargs["photo"]),
+                                 message="invalid photo URL")
+    bot.send_photo = reject_single_url
     pub = TelegramPublisher(dry_run=False, bot=bot, avito_proxy="http://avito-only.invalid")
     assert await pub.publish(
         _scored(photos=["https://images.cdn-cian.ru/a.jpg",
-                        "https://images.cdn-cian.ru/blocked.jpg",
                         "https://images.cdn-cian.ru/b.jpg"]),
         channel="test", use_custom_emoji=True,
     )
-    assert len(requests) == 3 and len(bot.album_calls) == 1
+    assert len(requests) == 2 and len(bot.album_calls) == 1
     media = bot.album_calls[0]["media"]
     assert len(media) == 2 and not bot.message_calls
     for item in media:
         assert isinstance(item.media, BufferedInputFile)
         with Image.open(BytesIO(item.media.data)) as picture:
             assert picture.format == "JPEG" and picture.size == (800, 600)
-    assert bot.markup_calls  # Navigation remains attached to the album.
+    assert not bot.markup_calls
+
+
+async def test_cian_urls_are_sent_without_download(monkeypatch):
+    pub = TelegramPublisher(dry_run=False, bot=FakeBot())
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Must not upload/download accessible Cian URLs")
+    monkeypatch.setattr(pub, "_download_photos", forbidden)
+    assert await pub.publish(_scored(photos=["https://images.cdn-cian.ru/a.jpg",
+                                          "https://images.cdn-cian.ru/b.jpg"]), channel="test")
+    assert len(pub._bot.album_calls) == 1
+
+
+async def test_relay_falls_back_to_text_without_upload(monkeypatch):
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendPhoto
+
+    bot = FakeBot()
+
+    async def reject(**kwargs):
+        assert kwargs["request_timeout"] == 8
+        raise TelegramBadRequest(
+            method=SendPhoto(chat_id="test", photo="invalid"), message="invalid URL"
+        )
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Relay must not fall back to multipart uploads")
+
+    monkeypatch.setattr(bot, "send_media_group", reject)
+    monkeypatch.setattr(bot, "send_photo", reject)
+    pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
+    monkeypatch.setattr(pub, "_download_photos", forbidden)
+    assert await pub.publish(_scored(photos=["https://img/a", "https://img/b"]), channel="test")
+    assert len(bot.message_calls) == 1
+
+
+async def test_cian_jpeg_proxy_sends_three_validated_urls():
+    from urllib.parse import parse_qs, urlsplit
+
+    bot = FakeBot()
+    publisher = TelegramPublisher(
+        dry_run=False, bot=bot, via_relay=True, cian_jpeg_proxy_enabled=True,
+    )
+    original = [f"https://images.cdn-cian.ru/{i}.jpg" for i in range(4)]
+    assert await publisher.publish(_scored(photos=original), channel="test")
+    media = bot.album_calls[0]["media"]
+    assert len(media) == 3 and not bot.message_calls
+    for photo, source in zip(media, original):
+        parsed = urlsplit(photo.media)
+        assert parsed.hostname == "wsrv.nl"
+        query = parse_qs(parsed.query)
+        assert query["url"] == [source] and query["output"] == ["jpg"]

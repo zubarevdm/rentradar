@@ -29,10 +29,3 @@ def nudge_keyboard(*, setup: bool = False) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🎁 Пригласить друга", callback_data="nav:invite")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def listing_keyboard(url: str, *, personal: bool) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="Открыть объявление →", url=url)]]
-    if personal:
-        rows[0].append(InlineKeyboardButton(text="☰ Меню", callback_data="nav:menu"))
-    return InlineKeyboardMarkup(inline_keyboard=rows)

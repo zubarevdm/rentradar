@@ -11,7 +11,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from ..models import Listing, Renovation, _normalize_text
+from ..models import Listing, _normalize_text
 from ..text_signals import looks_like_agent
 from .metro import station_matches
 
@@ -36,7 +36,6 @@ class UserFilter(BaseModel):
     metros: list[str] = Field(default_factory=list)  # станции метро (имена)
     districts: list[str] = Field(default_factory=list)  # районы
     max_metro_min: int | None = None  # максимум минут пешком до метро
-    renovation_min: str | None = None  # мин. уровень ремонта (значение Renovation)
     no_commission: bool = False  # только без посредников (комиссия 0 + без риелт. фраз)
 
     interval_min: int = 30
@@ -53,12 +52,8 @@ class UserFilter(BaseModel):
         return max(MIN_INTERVAL_MIN, min(MAX_INTERVAL_MIN, self.interval_min))
 
 
-def matches(listing: Listing, flt: UserFilter, *, ignore_renovation: bool = False) -> bool:
-    """Подходит ли лот под фильтр пользователя. Пустые критерии не ограничивают.
-
-    `ignore_renovation=True` — проверять всё, КРОМЕ уровня ремонта. Нужно, чтобы
-    решить «стоит ли тратить нейронку на этот лот для данного пользователя»:
-    структурные критерии (метро/цена/комнаты) дёшевы и фильтруют до vision."""
+def matches(listing: Listing, flt: UserFilter) -> bool:
+    """Подбор по условиям пользователя без анализа фотографий и ремонта."""
     if listing.flagged:  # скам-оверлей на фото — не шлём никому
         return False
     if _norm(listing.city) != _norm(flt.city):
@@ -92,14 +87,6 @@ def matches(listing: Listing, flt: UserFilter, *, ignore_renovation: bool = Fals
         listing.metro_distance_min is None or listing.metro_distance_min > flt.max_metro_min
     ):
         return False
-
-    # Ремонт не ниже выбранного. Непроанализированные (renovation is None) при
-    # активном фильтре по ремонту НЕ проходят — нельзя подтвердить уровень.
-    if not ignore_renovation and flt.renovation_min:
-        if listing.renovation is None:
-            return False
-        if Renovation(listing.renovation).rank < Renovation(flt.renovation_min).rank:
-            return False
 
     # Без посредников: явная комиссия > 0 = агент; риелторские фразы в описании —
     # тоже агент (даже если комиссия «0»). Неизвестная комиссия (None) допускается,

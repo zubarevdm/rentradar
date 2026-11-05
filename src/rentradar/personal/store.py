@@ -11,7 +11,8 @@ from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..storage import SqlStorage
@@ -411,11 +412,23 @@ class PersonalStore:
         delivered: bool = False,
         now: datetime | None = None,
     ) -> None:
+        # Repeated writes must be safe, including concurrent cycles and backlog.
+        values = dict(user_id=user_id, content_key=content_key, delivered=delivered,
+                      sent_at=now or utcnow())
+        statement = insert(UserSentRow).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[UserSentRow.user_id, UserSentRow.content_key],
+            set_={
+                "delivered": UserSentRow.delivered | statement.excluded.delivered,
+                "sent_at": case(
+                    ((~UserSentRow.delivered) & statement.excluded.delivered,
+                     statement.excluded.sent_at),
+                    else_=UserSentRow.sent_at,
+                ),
+            },
+        )
         async with self._session() as session:
-            row = UserSentRow(user_id=user_id, content_key=content_key, delivered=delivered)
-            if now is not None:
-                row.sent_at = now
-            session.add(row)
+            await session.execute(statement)
             await session.commit()
 
     async def count_delivered(self, user_id: int | None, since: datetime) -> int:
@@ -445,7 +458,7 @@ def _apply_filter(row: UserFilterRow, flt: UserFilter) -> None:
     row.metros = list(flt.metros)
     row.districts = list(flt.districts)
     row.max_metro_min = flt.max_metro_min
-    row.renovation_min = flt.renovation_min
+    row.renovation_min = None  # MVP: legacy column, no active filter
     row.no_commission = flt.no_commission
     row.interval_min = flt.clamp_interval()
     row.active = flt.active
@@ -465,7 +478,6 @@ def _row_to_filter(row: UserFilterRow) -> UserFilter:
         metros=list(row.metros or []),
         districts=list(row.districts or []),
         max_metro_min=row.max_metro_min,
-        renovation_min=row.renovation_min,
         # NULL у старых строк (колонка добавлена миграцией позже) → False, иначе
         # pydantic валится и роняет ВСЁ, что грузит фильтры (vision, рассылку).
         no_commission=bool(row.no_commission),

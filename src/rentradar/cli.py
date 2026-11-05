@@ -166,7 +166,7 @@ def _passes_public_gate(scored: ScoredListing, settings: Settings) -> bool:
     listing = scored.listing
     # Без vision-проверки в канал не пускаем — иначе скам-оверлей на фото проскочит
     # до анализа (как и случилось). Проверенные лоты имеют analyzed_at.
-    if settings.public_require_analyzed and listing.analyzed_at is None:
+    if settings.vision_enabled and settings.public_require_analyzed and listing.analyzed_at is None:
         return False
     if listing.flagged:  # скам-оверлей на фото
         return False
@@ -175,6 +175,8 @@ def _passes_public_gate(scored: ScoredListing, settings: Settings) -> bool:
         return False
     if settings.public_max_price and listing.price > settings.public_max_price:
         return False
+    if not settings.vision_enabled:
+        return True
     if listing.renovation in settings.public_block_renovations:
         return False
     # WOW-порог: канал — витрина, нужен ПОДТВЕРЖДЁННЫЙ красивый интерьер. Неизвестный
@@ -336,10 +338,12 @@ async def _serve(settings: Settings) -> None:
             dry_run=False,
             storage=storage,
             bot=bot,
+            via_relay=bool(settings.telegram_api_base),
+            cian_jpeg_proxy_enabled=settings.cian_jpeg_proxy_enabled,
             max_photos_personal=settings.max_photos_personal,
             max_photos_public=settings.max_photos_public,
             emoji=load_emoji(settings.emoji_path),
-            show_renovation=settings.show_renovation_in_post,
+            show_renovation=settings.vision_enabled and settings.show_renovation_in_post,
             cta_text=settings.cta_text,
             cta_url=settings.cta_url,
             cta_public_text=settings.cta_public_text,
@@ -354,7 +358,7 @@ async def _serve(settings: Settings) -> None:
             storage=storage,
             max_photos_personal=settings.max_photos_personal,
             max_photos_public=settings.max_photos_public,
-            show_renovation=settings.show_renovation_in_post,
+            show_renovation=settings.vision_enabled and settings.show_renovation_in_post,
             cta_text=settings.cta_text,
             cta_url=settings.cta_url,
             cta_public_text=settings.cta_public_text,
@@ -460,13 +464,16 @@ async def _serve(settings: Settings) -> None:
         except Exception:  # noqa: BLE001
             log.exception("Ошибка обогащения Авито")
 
+    immediate_delivery = asyncio.Event()
+
     async def collect_job() -> None:
+        total = 0
+        notify_delivery = None if settings.avito_enabled else immediate_delivery.set
         try:
             await storage.recompute_market_stats(window_days=settings.market_window_days)
-            total = 0
             agg: dict[str, list[str]] = {}
             for p in profiles:
-                new, statuses = await pipeline.collect_only(p)
+                new, statuses = await pipeline.collect_only(p, on_new=notify_delivery)
                 total += new
                 for src, st in statuses.items():
                     agg.setdefault(src, []).append(st)
@@ -483,9 +490,8 @@ async def _serve(settings: Settings) -> None:
                 key="job:collect",
                 cooldown_h=1,
             )
-        # После сбора сразу разослать личке: «Сразу»-юзеры получают лот в тот же
-        # момент, как он собрался (в фазе со сбором, без лишнего ожидания тика).
-        await personal_job()
+        if total and notify_delivery is None:
+            immediate_delivery.set()
 
     async def public_job() -> None:
         if public_paused["on"]:
@@ -506,7 +512,7 @@ async def _serve(settings: Settings) -> None:
             # ни один не проанализирован → молчать нельзя, алертим админа.
             if candidates and not passed:
                 n_unanalyzed = sum(1 for c in candidates if c.listing.analyzed_at is None)
-                if n_unanalyzed == len(candidates) and settings.public_require_analyzed:
+                if n_unanalyzed == len(candidates) and settings.vision_enabled and settings.public_require_analyzed:
                     await _alert_admin(
                         f"⚠️ Канал голодает: все {n_unanalyzed} кандидатов слота не "
                         "прошли vision-анализ (vision отстаёт или стоит). "
@@ -518,7 +524,7 @@ async def _serve(settings: Settings) -> None:
             # лучшие сделки бережём для бота. Кросс-дедуп одной квартиры с разных
             # площадок (дешевле/приоритет) — чтобы не постить дубли.
             passed = _dedupe_scored(passed)
-            n = len(await pipeline.publish_top(passed, by_appeal=settings.public_rank_by_appeal))
+            n = len(await pipeline.publish_top(passed, by_appeal=settings.vision_enabled and settings.public_rank_by_appeal))
             runtime["last_public_at"] = _utcnow()
             runtime["last_public_n"] = n
             log.info(
@@ -618,7 +624,7 @@ async def _serve(settings: Settings) -> None:
                     # Кому нужен этот лот: годен в паблик (скор≥порога) ИЛИ структурно
                     # подходит под чей-то фильтр (метро/цена/комнаты, без учёта ремонта).
                     wanted_by_user = any(
-                        matches(listing, flt, ignore_renovation=True)
+                        matches(listing, flt)
                         for flt in active_filters
                     )
                     hopeless = (
@@ -694,9 +700,9 @@ async def _serve(settings: Settings) -> None:
                 cooldown_h=1,
             )
 
-    async def personal_job() -> None:
+    async def personal_job(*, immediate: bool = False) -> None:
         try:
-            n = await personal.run_due(_utcnow())
+            n = await (personal.run_immediate(_utcnow()) if immediate else personal.run_due(_utcnow()))
             if n:
                 log.info("Личная рассылка: отправлено %d", n)
         except Exception as exc:  # noqa: BLE001
@@ -783,6 +789,14 @@ async def _serve(settings: Settings) -> None:
         )
     scheduler.start()
 
+    async def immediate_worker() -> None:
+        while True:
+            await immediate_delivery.wait()
+            immediate_delivery.clear()
+            await personal_job(immediate=True)
+
+    delivery_task = asyncio.create_task(immediate_worker())
+
     async def startup_jobs() -> None:
         # На старте — сбор + первый vision-проход (чтобы БД и личка сразу со свежими
         # данными и анализом). Публичный постинг НЕ дёргаем: иначе каждый рестарт =
@@ -825,7 +839,8 @@ async def _serve(settings: Settings) -> None:
                     src = "ещё не собирал"
                 total = await storage.count_listings()
                 since = now - timedelta(hours=24)
-                vqueue = len(await storage.unanalyzed_listings("Москва", since, 10_000))
+                vqueue = (len(await storage.unanalyzed_listings("Москва", since, 10_000))
+                          if analyzer is not None else "отключён")
                 try:
                     import resource
 
@@ -1023,6 +1038,8 @@ async def _serve(settings: Settings) -> None:
         log.info("Остановка serve по сигналу")
     finally:
         scheduler.shutdown(wait=False)
+        delivery_task.cancel()
+        await asyncio.gather(delivery_task, return_exceptions=True)
         if bot is not None:
             await bot.session.close()
         await storage.dispose()

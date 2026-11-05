@@ -88,39 +88,18 @@ def test_combined_filter() -> None:
     assert not matches(_listing(price=80_000), f)
 
 
-def test_renovation_min_filter() -> None:
-    f = UserFilter(user_id=1, renovation_min="modern")  # современный и выше
-    assert matches(_listing(renovation="modern"), f)
-    assert matches(_listing(renovation="designer"), f)
-    assert not matches(_listing(renovation="simple"), f)
-    assert not matches(_listing(renovation="soviet"), f)
-    # Непроанализированный (renovation None) при активном фильтре не проходит.
-    assert not matches(_listing(renovation=None), f)
+def test_legacy_renovation_preference_is_ignored() -> None:
+    for preference in ("modern", "designer", None):
+        f = UserFilter(user_id=1, renovation_min=preference)
+        for renovation in ("modern", "designer", "simple", "soviet", None):
+            assert matches(_listing(renovation=renovation), f)
 
 
-def test_renovation_only_designer() -> None:
-    f = UserFilter(user_id=1, renovation_min="designer")
-    assert matches(_listing(renovation="designer"), f)
-    assert not matches(_listing(renovation="modern"), f)
-
-
-def test_no_renovation_filter_passes_all() -> None:
-    f = UserFilter(user_id=1)  # renovation_min None → не ограничивает
-    assert matches(_listing(renovation=None), f)
-    assert matches(_listing(renovation="needs_repair"), f)
-
-
-def test_ignore_renovation_keeps_structural_checks() -> None:
-    # ignore_renovation=True: ремонт игнорируем, но метро/цена по-прежнему режут.
-    f = UserFilter(user_id=1, metros=["ЦСКА"], renovation_min="designer")
-    near = _listing(metro="ЦСКА", renovation=None)
-    far = _listing(metro="Тверская", renovation="designer")
-    # Без анализа ремонта: лот у ЦСКА структурно подходит (его и надо оценить).
-    assert matches(near, f, ignore_renovation=True)
-    # Не у ЦСКА — структурно мимо, даже если дизайнерский.
-    assert not matches(far, f, ignore_renovation=True)
-    # А обычный matches лот у ЦСКА без оценки ремонта не пропустит.
-    assert not matches(near, f)
+def test_legacy_renovation_keeps_other_conditions() -> None:
+    f = UserFilter(user_id=1, metros=["ЦСКА"], price_max=70000, renovation_min="designer")
+    assert matches(_listing(metro="ЦСКА", renovation=None), f)
+    assert not matches(_listing(metro="Тверская", renovation="designer"), f)
+    assert not matches(_listing(metro="ЦСКА", price=80000), f)
 
 
 def test_flagged_never_matches() -> None:

@@ -147,19 +147,14 @@ async def test_freshness_decays_with_age(profile: SearchProfile) -> None:
     assert old_v < 0.2
 
 
-async def test_condition_signal_from_appeal(profile: SearchProfile) -> None:
+async def test_mvp_ignores_old_photo_scores(profile: SearchProfile) -> None:
     engine = TastyScoringEngine(FakeMarket(price=60_000, ppm=1_600, sample=20))
-    pretty = await engine.score(_listing(appeal=95), profile)
-    ugly = await engine.score(_listing(appeal=20), profile)
-    neutral = await engine.score(_listing(appeal=None), profile)
-
-    assert next(s for s in pretty.signals if s.name == "condition").value == 0.95
-    assert next(s for s in ugly.signals if s.name == "condition").value == 0.20
-    # Нет оценки → нейтральные 0.5 + флаг.
-    assert next(s for s in neutral.signals if s.name == "condition").value == 0.5
-    assert "no_appeal" in neutral.flags
-    # Красивая квартира заметно обгоняет убитую при прочих равных (~25% веса).
-    assert pretty.total - ugly.total > 15
+    listing = _listing(appeal=95)
+    scores = [await engine.score(listing.model_copy(update={"appeal": value}), profile)
+              for value in (95, 20, None)]
+    assert scores[0].total == scores[1].total == scores[2].total
+    assert all(next(s for s in score.signals if s.name == "condition").value == 0.5
+               for score in scores)
 
 
 async def test_fraud_min_price_and_photos(profile: SearchProfile) -> None:

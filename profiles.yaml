@@ -33,3 +33,10 @@ profiles:
     rooms: [2]
     metro_only: false
     publish_threshold: 60.0
+
+  - name: "Бюджетная аренда до 60 000 ₽ (Москва)"
+    city: "Москва"
+    deal_type: long_rent
+    price_max: 60000
+    rooms: []
+    collect_limit: 120

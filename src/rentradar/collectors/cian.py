@@ -169,6 +169,7 @@ class CianCollector(HttpCollector):
             "engine_version": {"type": "term", "value": 2},
             "region": {"type": "terms", "value": [region]},
             "page": {"type": "term", "value": page},
+            "sort": {"type": "term", "value": "creation_date_desc"},
         }
 
         if profile.deal_type == DealType.LONG_RENT:
