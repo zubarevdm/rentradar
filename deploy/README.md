@@ -53,3 +53,4 @@ IP сервера Авито банит; ходим через Android-теле�
 - `.env`: `RENTRADAR_AVITO_PROXY=http://127.0.0.1:1056`, `RENTRADAR_AVITO_BROWSER_WARMUP=true`,
   `RENTRADAR_AVITO_ROTATE_CMD=/usr/local/bin/phone-rotate-ip`.
 - Проверка: `curl -x http://127.0.0.1:1056 https://api.ipify.org` → IP оператора.
+- Алерты админу: `RENTRADAR_AVITO_PHONE_CHECK_CMD=/usr/local/bin/phone-adb-check` (adb connect + get-state).

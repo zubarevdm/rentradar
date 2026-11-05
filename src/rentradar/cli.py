@@ -764,8 +764,31 @@ async def _serve(settings: Settings) -> None:
                 cooldown_h=1,
             )
 
+    phone_texts = {
+        ("proxy", False): "📵 Телефон-прокси Авито <b>не отвечает</b>: нет связи, Wi-Fi включён "
+                          "или Tailscale выключен. Авито не собирается.",
+        ("proxy", True): "📶 Телефон-прокси Авито снова на связи.",
+        ("control", False): "⚠️ Нет управления телефоном (adb) — IP при бане не сменится. "
+                            "Скорее всего телефон перезагрузился: подключи к ПК и выполни "
+                            "<code>adb tcpip 5555</code>.",
+        ("control", True): "✅ Управление телефоном (adb) восстановлено.",
+    }
+    phone_monitor = (
+        avito_access.PhoneMonitor(
+            proxy=settings.avito_proxy, control_cmd=settings.avito_phone_check_cmd
+        )
+        if settings.avito_enabled and settings.avito_browser_warmup and settings.avito_proxy
+        else None
+    )
+
+    async def phone_job() -> None:
+        for part, ok in await phone_monitor.check():
+            await _alert_admin(phone_texts[(part, ok)], key=f"phone:{part}", cooldown_h=0)
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(collect_job, "interval", minutes=max(1, settings.collect_interval_min))
+    if phone_monitor is not None:
+        scheduler.add_job(phone_job, "interval", minutes=max(1, settings.avito_phone_check_min))
     # Публичный постинг: по часам-пикам (MSK), иначе — почасовой запасной режим.
     post_hours = settings.public_post_hours.strip()
     if post_hours:

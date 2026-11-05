@@ -122,6 +122,59 @@ class AvitoAccess:
         return await self.warm()
 
 
+async def _run_ok(cmd: str, timeout: float = 30.0) -> bool:
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+    )
+    try:
+        return await asyncio.wait_for(proc.wait(), timeout=timeout) == 0
+    except TimeoutError:
+        proc.kill()
+        return False
+
+
+async def _proxy_ok(proxy: str) -> bool:
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(proxy=proxy, timeout=20) as client:
+            return (await client.get("https://api.ipify.org")).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+class PhoneMonitor:
+    """Здоровье телефона-прокси: сам прокси и управление (adb для смены IP).
+
+    Сбой засчитываем после `fail_after` подряд проверок — смена IP рвёт связь
+    на полминуты, это не повод будить админа. Сообщаем только смену состояния.
+    """
+
+    def __init__(self, *, proxy: str, control_cmd: str = "", fail_after: int = 3) -> None:
+        self._checks = {"proxy": lambda: _proxy_ok(proxy)}
+        if control_cmd:
+            self._checks["control"] = lambda: _run_ok(control_cmd)
+        self._fail_after = fail_after
+        self._fails = dict.fromkeys(self._checks, 0)
+        self._down: set[str] = set()
+
+    async def check(self) -> list[tuple[str, bool]]:
+        """[(часть, теперь_работает)] — только изменившиеся состояния."""
+        changes: list[tuple[str, bool]] = []
+        for name, probe in self._checks.items():
+            if await probe():
+                self._fails[name] = 0
+                if name in self._down:
+                    self._down.discard(name)
+                    changes.append((name, True))
+                continue
+            self._fails[name] += 1
+            if self._fails[name] >= self._fail_after and name not in self._down:
+                self._down.add(name)
+                changes.append((name, False))
+        return changes
+
+
 _access: AvitoAccess | None = None
 
 

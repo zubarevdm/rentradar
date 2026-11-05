@@ -73,3 +73,16 @@ def test_recover_is_rate_limited(tmp_path):
     assert asyncio.run(access.recover(ip_banned=False))
     assert not asyncio.run(access.recover(ip_banned=False))
     assert calls == [1]
+
+
+def test_phone_monitor_alerts_only_on_sustained_change():
+    mon = avito_access.PhoneMonitor(proxy="http://phone:1056", fail_after=3)
+    results = iter([False, False, True, False, False, False, False, True])
+
+    async def probe():
+        return next(results)
+
+    mon._checks = {"proxy": probe}
+    seen = [asyncio.run(mon.check()) for _ in range(8)]
+    # Два сбоя и восстановление — тишина; три подряд — алерт один раз; возврат — алерт.
+    assert seen == [[], [], [], [], [], [("proxy", False)], [], [("proxy", True)]]
