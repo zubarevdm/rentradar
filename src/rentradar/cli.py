@@ -27,6 +27,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import ccagent
 from .collectors import AvitoCollector, CianCollector, YandexCollector
+from .collectors import avito_access
 from .collectors.avito import fetch_detail, set_request_cooldown
 from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .errors import CollectorBlockedError
@@ -257,6 +258,13 @@ def _build_collectors(settings: Settings) -> list:
     """Все активные коллекторы площадок. Добавление площадки = строка здесь.
     Авито — через прокси (если задан в .env), т.к. на VPS его банят напрямую."""
     set_request_cooldown(settings.avito_collect_interval_min * 60)
+    if settings.avito_browser_warmup and settings.avito_proxy and avito_access.current() is None:
+        avito_access.configure(avito_access.AvitoAccess(
+            proxy=settings.avito_proxy,
+            cookies_path=settings.avito_cookies_path,
+            rotate_cmd=settings.avito_rotate_cmd,
+            rotate_wait_sec=settings.avito_rotate_wait_sec,
+        ))
     collectors: list = [CianCollector(), YandexCollector()]
     if settings.avito_enabled:
         collectors.append(

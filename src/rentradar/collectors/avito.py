@@ -32,6 +32,7 @@ from ..config import SearchProfile
 from ..errors import CollectorBlockedError
 from ..models import DealType, Listing, PropertyType, RawListing, Source
 from ..photos import detail_photos, largest_srcset
+from . import avito_access
 from .base import HttpCollector
 
 logger = logging.getLogger(__name__)
@@ -79,13 +80,16 @@ def set_request_cooldown(seconds: float) -> None:
 
 
 def _blocking_get(
-    url: str, impersonate: str, params: dict | None, proxy: str | None, timeout: float
+    url: str, impersonate: str, params: dict | None, proxy: str | None, timeout: float,
+    cookies: dict[str, str] | None = None,
 ) -> object:
     kwargs: dict = {"impersonate": impersonate, "timeout": timeout}
     if params:
         kwargs["params"] = params
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}
+    if cookies:
+        kwargs["cookies"] = cookies
     return cffi_requests.get(url, **kwargs)
 
 
@@ -116,6 +120,9 @@ async def _avito_fetch_html(
 async def _fetch_with_profiles(
     url: str, *, params: dict | None, proxy: str | None, timeout: float,
 ) -> str | None:
+    access = avito_access.current()
+    if access is not None and access.proxy == proxy:
+        return await _fetch_with_access(access, url, params=params, timeout=timeout)
     key = proxy or "direct"
     for imp in _rotator.order():
         try:
@@ -138,6 +145,42 @@ async def _fetch_with_profiles(
         if not blocked:
             _rotator.mark_good(imp)
             return resp.text
+    _blocked_until[key] = time.monotonic() + _block_cooldown_seconds
+    return None
+
+
+def _block_kind(resp: object) -> str | None:
+    """None — страница нормальная; "ip" — бан IP; "challenge" — проверка браузера/лимит."""
+    prefix = resp.text[:4000].lower()
+    if "проблема с ip" in prefix:
+        return "ip"
+    if resp.status_code in (429, 439) or any(text in prefix for text in (
+        "доступ ограничен", "проверка безопасности", "подтвердите, что вы не робот",
+    )):
+        return "challenge"
+    return None if resp.status_code == 200 else "challenge"
+
+
+async def _fetch_with_access(
+    access: avito_access.AvitoAccess, url: str, *, params: dict | None, timeout: float,
+) -> str | None:
+    """Мобильный прокси: curl_cffi с куками браузера; при блоке — прогрев/смена IP и повтор."""
+    key = access.proxy or "direct"
+    for attempt in range(2):
+        try:
+            resp = await asyncio.to_thread(
+                _blocking_get, url, avito_access.IMPERSONATE, params, access.proxy, timeout,
+                access.cookies,
+            )
+        except Exception as exc:  # noqa: BLE001 — сеть/прокси (телефон переподключается)
+            logger.warning("avito via proxy: %s: %s", type(exc).__name__, exc)
+            break
+        kind = _block_kind(resp)
+        if kind is None:
+            return resp.text
+        logger.warning("avito: HTTP %s (%s), попытка %d", resp.status_code, kind, attempt + 1)
+        if attempt or not await access.recover(ip_banned=kind == "ip"):
+            break
     _blocked_until[key] = time.monotonic() + _block_cooldown_seconds
     return None
 # Полноразмерные фото (1280x960) в JSON страницы объявления — экранированы: \"1280x960\":\"URL\".

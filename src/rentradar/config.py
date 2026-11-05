@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     # Пусто = напрямую (ОК на домашнем IP; на VPS Авито банит → нужен прокси).
     # Формат: "http://user:pass@host:port".
     avito_proxy: str = ""
+    # Мобильный прокси (телефон): при «проверке безопасности» проходим её браузером
+    # (Playwright) и ходим с его куками. Требует avito_proxy.
+    avito_browser_warmup: bool = False
+    avito_cookies_path: Path = Path("data/avito_cookies.json")
+    # Shell-команда смены IP при бане, например режим полёта через adb. Пусто = не меняем.
+    avito_rotate_cmd: str = ""
+    avito_rotate_wait_sec: float = 15.0
     # Выключатель Авито (например, пока IP сервера в бане): false = не ходим вовсе.
     avito_enabled: bool = True
     # Дообогащение Авито с детальной страницы (описание/залог/комиссия/полноразмер-
