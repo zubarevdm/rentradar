@@ -209,3 +209,15 @@ async def test_proxy_network_error_is_blocked_not_crash() -> None:
     _mock(collector, "_backup_client", boom, calls, "backup")
     with pytest.raises(CollectorBlockedError):
         await collector.fetch(SearchProfile(name="t", city="Москва"))
+
+
+async def test_fallback_fetches_only_first_page(page_html: str) -> None:
+    def ok(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=page_html)
+
+    calls: list[str] = []
+    collector = YandexCollector(min_delay=0.0, max_pages=3, fallback_proxy="http://phone:1")
+    _mock(collector, "_client", _captcha, calls, "direct")
+    _mock(collector, "_backup_client", ok, calls, "backup")
+    await collector.fetch(SearchProfile(name="t", city="Москва"), limit=100)
+    assert calls == ["direct", "backup"]

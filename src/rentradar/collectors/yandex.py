@@ -90,6 +90,10 @@ class YandexCollector(HttpCollector):
         results: list[RawListing] = []
         async with self._client(follow_redirects=True) as client, self._backup_client() as backup:
             for page in range(1, self._max_pages + 1):
+                # Через телефон — только первая страница (свежие при sort=DATE_DESC):
+                # мобильный трафик и время сбора, Авито ходит через тот же телефон.
+                if page > 1 and self._on_fallback():
+                    break
                 url, params = self.build_query(profile, region=region, page=page)
                 await self._throttle()
                 offers = await self._fetch_offers(client, backup, url, params)
@@ -106,6 +110,9 @@ class YandexCollector(HttpCollector):
                     if len(results) >= limit:
                         return results
         return results
+
+    def _on_fallback(self) -> bool:
+        return self._fallback_proxy is not None and time.monotonic() < self._fallback_until
 
     def _backup_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -125,7 +132,7 @@ class YandexCollector(HttpCollector):
     ) -> list[dict] | None:
         """Офферы страницы: напрямую, а при капче — через резервный прокси.
         None = капча/блок (и резерв не помог или не задан)."""
-        if self._fallback_proxy is None or time.monotonic() >= self._fallback_until:
+        if not self._on_fallback():
             offers = await self._get_offers(client, url, params)
             if offers is not None or self._fallback_proxy is None:
                 return offers
