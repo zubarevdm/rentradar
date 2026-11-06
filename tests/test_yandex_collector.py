@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from curl_cffi.requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
 
 from rentradar.collectors.yandex import YandexCollector, _extract_offers, _wrap_offer
 from rentradar.config import SearchProfile
@@ -38,6 +39,11 @@ def test_extract_returns_none_on_captcha() -> None:
 
 def test_extract_returns_none_without_state() -> None:
     assert _extract_offers("<html><body>no state here</body></html>") is None
+
+
+def test_extract_distinguishes_empty_results_from_missing_offers() -> None:
+    assert _extract_offers('window.INITIAL_STATE = {"search":{"offers":{"entities":[]}}};') == []
+    assert _extract_offers('window.INITIAL_STATE = {"search":{}};') is None
 
 
 # ── билдер запроса ─────────────────────────────────────────────────────────
@@ -108,16 +114,16 @@ async def test_fetch_parses_page(
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if "page=2" in str(request.url):
-            return httpx.Response(200, text="<html>window.INITIAL_STATE = {\"search\":{}};</html>")
+            return httpx.Response(
+                200, text='window.INITIAL_STATE = {"search":{"offers":{"entities":[]}}};',
+            )
         return httpx.Response(200, text=page_html)
 
     collector = YandexCollector(min_delay=0.0)
     monkeypatch.setattr(
         collector,
-        "_client",
-        lambda *, follow_redirects=True: httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ),
+        "_search_session",
+        lambda proxy: httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False),
     )
     profile = SearchProfile(name="t", city="Москва")
     raws = await collector.fetch(profile)
@@ -132,10 +138,8 @@ async def test_fetch_raises_on_captcha(monkeypatch: pytest.MonkeyPatch) -> None:
     collector = YandexCollector(min_delay=0.0)
     monkeypatch.setattr(
         collector,
-        "_client",
-        lambda *, follow_redirects=True: httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ),
+        "_search_session",
+        lambda proxy: httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False),
     )
     with pytest.raises(CollectorBlockedError):
         await collector.fetch(SearchProfile(name="t", city="Москва"))
@@ -152,15 +156,21 @@ def test_studio_lowercase_key() -> None:
 
 
 # ── резервный прокси при капче ─────────────────────────────────────────────
-def _mock(collector: YandexCollector, attr: str, handler, calls: list[str], tag: str) -> None:
-    def wrapped(request: httpx.Request) -> httpx.Response:
-        calls.append(tag)
-        return handler(request)
+def _mock(collector: YandexCollector, direct, backup, calls: list[str]) -> None:
+    def factory(proxy: str | None) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: wrapped(request, proxy)),
+            trust_env=False,
+        )
 
-    def factory(*, follow_redirects: bool = True) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(wrapped))
+    def wrapped(request: httpx.Request, proxy: str | None) -> httpx.Response:
+        if proxy is None:
+            calls.append("direct")
+            return direct(request)
+        calls.append("backup")
+        return backup(request)
 
-    setattr(collector, attr, factory)
+    collector._search_session = factory  # type: ignore[method-assign, assignment]
 
 
 def _captcha(request: httpx.Request) -> httpx.Response:
@@ -173,8 +183,7 @@ async def test_captcha_falls_back_to_proxy_and_holds(page_html: str) -> None:
 
     calls: list[str] = []
     collector = YandexCollector(min_delay=0.0, max_pages=1, fallback_proxy="http://phone:1")
-    _mock(collector, "_client", _captcha, calls, "direct")
-    _mock(collector, "_backup_client", ok, calls, "backup")
+    _mock(collector, _captcha, ok, calls)
     profile = SearchProfile(name="t", city="Москва")
 
     assert len(await collector.fetch(profile)) == 3
@@ -193,21 +202,21 @@ async def test_captcha_falls_back_to_proxy_and_holds(page_html: str) -> None:
 async def test_captcha_on_both_raises_blocked() -> None:
     calls: list[str] = []
     collector = YandexCollector(min_delay=0.0, max_pages=1, fallback_proxy="http://phone:1")
-    _mock(collector, "_client", _captcha, calls, "direct")
-    _mock(collector, "_backup_client", _captcha, calls, "backup")
+    _mock(collector, _captcha, _captcha, calls)
     with pytest.raises(CollectorBlockedError):
         await collector.fetch(SearchProfile(name="t", city="Москва"))
 
 
 async def test_proxy_network_error_is_blocked_not_crash() -> None:
     def boom(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("phone offline")
+        raise ConnectionError("phone offline")
 
     calls: list[str] = []
     collector = YandexCollector(min_delay=0.0, max_pages=1, fallback_proxy="http://phone:1")
-    _mock(collector, "_client", _captcha, calls, "direct")
-    _mock(collector, "_backup_client", boom, calls, "backup")
-    with pytest.raises(CollectorBlockedError):
+    _mock(collector, _captcha, boom, calls)
+    with pytest.raises(
+        CollectorBlockedError, match=r"основной маршрут: SmartCaptcha.*ConnectionError",
+    ):
         await collector.fetch(SearchProfile(name="t", city="Москва"))
 
 
@@ -217,7 +226,51 @@ async def test_fallback_fetches_only_first_page(page_html: str) -> None:
 
     calls: list[str] = []
     collector = YandexCollector(min_delay=0.0, max_pages=3, fallback_proxy="http://phone:1")
-    _mock(collector, "_client", _captcha, calls, "direct")
-    _mock(collector, "_backup_client", ok, calls, "backup")
+    _mock(collector, _captcha, ok, calls)
     await collector.fetch(SearchProfile(name="t", city="Москва"), limit=100)
+    assert calls == ["direct", "backup"]
+
+
+async def test_later_captcha_keeps_first_page_without_using_proxy(page_html: str) -> None:
+    def direct(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("page") == "2":
+            return _captcha(request)
+        return httpx.Response(200, text=page_html)
+
+    calls: list[str] = []
+    collector = YandexCollector(min_delay=0.0, fallback_proxy="http://phone:1")
+    _mock(collector, direct, _captcha, calls)
+
+    assert len(await collector.fetch(SearchProfile(name="t", city="Москва"))) == 3
+    assert calls == ["direct", "direct"]
+
+
+async def test_failed_preferred_proxy_retries_primary_immediately(page_html: str) -> None:
+    def direct(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=page_html)
+
+    def failed_proxy(request: httpx.Request) -> httpx.Response:
+        raise ChunkedEncodingError("incomplete chunked read")
+
+    calls: list[str] = []
+    collector = YandexCollector(min_delay=0.0, max_pages=1, fallback_proxy="http://phone:1")
+    collector._fallback_until = float("inf")
+    _mock(collector, direct, failed_proxy, calls)
+
+    profile = SearchProfile(name="t", city="Москва")
+    assert len(await collector.fetch(profile)) == 3
+    assert calls == ["backup", "direct"]
+    assert len(await collector.fetch(profile)) == 3
+    assert calls == ["backup", "direct", "direct"]
+
+
+async def test_transport_failure_on_primary_tries_proxy(page_html: str) -> None:
+    def failed_direct(request: httpx.Request) -> httpx.Response:
+        raise Timeout("timed out")
+
+    calls: list[str] = []
+    collector = YandexCollector(min_delay=0.0, fallback_proxy="http://phone:1")
+    _mock(collector, failed_direct, lambda _: httpx.Response(200, text=page_html), calls)
+
+    assert len(await collector.fetch(SearchProfile(name="t", city="Москва"))) == 3
     assert calls == ["direct", "backup"]

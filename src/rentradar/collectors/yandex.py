@@ -18,8 +18,10 @@ import re
 import time
 from datetime import UTC, datetime
 from math import ceil, isfinite
+from urllib.parse import urlencode, urlsplit
 
-import httpx
+from curl_cffi import CurlError
+from curl_cffi.requests import AsyncSession
 
 from ..config import SearchProfile
 from ..errors import CollectorBlockedError
@@ -30,7 +32,7 @@ from ..models import (
     RawListing,
     Source,
 )
-from .base import _DEFAULT_HEADERS, HttpCollector
+from .base import HttpCollector
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +59,6 @@ _MATERIAL_RU = {
     "FERROCONCRETE": "ж/б",
 }
 
-_HTML_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-
 class YandexCollector(HttpCollector):
     source_name = Source.YANDEX.value
 
@@ -79,8 +72,7 @@ class YandexCollector(HttpCollector):
     ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self._max_pages = max_pages
-        # Резервный прокси (телефон): на капчу по основному IP повторяем через него
-        # и держимся его fallback_hold_sec, чтобы основной IP «остыл».
+        # После успешного запроса через телефон даём основному IP остыть.
         self._fallback_proxy = fallback_proxy or None
         self._fallback_hold_sec = fallback_hold_sec
         self._fallback_until = 0.0
@@ -88,19 +80,23 @@ class YandexCollector(HttpCollector):
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         region = REGION_SLUG.get(profile.city.strip().lower(), "moskva")
         results: list[RawListing] = []
-        async with self._client(follow_redirects=True) as client, self._backup_client() as backup:
+        async with self._search_session(self._proxy) as client:
             for page in range(1, self._max_pages + 1):
-                # Через телефон — только первая страница (свежие при sort=DATE_DESC):
-                # мобильный трафик и время сбора, Авито ходит через тот же телефон.
-                if page > 1 and self._on_fallback():
-                    break
-                url, params = self.build_query(profile, region=region, page=page)
-                await self._throttle()
-                offers = await self._fetch_offers(client, backup, url, params)
-                if offers is None:
-                    raise CollectorBlockedError(
-                        f"Яндекс не отдал INITIAL_STATE (вероятно SmartCaptcha) для {url}"
-                    )
+                base_url, params = self.build_query(profile, region=region, page=page)
+                url = f"{base_url}?{urlencode(params)}"
+                if page == 1:
+                    offers, via_backup = await self._fetch_first_page(client, url)
+                else:
+                    try:
+                        offers = await self._get_offers(client, url)
+                    except CollectorBlockedError as exc:
+                        if not results:
+                            raise
+                        logger.warning(
+                            "Яндекс: основной маршрут, страница %d: %s. Сохраняем %d офферов",
+                            page, exc, len(results),
+                        )
+                        break
                 if not offers:
                     break
                 for offer in offers:
@@ -109,43 +105,72 @@ class YandexCollector(HttpCollector):
                         results.append(raw)
                     if len(results) >= limit:
                         return results
+                # Мобильный прокси делит трафик с Авито. Свежие офферы идут первыми.
+                if via_backup:
+                    break
         return results
 
     def _on_fallback(self) -> bool:
         return self._fallback_proxy is not None and time.monotonic() < self._fallback_until
 
-    def _backup_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            headers=_DEFAULT_HEADERS, follow_redirects=True, proxy=self._fallback_proxy,
-        )
+    def _search_session(self, proxy: str | None) -> AsyncSession:
+        # На VPS httpx получал SmartCaptcha даже через телефон; профиль Chrome
+        # возвращал выдачу по обоим маршрутам.
+        return AsyncSession(impersonate="chrome", proxy=proxy, timeout=self._timeout)
 
-    async def _get_offers(
-        self, client: httpx.AsyncClient, url: str, params: object,
-    ) -> list[dict] | None:
-        resp = await client.get(
-            url, params=params, headers=dict(_HTML_HEADERS), timeout=self._timeout,
-        )  # type: ignore[arg-type]
-        return _extract_offers(resp.text)
-
-    async def _fetch_offers(
-        self, client: httpx.AsyncClient, backup: httpx.AsyncClient, url: str, params: object,
-    ) -> list[dict] | None:
-        """Офферы страницы: напрямую, а при капче — через резервный прокси.
-        None = капча/блок (и резерв не помог или не задан)."""
-        if not self._on_fallback():
-            offers = await self._get_offers(client, url, params)
-            if offers is not None or self._fallback_proxy is None:
-                return offers
-            self._fallback_until = time.monotonic() + self._fallback_hold_sec
-            logger.warning(
-                "Яндекс: капча на основном IP — %.0f мин идём через резервный прокси",
-                self._fallback_hold_sec / 60,
-            )
+    async def _get_offers(self, client: AsyncSession, url: str) -> list[dict]:
+        await self._throttle()
         try:
-            return await self._get_offers(backup, url, params)
-        except httpx.HTTPError as exc:  # телефон переподключается / меняет IP
-            logger.warning("Яндекс через резервный прокси: %s: %s", type(exc).__name__, exc)
-            return None
+            resp = await client.get(url)
+        except CurlError as exc:
+            raise CollectorBlockedError(
+                f"ошибка запроса {type(exc).__name__} (curl {exc.code})"
+            ) from None
+        if urlsplit(str(resp.url)).path.rstrip("/").endswith("/showcaptcha"):
+            raise CollectorBlockedError("SmartCaptcha")
+        if not 200 <= resp.status_code < 300:
+            raise CollectorBlockedError(f"HTTP {resp.status_code}")
+        offers = _extract_offers(resp.text)
+        if offers is None:
+            reason = "SmartCaptcha" if "showcaptcha" in resp.text.lower() else (
+                "в INITIAL_STATE нет списка объявлений"
+            )
+            raise CollectorBlockedError(reason)
+        return offers
+
+    async def _fetch_first_page(
+        self, client: AsyncSession, url: str,
+    ) -> tuple[list[dict], bool]:
+        """Пробуем каждый настроенный маршрут не больше одного раза."""
+        prefer_backup = self._on_fallback()
+        if prefer_backup:
+            routes = (True, False)
+        elif self._fallback_proxy:
+            routes = (False, True)
+        else:
+            routes = (False,)
+
+        failures: list[str] = []
+        for via_backup in routes:
+            route = "резервный прокси" if via_backup else "основной маршрут"
+            try:
+                if via_backup:
+                    async with self._search_session(self._fallback_proxy) as backup:
+                        offers = await self._get_offers(backup, url)
+                else:
+                    offers = await self._get_offers(client, url)
+            except CollectorBlockedError as exc:
+                failures.append(f"{route}: {exc}")
+                if via_backup:
+                    self._fallback_until = 0.0
+                continue
+            if via_backup and not prefer_backup:
+                self._fallback_until = time.monotonic() + self._fallback_hold_sec
+            if failures:
+                logger.warning("Яндекс: %s. Выдача получена (%s)", failures[0], route)
+            return offers, via_backup
+
+        raise CollectorBlockedError(f"Яндекс: {'; '.join(failures)}")
 
     @staticmethod
     def build_query(
@@ -220,14 +245,14 @@ class YandexCollector(HttpCollector):
 
 # ── парсинг INITIAL_STATE ───────────────────────────────────────────────────
 def _extract_offers(html: str) -> list[dict] | None:
-    """Достать офферы из HTML. None — если страница заблокирована/без данных."""
-    if "showcaptcha" in html.lower():
-        return None
+    """Достать офферы из HTML. Пустой список означает штатную пустую выдачу."""
     state = _parse_initial_state(html)
-    if state is None:
+    search = state.get("search") if state else None
+    offers = search.get("offers") if isinstance(search, dict) else None
+    entities = offers.get("entities") if isinstance(offers, dict) else None
+    if not isinstance(entities, list) or any(not isinstance(item, dict) for item in entities):
         return None
-    entities = (((state.get("search") or {}).get("offers")) or {}).get("entities")
-    return entities if isinstance(entities, list) else []
+    return entities
 
 
 def _parse_initial_state(html: str) -> dict | None:
