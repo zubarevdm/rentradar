@@ -48,6 +48,9 @@ from .vision import VisionQuotaError, build_analyzer
 
 log = logging.getLogger("rentradar")
 
+# Сколько сборов подряд площадка должна не собраться, чтобы алертить 🔴.
+SOURCE_DOWN_AFTER = 3
+
 
 def _lifecycle_kind(sub: SubscriberRow, now: datetime, settings: Settings) -> str | None:
     """Какое напоминание положено сейчас: trial_soon / trial / expiry / winback.
@@ -266,7 +269,10 @@ def _build_collectors(settings: Settings) -> list:
             rotate_cmd=settings.avito_rotate_cmd,
             rotate_wait_sec=settings.avito_rotate_wait_sec,
         ))
-    collectors: list = [CianCollector(), YandexCollector()]
+    collectors: list = [
+        CianCollector(),
+        YandexCollector(fallback_proxy=settings.yandex_fallback_proxy or None),
+    ]
     if settings.avito_enabled:
         collectors.append(
             AvitoCollector(
@@ -578,6 +584,7 @@ async def _serve(settings: Settings) -> None:
     # Состояние площадок для health-мониторинга: source → 'ok'|'down'. Алертим на
     # переходе (не каждый цикл): 🔴 при падении, 🟢 при восстановлении.
     source_health: dict[str, str] = {}
+    source_fails: dict[str, int] = {}
     # Пауза публичного постинга (админ-команда) — не мешает сбору и личке.
     public_paused = {"on": False}
     # Живые метрики для команды /health.
@@ -607,9 +614,16 @@ async def _serve(settings: Settings) -> None:
 
     async def _check_source_health(agg: dict[str, list[str]]) -> None:
         """По итогам сбора: source считается живым, если собрал хоть в одном профиле.
-        Алертим только на смене состояния (ok↔down) — без спама каждые 10 минут."""
+        Алертим только на смене состояния (ok↔down) — без спама каждые 10 минут.
+        «Лежит» — только после SOURCE_DOWN_AFTER неудачных сборов подряд: разовый
+        сбой (капча, смена IP телефона) сам проходит на следующем сборе."""
         for src, results in agg.items():
-            state = "ok" if "ok" in results else "down"
+            if "ok" in results:
+                source_fails[src] = 0
+                state = "ok"
+            else:
+                source_fails[src] = source_fails.get(src, 0) + 1
+                state = "down" if source_fails[src] >= SOURCE_DOWN_AFTER else "ok"
             if source_health.get(src, "ok") == state:
                 continue
             source_health[src] = state

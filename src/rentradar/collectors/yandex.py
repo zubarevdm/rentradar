@@ -15,8 +15,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import UTC, datetime
 from math import ceil, isfinite
+
+import httpx
 
 from ..config import SearchProfile
 from ..errors import CollectorBlockedError
@@ -27,7 +30,7 @@ from ..models import (
     RawListing,
     Source,
 )
-from .base import HttpCollector
+from .base import _DEFAULT_HEADERS, HttpCollector
 
 logger = logging.getLogger(__name__)
 
@@ -66,21 +69,30 @@ _HTML_HEADERS = {
 class YandexCollector(HttpCollector):
     source_name = Source.YANDEX.value
 
-    def __init__(self, *, max_pages: int = 3, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *,
+        max_pages: int = 3,
+        fallback_proxy: str | None = None,
+        fallback_hold_sec: float = 1800.0,
+        **kwargs: object,
+    ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self._max_pages = max_pages
+        # Резервный прокси (телефон): на капчу по основному IP повторяем через него
+        # и держимся его fallback_hold_sec, чтобы основной IP «остыл».
+        self._fallback_proxy = fallback_proxy or None
+        self._fallback_hold_sec = fallback_hold_sec
+        self._fallback_until = 0.0
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         region = REGION_SLUG.get(profile.city.strip().lower(), "moskva")
         results: list[RawListing] = []
-        async with self._client(follow_redirects=True) as client:
+        async with self._client(follow_redirects=True) as client, self._backup_client() as backup:
             for page in range(1, self._max_pages + 1):
                 url, params = self.build_query(profile, region=region, page=page)
                 await self._throttle()
-                resp = await client.get(
-                    url, params=params, headers=dict(_HTML_HEADERS), timeout=self._timeout
-                )  # type: ignore[arg-type]
-                offers = _extract_offers(resp.text)
+                offers = await self._fetch_offers(client, backup, url, params)
                 if offers is None:
                     raise CollectorBlockedError(
                         f"Яндекс не отдал INITIAL_STATE (вероятно SmartCaptcha) для {url}"
@@ -94,6 +106,39 @@ class YandexCollector(HttpCollector):
                     if len(results) >= limit:
                         return results
         return results
+
+    def _backup_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers=_DEFAULT_HEADERS, follow_redirects=True, proxy=self._fallback_proxy,
+        )
+
+    async def _get_offers(
+        self, client: httpx.AsyncClient, url: str, params: object,
+    ) -> list[dict] | None:
+        resp = await client.get(
+            url, params=params, headers=dict(_HTML_HEADERS), timeout=self._timeout,
+        )  # type: ignore[arg-type]
+        return _extract_offers(resp.text)
+
+    async def _fetch_offers(
+        self, client: httpx.AsyncClient, backup: httpx.AsyncClient, url: str, params: object,
+    ) -> list[dict] | None:
+        """Офферы страницы: напрямую, а при капче — через резервный прокси.
+        None = капча/блок (и резерв не помог или не задан)."""
+        if self._fallback_proxy is None or time.monotonic() >= self._fallback_until:
+            offers = await self._get_offers(client, url, params)
+            if offers is not None or self._fallback_proxy is None:
+                return offers
+            self._fallback_until = time.monotonic() + self._fallback_hold_sec
+            logger.warning(
+                "Яндекс: капча на основном IP — %.0f мин идём через резервный прокси",
+                self._fallback_hold_sec / 60,
+            )
+        try:
+            return await self._get_offers(backup, url, params)
+        except httpx.HTTPError as exc:  # телефон переподключается / меняет IP
+            logger.warning("Яндекс через резервный прокси: %s: %s", type(exc).__name__, exc)
+            return None
 
     @staticmethod
     def build_query(

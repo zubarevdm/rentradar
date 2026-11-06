@@ -149,3 +149,63 @@ def test_studio_lowercase_key() -> None:
     assert _rooms_and_type({"roomsTotalKey": "STUDIO"}) == (0, PropertyType.STUDIO)
     assert _rooms_and_type({"studio": True}) == (0, PropertyType.STUDIO)
     assert _rooms_and_type({"roomsTotalKey": "2", "roomsTotal": 2}) == (2, PropertyType.FLAT)
+
+
+# ── резервный прокси при капче ─────────────────────────────────────────────
+def _mock(collector: YandexCollector, attr: str, handler, calls: list[str], tag: str) -> None:
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        calls.append(tag)
+        return handler(request)
+
+    def factory(*, follow_redirects: bool = True) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(wrapped))
+
+    setattr(collector, attr, factory)
+
+
+def _captcha(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, text="<html>... showcaptcha please ...</html>")
+
+
+async def test_captcha_falls_back_to_proxy_and_holds(page_html: str) -> None:
+    def ok(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=page_html)
+
+    calls: list[str] = []
+    collector = YandexCollector(min_delay=0.0, max_pages=1, fallback_proxy="http://phone:1")
+    _mock(collector, "_client", _captcha, calls, "direct")
+    _mock(collector, "_backup_client", ok, calls, "backup")
+    profile = SearchProfile(name="t", city="Москва")
+
+    assert len(await collector.fetch(profile)) == 3
+    assert calls == ["direct", "backup"]
+    # Пока держимся резерва — основной IP не трогаем.
+    calls.clear()
+    assert len(await collector.fetch(profile)) == 3
+    assert calls == ["backup"]
+    # Срок вышел — снова пробуем напрямую.
+    collector._fallback_until = 0.0
+    calls.clear()
+    await collector.fetch(profile)
+    assert calls[0] == "direct"
+
+
+async def test_captcha_on_both_raises_blocked() -> None:
+    calls: list[str] = []
+    collector = YandexCollector(min_delay=0.0, max_pages=1, fallback_proxy="http://phone:1")
+    _mock(collector, "_client", _captcha, calls, "direct")
+    _mock(collector, "_backup_client", _captcha, calls, "backup")
+    with pytest.raises(CollectorBlockedError):
+        await collector.fetch(SearchProfile(name="t", city="Москва"))
+
+
+async def test_proxy_network_error_is_blocked_not_crash() -> None:
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("phone offline")
+
+    calls: list[str] = []
+    collector = YandexCollector(min_delay=0.0, max_pages=1, fallback_proxy="http://phone:1")
+    _mock(collector, "_client", _captcha, calls, "direct")
+    _mock(collector, "_backup_client", boom, calls, "backup")
+    with pytest.raises(CollectorBlockedError):
+        await collector.fetch(SearchProfile(name="t", city="Москва"))
