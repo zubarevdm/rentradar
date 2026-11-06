@@ -81,7 +81,7 @@ def set_request_cooldown(seconds: float) -> None:
 
 def _blocking_get(
     url: str, impersonate: str, params: dict | None, proxy: str | None, timeout: float,
-    cookies: dict[str, str] | None = None,
+    cookies: dict[str, str] | None = None, headers: dict[str, str] | None = None,
 ) -> object:
     kwargs: dict = {"impersonate": impersonate, "timeout": timeout}
     if params:
@@ -90,6 +90,8 @@ def _blocking_get(
         kwargs["proxies"] = {"http": proxy, "https": proxy}
     if cookies:
         kwargs["cookies"] = cookies
+    if headers:
+        kwargs["headers"] = headers
     return cffi_requests.get(url, **kwargs)
 
 
@@ -164,13 +166,13 @@ def _block_kind(resp: object) -> str | None:
 async def _fetch_with_access(
     access: avito_access.AvitoAccess, url: str, *, params: dict | None, timeout: float,
 ) -> str | None:
-    """Мобильный прокси: curl_cffi с куками браузера; при блоке — прогрев/смена IP и повтор."""
+    """Мобильный прокси: curl_cffi с куками и UA профиля браузера; при блоке — прогрев/смена IP и повтор."""
     key = access.proxy or "direct"
     for attempt in range(2):
         try:
             resp = await asyncio.to_thread(
                 _blocking_get, url, avito_access.IMPERSONATE, params, access.proxy, timeout,
-                access.cookies,
+                access.cookies, access.headers,
             )
         except Exception as exc:  # noqa: BLE001 — сеть/прокси (телефон переподключается)
             logger.warning("avito via proxy: %s: %s", type(exc).__name__, exc)

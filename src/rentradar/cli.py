@@ -262,6 +262,7 @@ def _build_collectors(settings: Settings) -> list:
         avito_access.configure(avito_access.AvitoAccess(
             proxy=settings.avito_proxy,
             cookies_path=settings.avito_cookies_path,
+            profile_dir=settings.avito_browser_profile,
             rotate_cmd=settings.avito_rotate_cmd,
             rotate_wait_sec=settings.avito_rotate_wait_sec,
         ))

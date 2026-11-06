@@ -1,10 +1,12 @@
-"""Доступ к Авито через мобильный прокси: куки браузера и смена IP.
+"""Доступ к Авито через мобильный прокси: доверенная сессия браузера и смена IP.
 
-С мобильного IP Авито не банит сразу, а отдаёт 439 «проверка безопасности» —
-JS-челлендж, который curl не проходит. Настоящий Chromium через тот же прокси
-проходит его за секунды; дальше curl_cffi с этими куками ходит как обычно.
-Если же IP всё-таки помечен («проблема с IP»), дёргаем команду смены IP
-(например, режим полёта на телефоне через adb) и прогреваемся заново.
+Авито пускает не «чистых» новичков, а сессии с историей: с того же мобильного IP
+браузер телефона с давними куками проходит, а инкогнито получает «проблему с IP».
+Поэтому держим ОДИН постоянный профиль Camoufox (Firefox против антиботов, с
+целостным отпечатком ПК): он проходит «проверку браузера» и копит доверие. Частый
+опрос выдачи идёт быстрым curl_cffi с куками и User-Agent этого профиля. При
+блоке — прогрев тем же профилем; при «проблеме с IP» — ещё и смена IP (режим
+полёта на телефоне через adb).
 """
 
 from __future__ import annotations
@@ -18,8 +20,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 WARM_URL = "https://www.avito.ru/moskva/kvartiry/sdam/na_dlitelnyy_srok-ASgBAgICAkSSA8gQ8AeQUg"
-# Профиль curl_cffi под куки Chromium: другой TLS-отпечаток с теми же куками палится.
-IMPERSONATE = "chrome"
+# TLS-профиль curl_cffi под браузер профиля (Camoufox = Firefox).
+IMPERSONATE = "firefox135"
 # Чаще не пытаемся: если прогрев/смена IP не помогли, ждём обычную паузу источника.
 _MIN_RECOVER_GAP = 120.0
 
@@ -30,59 +32,73 @@ class AvitoAccess:
         *,
         proxy: str | None,
         cookies_path: Path,
+        profile_dir: Path | None = None,
         rotate_cmd: str = "",
         rotate_wait_sec: float = 15.0,
     ) -> None:
         self.proxy = proxy
         self._path = cookies_path
+        self._profile = profile_dir or cookies_path.with_name("avito_browser_profile")
         self._rotate_cmd = rotate_cmd
         self._rotate_wait = rotate_wait_sec
         self._last_recover = 0.0
-        self.cookies: dict[str, str] = self._load()
+        self.user_agent = ""
+        self.cookies: dict[str, str] = {}
+        self._load()
 
-    def _load(self) -> dict[str, str]:
+    def _load(self) -> None:
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
+            data = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {}
+            return
+        self.user_agent = data.get("ua", "")
+        self.cookies = data.get("cookies", {})
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self.cookies), encoding="utf-8")
+        self._path.write_text(
+            json.dumps({"ua": self.user_agent, "cookies": self.cookies}), encoding="utf-8"
+        )
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"User-Agent": self.user_agent} if self.user_agent else {}
 
     async def warm(self) -> bool:
-        """Пройти челлендж настоящим браузером через прокси и забрать куки."""
+        """Пройти «проверку браузера» постоянным профилем Camoufox и забрать куки."""
         try:
-            from playwright.async_api import async_playwright
+            from camoufox.async_api import AsyncCamoufox
         except ImportError:
-            logger.warning("avito: playwright не установлен — прогрев недоступен")
+            logger.warning("avito: camoufox не установлен — прогрев недоступен")
             return False
-        launch: dict = {"args": ["--disable-blink-features=AutomationControlled"]}
+        options: dict = {
+            "headless": "virtual",  # окно в виртуальном дисплее (Xvfb), не headless
+            "os": "windows",
+            "locale": "ru-RU",
+            "humanize": True,
+            "persistent_context": True,
+            "user_data_dir": str(self._profile),
+            "i_know_what_im_doing": True,  # Windows-отпечаток на Linux-сервере — намеренно
+        }
         if self.proxy:
-            launch["proxy"] = {"server": self.proxy}
+            options |= {"proxy": {"server": self.proxy}, "geoip": True}
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(**launch)
-                try:
-                    ctx = await browser.new_context(
-                        locale="ru-RU", viewport={"width": 1366, "height": 800}
-                    )
-                    page = await ctx.new_page()
-                    await page.goto(WARM_URL, wait_until="domcontentloaded", timeout=60_000)
-                    for _ in range(8):
-                        if await page.locator("[data-marker=item]").count():
-                            break
-                        await page.wait_for_timeout(5_000)
-                    else:
-                        logger.warning("avito: прогрев — челлендж не пройден (%s)",
-                                       await page.title())
-                        return False
-                    self.cookies = {
-                        c["name"]: c["value"] for c in await ctx.cookies()
-                        if "avito" in c.get("domain", "")
-                    }
-                finally:
-                    await browser.close()
+            async with AsyncCamoufox(**options) as ctx:
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                await page.goto(WARM_URL, wait_until="domcontentloaded", timeout=60_000)
+                for _ in range(12):
+                    if await page.locator("[data-marker=item]").count():
+                        break
+                    await page.wait_for_timeout(5_000)
+                else:
+                    logger.warning("avito: прогрев — проверка не пройдена (%s)",
+                                   await page.title())
+                    return False
+                self.user_agent = await page.evaluate("navigator.userAgent")
+                self.cookies = {
+                    c["name"]: c["value"] for c in await ctx.cookies()
+                    if "avito" in c.get("domain", "")
+                }
         except Exception as exc:  # noqa: BLE001 — браузер/сеть: просто не прогрелись
             logger.warning("avito: прогрев упал: %s: %s", type(exc).__name__, exc)
             return False

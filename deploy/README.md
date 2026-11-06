@@ -50,6 +50,8 @@ IP сервера Авито банит; ходим через Android-теле�
   затем `tailscale set --exit-node=<IP телефона>` — через телефон идёт только трафик прокси.
 - `phone-adb.service`: `socat` 127.0.0.1:15555 → `tailscale nc <IP телефона> 5555`.
 - `/usr/local/bin/phone-rotate-ip`: режим полёта на 4 с через adb → новый IP.
+- Прогрев: Camoufox в venv бота (`pip install "camoufox[geoip]"`, `python -m camoufox fetch`, нужен `xvfb`).
+  Постоянный профиль `data/avito_browser_profile` копит доверие Авито — не удалять.
 - `.env`: `RENTRADAR_AVITO_PROXY=http://127.0.0.1:1056`, `RENTRADAR_AVITO_BROWSER_WARMUP=true`,
   `RENTRADAR_AVITO_ROTATE_CMD=/usr/local/bin/phone-rotate-ip`.
 - Проверка: `curl -x http://127.0.0.1:1056 https://api.ipify.org` → IP оператора.

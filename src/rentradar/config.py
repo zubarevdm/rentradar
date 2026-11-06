@@ -48,10 +48,11 @@ class Settings(BaseSettings):
     # Пусто = напрямую (ОК на домашнем IP; на VPS Авито банит → нужен прокси).
     # Формат: "http://user:pass@host:port".
     avito_proxy: str = ""
-    # Мобильный прокси (телефон): при «проверке безопасности» проходим её браузером
-    # (Playwright) и ходим с его куками. Требует avito_proxy.
+    # Мобильный прокси (телефон): «проверку браузера» проходит постоянный профиль
+    # Camoufox (копит доверие Авито), выдачу опрашиваем curl_cffi с его куками/UA.
     avito_browser_warmup: bool = False
     avito_cookies_path: Path = Path("data/avito_cookies.json")
+    avito_browser_profile: Path = Path("data/avito_browser_profile")
     # Shell-команда смены IP при бане, например режим полёта через adb. Пусто = не меняем.
     avito_rotate_cmd: str = ""
     avito_rotate_wait_sec: float = 15.0

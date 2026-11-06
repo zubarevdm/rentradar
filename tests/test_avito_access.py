@@ -25,7 +25,7 @@ def _run(monkeypatch, tmp_path, responses):
     avito._blocked_until.clear()
     seen: list[dict | None] = []
 
-    def fake_get(url, imp, params, proxy, timeout, cookies=None):
+    def fake_get(url, imp, params, proxy, timeout, cookies=None, headers=None):
         seen.append(dict(cookies or {}))
         return responses.pop(0)
 
@@ -86,3 +86,12 @@ def test_phone_monitor_alerts_only_on_sustained_change():
     seen = [asyncio.run(mon.check()) for _ in range(8)]
     # Два сбоя и восстановление — тишина; три подряд — алерт один раз; возврат — алерт.
     assert seen == [[], [], [], [], [], [("proxy", False)], [], [("proxy", True)]]
+
+
+def test_session_roundtrip_keeps_user_agent(tmp_path):
+    path = tmp_path / "c.json"
+    a = avito_access.AvitoAccess(proxy=None, cookies_path=path)
+    a.user_agent, a.cookies = "Firefox/158.0", {"u": "1"}
+    a._save()
+    b = avito_access.AvitoAccess(proxy=None, cookies_path=path)
+    assert b.headers == {"User-Agent": "Firefox/158.0"} and b.cookies == {"u": "1"}
