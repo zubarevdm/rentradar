@@ -224,5 +224,14 @@ async def test_original_photo_bytes_are_not_resized_or_recompressed(file_name, n
     assert await pub.publish(scored, channel="42", use_custom_emoji=True)
     sent = bot.photo_calls[0]
     assert sent["photo"].data == data
-    assert ("Полные фото — в объявлении" in sent["caption"]) is notice
+    # Подпись ссылки одна для всех площадок, независимо от размера фото.
+    assert "Полные фото" not in sent["caption"]
+    assert "Открыть объявление на источнике" in sent["caption"]
     assert "https://cian.ru/1" in sent["caption"]
+
+
+async def test_text_post_has_no_link_preview() -> None:
+    bot = FakeBot()
+    pub = TelegramPublisher(dry_run=False, bot=bot)
+    assert await pub.publish(_scored(photos=[]), channel="42")
+    assert bot.message_calls[0]["disable_web_page_preview"] is True

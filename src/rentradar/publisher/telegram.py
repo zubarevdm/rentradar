@@ -32,7 +32,7 @@ from ..collectors.avito import fetch_detail
 from ..config import Settings, load_emoji
 from ..interfaces import Publisher
 from ..models import Listing, ScoreBreakdown, ScoredListing, Source
-from ..photos import image_dimensions, telegram_photo
+from ..photos import telegram_photo
 
 logger = logging.getLogger(__name__)
 
@@ -292,9 +292,6 @@ class TelegramPublisher(Publisher):
             # Через relay загрузка байтами (multipart) виснет по 60 с на попытку и
             # стопорит всю очередь рассылки. Telegram сам не тянет CDN Авито, но
             # берёт те же фото через wsrv.nl (как у Циана).
-            if not avito_full and scored.listing.enriched_at is None:
-                # Карточку не открыли — у нас только превью из выдачи.
-                text = text.replace("Открыть объявление на источнике", "Полные фото — в объявлении")
             jpeg_urls = [_wsrv_jpeg(url) for url in photos if _is_avito_cdn(url)][:cap]
             if jpeg_urls and await self._try_send(
                 channel, text, jpeg_urls, protect=protect, photo_timeout=12
@@ -309,11 +306,6 @@ class TelegramPublisher(Publisher):
         # работает) и грузим байтами. Полноразмер уже получен выше.
         if photos and scored.listing.source == Source.AVITO:
             photos = await self._download_photos(avito_full or photos)
-            sizes = [image_dimensions(photo.data) for photo in photos]
-            if sizes and all(size is not None and max(size) < 640 for size in sizes):
-                # A blocked original must not be presented as a sharp full-size image.
-                # The shorter link label keeps caption length and source intact.
-                text = text.replace("Открыть объявление на источнике", "Полные фото — в объявлении")
         # Защита от кражи контента (protect выше): в личке (платное) — по protect_bot,
         # в канале — по protect_public (use_custom_emoji=True только в личных чатах).
         if photos and scored.listing.source == Source.CIAN:
@@ -410,7 +402,8 @@ class TelegramPublisher(Publisher):
                 else:
                     await self._bot.send_message(
                         chat_id=channel, text=text,
-                        disable_web_page_preview=False, protect_content=protect,
+                        # Превью ссылки сильно удлиняет пост — без него.
+                        disable_web_page_preview=True, protect_content=protect,
                     )
                 return True
             except TelegramRetryAfter as exc:
