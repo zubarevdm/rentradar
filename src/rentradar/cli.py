@@ -413,6 +413,27 @@ async def _serve(settings: Settings) -> None:
         settings.dry_run,
     )
 
+    async def _wanted_by_subscribers(listings: list) -> list:
+        """Лоты, которые подходят под фильтр хотя бы одного подписчика с доступом.
+
+        Карточка Авито — лишний запрос через телефон-прокси, а каждый запрос
+        приближает 429. Тянем её только для лотов, которые реально уйдут в личку.
+        Данные карточки (комиссия, описание) могут лишь отсеять лот, но не добавить,
+        поэтому матчинг по данным из выдачи — надмножество итоговой рассылки.
+        Паблик-канал дотягивает карточку сам при отправке (fallback в паблишере).
+        """
+        if not listings:
+            return []
+        now = _utcnow()
+        active: dict[int, bool] = {}
+        filters = []
+        for flt in await personal_store.all_active_filters():
+            if flt.user_id not in active:
+                active[flt.user_id] = await personal_store.is_active(flt.user_id, now)
+            if active[flt.user_id]:
+                filters.append(flt)
+        return [lst for lst in listings if any(matches(lst, f) for f in filters)]
+
     async def enrich_job() -> None:
         """Дообогатить свежие Авито-лоты с детальных страниц: описание, залог,
         комиссия, полноразмер-фото (в выдаче их нет — поэтому у Авито не работали
@@ -431,8 +452,9 @@ async def _serve(settings: Settings) -> None:
         try:
             since = _utcnow() - timedelta(hours=24)
             cands = await storage.unenriched_listings(
-                Source.AVITO.value, since, settings.avito_detail_max_per_run
+                Source.AVITO.value, since, settings.avito_detail_max_per_run * 15
             )
+            cands = (await _wanted_by_subscribers(cands))[: settings.avito_detail_max_per_run]
             done = 0
             for listing in cands:
                 if done:  # пауза между запросами (не перед первым)
