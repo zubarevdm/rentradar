@@ -166,7 +166,9 @@ def _block_kind(resp: object) -> str | None:
 async def _fetch_with_access(
     access: avito_access.AvitoAccess, url: str, *, params: dict | None, timeout: float,
 ) -> str | None:
-    """Мобильный прокси: curl_cffi с куками и UA профиля браузера; при блоке — прогрев/смена IP и повтор."""
+    """Мобильный прокси: curl_cffi с куками и UA профиля браузера.
+
+    При блоке — прогрев/смена IP и повтор."""
     key = access.proxy or "direct"
     for attempt in range(2):
         try:
@@ -193,6 +195,7 @@ _AMOUNT = r"\d+(?: \d{3})*(?:[.,]\d+)?"
 _CURRENCY = r"(?:₽|руб\w*\.?|р\.|rub\b)"
 _PAYMENT_LABEL = r"(?:залог|(?:страховой )?депозит|комисси\w*)"
 _JSON_START = re.compile(r"[\{\[]")
+_GROUP_CHARS = re.compile(r"""[\\"'\[\]{}]""")
 
 
 def _terms_text(raw: str) -> str:
@@ -269,30 +272,42 @@ def _rental_amounts(text: str, price: int | None) -> tuple[int | None, int | Non
 def _structured_terms(document: str) -> list[str]:
     """Read nested JSON state without evaluating JavaScript or sibling adverts."""
     texts: list[str] = []
+    pairs = {"{": "}", "[": "]"}
 
-    def after_group(source: str, start: int) -> int:
-        """Skip an invalid JS object as a whole, including its nested adverts."""
-        pairs = {"{": "}", "[": "]"}
-        stack: list[str] = []
+    def group_ends(source: str, start: int, cache: dict[int, int | None]) -> int | None:
+        """Конец JS-группы, открытой в start (None — не закрылась до конца текста).
+
+        Скан с открывающей скобки заодно определяет концы всех вложенных групп,
+        встреченных вне кавычек: дальше они идут так же, как шёл бы скан с них
+        самих. Кэш делает разбор многомегабайтной страницы линейным, а не
+        квадратичным (раньше одна карточка разбиралась минутами и вешала бота).
+        """
+        if start in cache:
+            return cache[start]
+        stack: list[tuple[str, int]] = []
         quote: str | None = None
-        escaped = False
-        for offset in range(start, len(source)):
-            char = source[offset]
-            if escaped:
-                escaped = False
-            elif quote and char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            elif not quote and char in ('"', "'"):
+        skip = -1
+        for match in _GROUP_CHARS.finditer(source, start):
+            offset = match.start()
+            if offset == skip:  # символ после \ внутри строки
+                continue
+            char = match.group()
+            if quote:
+                if char == "\\":
+                    skip = offset + 1
+                elif char == quote:
+                    quote = None
+            elif char in ('"', "'"):
                 quote = char
-            elif not quote and char in pairs:
-                stack.append(pairs[char])
-            elif not quote and stack and char == stack[-1]:
-                stack.pop()
+            elif char in pairs:
+                stack.append((pairs[char], offset))
+            elif stack and char == stack[-1][0]:
+                cache[stack.pop()[1]] = offset + 1
                 if not stack:
                     return offset + 1
-        return start + 1
+        for _, opened in stack:
+            cache[opened] = None
+        return None
 
     def scalar(value: object) -> str:
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):
@@ -335,15 +350,22 @@ def _structured_terms(document: str) -> list[str]:
     decoded = html_lib.unescape(document)
     for _ in range(2):
         position = 0
+        cache: dict[int, int | None] = {}
         while match := _JSON_START.search(decoded, position):
             start = match.start()
+            end = group_ends(decoded, start, cache)
+            if end is None:  # незакрытая группа не может быть валидным JSON
+                position = start + 1
+                continue
+            # Декодируем только саму группу: ошибка raw_decode на полном документе
+            # считает номер строки от его начала — O(n) на каждую ложную «{».
             try:
-                value, end = decoder.raw_decode(decoded, start)
+                value, size = decoder.raw_decode(decoded[start:end])
             except ValueError:
-                position = after_group(decoded, start)
+                position = end  # невалидный JS-объект пропускаем целиком с вложенными
                 continue
             walk(value)
-            position = end
+            position = start + size
         decoded = decoded.replace(r'\"', '"').replace(r"\\", "\\")
     return texts
 
@@ -392,6 +414,13 @@ async def fetch_detail(
     if html is None:
         logger.warning("avito detail: не открыл %s (отказ источника или пауза запросов)", url)
         return None
+    # Страница — мегабайты HTML/JSON: разбор в потоке, чтобы не стопорить бота.
+    return await asyncio.to_thread(_detail_from_html, html, url, price, limit)
+
+
+def _detail_from_html(
+    html: str, url: str, price: int | None, limit: int,
+) -> AvitoDetail | None:
     tree = HTMLParser(html)
     title_node = tree.css_first("title")
     title = title_node.text(strip=True).lower() if title_node else ""

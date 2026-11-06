@@ -115,3 +115,25 @@ async def test_search_fills_missing_terms_in_legacy_enriched_row(storage, sample
     assert await storage.upsert_listings([fresh]) == []
     saved = await storage.get_listing("avito", listing.external_id)
     assert saved.commission_amount == 0 and saved.move_in_total == listing.price + 50000
+
+
+def test_structured_terms_large_page_is_linear() -> None:
+    """Регрессия 06.11: на 2 МБ HTML разбор шёл минутами (raw_decode по всему
+    документу на каждой ложной «{») и вешал event loop бота."""
+    import time
+
+    from rentradar.collectors.avito import _structured_terms
+
+    state = (
+        '<script type="application/json">{"depositCommission":"залог 50000 ₽",'
+        '"items":[{"title":"Комиссия","value":"0 ₽"}]}</script>'
+    )
+    page = (
+        "<html><script>var re=/\"/;" + "f(x){g([1,2]);}" * 60000 + "</script>"
+        + "<p>it's {a [" * 2000 + "</p>" + state + "</html>"
+    )
+    started = time.monotonic()
+    texts = _structured_terms(page)
+    assert time.monotonic() - started < 5
+    assert "залог 50000 ₽" in texts
+    assert any(t.startswith("Комиссия: 0 ₽") for t in texts)
