@@ -409,7 +409,7 @@ async def _serve(settings: Settings) -> None:
         else f"каждые {settings.poll_interval_min}м"
     )
     log.info(
-        "serve: сбор/%dм · топ-%d %s (окно %dч) · личная/1м · vision=%s · бот=%s · dry=%s",
+        "serve: сбор/%gм · топ-%d %s (окно %dч) · личная/1м · vision=%s · бот=%s · dry=%s",
         settings.collect_interval_min,
         settings.max_posts_per_run,
         post_when,
