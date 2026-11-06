@@ -62,6 +62,13 @@ def test_build_query() -> None:
     assert "STUDIO" in rooms and "1" in rooms  # студия (0) → STUDIO
 
 
+def test_two_room_query_uses_category_with_same_price_range() -> None:
+    profile = SearchProfile(name="t", city="Москва", rooms=[2], price_min=50000, price_max=150000)
+    url, params = YandexCollector.build_query(profile, region="moskva", page=1)
+    assert url.endswith("/moskva/snyat/kvartira/dvuhkomnatnaya/")
+    assert dict(params) == {"sort": "DATE_DESC", "priceMin": "50000", "priceMax": "150000"}
+
+
 # ── нормализация ───────────────────────────────────────────────────────────
 def test_normalize_flat(collector: YandexCollector, page_html: str) -> None:
     offers = _extract_offers(page_html)

@@ -184,9 +184,15 @@ class YandexCollector(HttpCollector):
         """Собрать URL страницы поиска и query-параметры из профиля."""
         url = f"{BASE}/{region}/snyat/kvartira/"
         params: list[tuple[str, str]] = [("sort", "DATE_DESC")]
-        for r in sorted(set(profile.rooms)):
-            if r in ROOM_PARAM:
-                params.append(("roomsTotal", ROOM_PARAM[r]))
+        rooms = sorted(set(profile.rooms))
+        # Для двушек Яндекс отдаёт отдельную страницу категории. На VPS она
+        # возвращала объявления, когда общий поиск с roomsTotal=2 выдавал капчу.
+        if rooms == [2]:
+            url += "dvuhkomnatnaya/"
+        else:
+            for r in rooms:
+                if r in ROOM_PARAM:
+                    params.append(("roomsTotal", ROOM_PARAM[r]))
         if profile.price_min is not None:
             params.append(("priceMin", str(profile.price_min)))
         if profile.price_max is not None:
