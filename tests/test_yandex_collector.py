@@ -231,7 +231,7 @@ async def test_fallback_fetches_only_first_page(page_html: str) -> None:
     assert calls == ["direct", "backup"]
 
 
-async def test_later_captcha_keeps_first_page_without_using_proxy(page_html: str) -> None:
+async def test_later_captcha_keeps_first_page_and_pauses_pagination(page_html: str) -> None:
     def direct(request: httpx.Request) -> httpx.Response:
         if request.url.params.get("page") == "2":
             return _captcha(request)
@@ -243,6 +243,14 @@ async def test_later_captcha_keeps_first_page_without_using_proxy(page_html: str
 
     assert len(await collector.fetch(SearchProfile(name="t", city="Москва"))) == 3
     assert calls == ["direct", "direct"]
+
+    other_profile = SearchProfile(name="other", city="Москва", rooms=[2])
+    assert len(await collector.fetch(other_profile)) == 3
+    assert calls == ["direct", "direct", "direct"]
+
+    collector._pagination_paused_until = 0.0
+    assert len(await collector.fetch(other_profile)) == 3
+    assert calls == ["direct", "direct", "direct", "direct", "direct"]
 
 
 async def test_failed_preferred_proxy_retries_primary_immediately(page_html: str) -> None:

@@ -37,6 +37,7 @@ from .base import HttpCollector
 logger = logging.getLogger(__name__)
 
 BASE = "https://realty.yandex.ru"
+_PAGINATION_PAUSE_SEC = 1800.0
 
 # Город → slug в URL Яндекса.
 REGION_SLUG: dict[str, str] = {
@@ -76,6 +77,7 @@ class YandexCollector(HttpCollector):
         self._fallback_proxy = fallback_proxy or None
         self._fallback_hold_sec = fallback_hold_sec
         self._fallback_until = 0.0
+        self._pagination_paused_until = 0.0
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         region = REGION_SLUG.get(profile.city.strip().lower(), "moskva")
@@ -90,6 +92,9 @@ class YandexCollector(HttpCollector):
                     try:
                         offers = await self._get_offers(client, url)
                     except CollectorBlockedError as exc:
+                        # Если страница 1 доступна, временно оставляем только
+                        # свежую выдачу для всех профилей на этом маршруте.
+                        self._pagination_paused_until = time.monotonic() + _PAGINATION_PAUSE_SEC
                         if not results:
                             raise
                         logger.warning(
@@ -106,7 +111,7 @@ class YandexCollector(HttpCollector):
                     if len(results) >= limit:
                         return results
                 # Мобильный прокси делит трафик с Авито. Свежие офферы идут первыми.
-                if via_backup:
+                if via_backup or time.monotonic() < self._pagination_paused_until:
                     break
         return results
 
