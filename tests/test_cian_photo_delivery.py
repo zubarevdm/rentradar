@@ -132,3 +132,47 @@ async def test_cian_jpeg_proxy_sends_three_validated_urls():
         assert parsed.hostname == "wsrv.nl"
         query = parse_qs(parsed.query)
         assert query["url"] == [source] and query["output"] == ["jpg"]
+
+
+def _avito_scored(photos: list[str]):
+    from datetime import datetime
+
+    from rentradar.models import Source
+
+    scored = _scored(photos=photos)
+    listing = scored.listing.model_copy(update={
+        "source": Source.AVITO, "url": "https://www.avito.ru/moskva/kvartiry/x_1",
+        "enriched_at": datetime(2026, 11, 6),  # без похода за карточкой
+    })
+    return scored.model_copy(update={"listing": listing})
+
+
+async def test_avito_via_relay_sends_wsrv_urls_without_upload(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    bot = FakeBot()
+    pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Relay must not upload Avito photos as multipart")
+
+    monkeypatch.setattr(pub, "_download_photos", forbidden)
+    original = [f"https://{i}0.img.avito.st/image/1/p{i}?cqp=2.x" for i in range(3)]
+    assert await pub.publish(_avito_scored(original), channel="test")
+    media = bot.album_calls[0]["media"]
+    assert bot.album_calls[0]["request_timeout"] == 12
+    assert [parse_qs(urlsplit(m.media).query)["url"][0] for m in media] == original
+    assert all(urlsplit(m.media).hostname == "wsrv.nl" for m in media)
+
+
+async def test_avito_via_relay_falls_back_to_text_quickly(monkeypatch):
+    bot = FakeBot(fail={"album", "photo"})
+    pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Relay must not upload Avito photos as multipart")
+
+    monkeypatch.setattr(pub, "_download_photos", forbidden)
+    photos = ["https://10.img.avito.st/a", "https://20.img.avito.st/b", "https://evil.example/c"]
+    assert await pub.publish(_avito_scored(photos), channel="test")
+    assert len(bot.message_calls) == 1

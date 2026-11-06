@@ -11,14 +11,13 @@
 
 from __future__ import annotations
 
-from urllib.parse import urlencode
-
 import asyncio
 import html
 import logging
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from aiogram import Bot
@@ -288,6 +287,24 @@ class TelegramPublisher(Publisher):
             return True
 
         photos: list = avito_full or _select_photos(scored.listing, cap)
+        protect = self._protect_bot if use_custom_emoji else self._protect_public
+        if photos and scored.listing.source == Source.AVITO and self._via_relay:
+            # Через relay загрузка байтами (multipart) виснет по 60 с на попытку и
+            # стопорит всю очередь рассылки. Telegram сам не тянет CDN Авито, но
+            # берёт те же фото через wsrv.nl (как у Циана).
+            if not avito_full and scored.listing.enriched_at is None:
+                # Карточку не открыли — у нас только превью из выдачи.
+                text = text.replace("Открыть объявление на источнике", "Полные фото — в объявлении")
+            jpeg_urls = [_wsrv_jpeg(url) for url in photos if _is_avito_cdn(url)][:cap]
+            if jpeg_urls and await self._try_send(
+                channel, text, jpeg_urls, protect=protect, photo_timeout=12
+            ):
+                return True
+            if len(jpeg_urls) > 1 and await self._try_send(
+                channel, text, jpeg_urls[:1], protect=protect, photo_timeout=8
+            ):
+                return True
+            return await self._try_send(channel, text, [], protect=protect)
         # Telegram не может стянуть фото Авито с CDN — скачиваем сами (наш IP
         # работает) и грузим байтами. Полноразмер уже получен выше.
         if photos and scored.listing.source == Source.AVITO:
@@ -297,17 +314,13 @@ class TelegramPublisher(Publisher):
                 # A blocked original must not be presented as a sharp full-size image.
                 # The shorter link label keeps caption length and source intact.
                 text = text.replace("Открыть объявление на источнике", "Полные фото — в объявлении")
-        # Защита от кражи контента: в личке (платное) — по protect_bot, в канале —
-        # по protect_public (use_custom_emoji=True только в личных чатах).
-        protect = self._protect_bot if use_custom_emoji else self._protect_public
+        # Защита от кражи контента (protect выше): в личке (платное) — по protect_bot,
+        # в канале — по protect_public (use_custom_emoji=True только в личных чатах).
         if photos and scored.listing.source == Source.CIAN:
             if self._cian_jpeg_proxy_enabled:
                 # Only rehost public image URLs from Cian's known photo CDN.
                 jpeg_urls = [
-                    "https://wsrv.nl/?" + urlencode({
-                        "url": url, "w": 1200, "h": 1200, "we": 1, "output": "jpg", "q": 85,
-                    })
-                    for url in photos[:3]
+                    _wsrv_jpeg(url) for url in photos[:3]
                     if url.startswith("https://images.cdn-cian.ru/")
                 ]
                 if jpeg_urls and await self._try_send(
@@ -421,6 +434,18 @@ class TelegramPublisher(Publisher):
 
 def _money(value: float) -> str:
     return f"{round(value):,}".replace(",", " ")
+
+
+def _wsrv_jpeg(url: str) -> str:
+    """Публичный JPEG-прокси wsrv.nl: Telegram сам скачивает фото по этой ссылке."""
+    return "https://wsrv.nl/?" + urlencode({
+        "url": url, "w": 1200, "h": 1200, "we": 1, "output": "jpg", "q": 85,
+    })
+
+
+def _is_avito_cdn(url: str) -> bool:
+    host = urlsplit(url).hostname or ""
+    return url.startswith("https://") and (host == "img.avito.st" or host.endswith(".img.avito.st"))
 
 
 def _select_photos(listing: Listing, max_photos: int) -> list[str]:
