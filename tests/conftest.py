@@ -9,6 +9,23 @@ import pytest
 from rentradar.models import DealType, Listing, PropertyType, Source
 
 
+@pytest.fixture(autouse=True)
+def isolated_avito_transport(monkeypatch):
+    from rentradar.collectors import avito, avito_access
+
+    for name in (
+        "_blocked_until", "_block_attempts", "_pending_recovery",
+        "_last_request_at", "_request_locks",
+    ):
+        monkeypatch.setattr(avito, name, {})
+    monkeypatch.setattr(avito, "_request_delay_seconds", 0.0)
+    monkeypatch.setattr(avito, "_block_cooldown_seconds", 720.0)
+    monkeypatch.setattr(avito_access, "_proxy_locks", {})
+    avito_access.configure(None)
+    yield
+    avito_access.configure(None)
+
+
 @pytest.fixture
 def sample_listing() -> Listing:
     return Listing(

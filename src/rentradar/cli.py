@@ -26,9 +26,8 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import ccagent
-from .collectors import AvitoCollector, CianCollector, YandexCollector
-from .collectors import avito_access
-from .collectors.avito import fetch_detail, set_request_cooldown
+from .collectors import AvitoCollector, CianCollector, YandexCollector, avito_access
+from .collectors.avito import set_request_cooldown, set_request_delay
 from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .errors import CollectorBlockedError
 from .models import ScoredListing, Source, source_rank
@@ -39,6 +38,7 @@ from .personal.dispatcher import PersonalDispatcher
 from .personal.filters import matches
 from .personal.navigation import nudge_keyboard
 from .pipeline import Pipeline
+from .preparation import AvitoPreparer
 from .publisher import TelegramPublisher
 from .scoring import TastyScoringEngine
 from .storage import SqlMarketStatsProvider, SqlStorage
@@ -257,10 +257,11 @@ async def _recompute_stats(settings: Settings) -> None:
         await storage.dispose()
 
 
-def _build_collectors(settings: Settings) -> list:
+def _build_collectors(settings: Settings, *, scheduled: bool = False) -> list:
     """Все активные коллекторы площадок. Добавление площадки = строка здесь.
     Авито — через прокси (если задан в .env), т.к. на VPS его банят напрямую."""
-    set_request_cooldown(settings.avito_collect_interval_min * 60)
+    set_request_cooldown(settings.avito_block_cooldown_min * 60)
+    set_request_delay(settings.avito_request_delay_sec)
     if settings.avito_browser_warmup and settings.avito_proxy and avito_access.current() is None:
         avito_access.configure(avito_access.AvitoAccess(
             proxy=settings.avito_proxy,
@@ -278,7 +279,7 @@ def _build_collectors(settings: Settings) -> list:
             AvitoCollector(
                 proxy=settings.avito_proxy or None,
                 max_pages=settings.avito_max_pages,
-                min_interval_sec=settings.avito_collect_interval_min * 60,
+                min_interval_sec=0 if scheduled else settings.avito_collect_interval_min * 60,
             )
         )
     return collectors
@@ -352,6 +353,7 @@ async def _serve(settings: Settings) -> None:
         publisher = TelegramPublisher(
             dry_run=False,
             storage=storage,
+            prepare_personal_separately=True,
             bot=bot,
             via_relay=bool(settings.telegram_api_base),
             cian_jpeg_proxy_enabled=settings.cian_jpeg_proxy_enabled,
@@ -371,6 +373,7 @@ async def _serve(settings: Settings) -> None:
         publisher = TelegramPublisher(
             dry_run=True,
             storage=storage,
+            prepare_personal_separately=True,
             max_photos_personal=settings.max_photos_personal,
             max_photos_public=settings.max_photos_public,
             show_renovation=settings.vision_enabled and settings.show_renovation_in_post,
@@ -384,7 +387,7 @@ async def _serve(settings: Settings) -> None:
         )
 
     pipeline = Pipeline(
-        collectors=_build_collectors(settings),
+        collectors=_build_collectors(settings, scheduled=True),
         storage=storage,
         scoring=TastyScoringEngine(SqlMarketStatsProvider(storage)),
         publisher=publisher,
@@ -399,6 +402,7 @@ async def _serve(settings: Settings) -> None:
         scoring=TastyScoringEngine(SqlMarketStatsProvider(storage)),
         publisher=publisher,
         settings=settings,
+        require_prepared_avito=True,
     )
     analyzer = build_analyzer(settings)  # None при пустом ключе → vision выключен
     vision_scoring = TastyScoringEngine(SqlMarketStatsProvider(storage))
@@ -440,95 +444,58 @@ async def _serve(settings: Settings) -> None:
                 filters.append(flt)
         return [lst for lst in listings if any(matches(lst, f) for f in filters)]
 
-    async def enrich_job() -> None:
-        """Дообогатить свежие Авито-лоты с детальных страниц: описание, залог,
-        комиссия, полноразмер-фото (в выдаче их нет — поэтому у Авито не работали
-        «Заехать», фильтр «без посредников» и текстовый скам-гейт). Вежливый темп;
-        при блоке антибота проход прерывается до следующего сбора."""
-        if not settings.avito_enabled or settings.avito_detail_max_per_run <= 0:
-            return
-        # Гейт частоты: детальные страницы Авито бьют по тому же IP, что и поиск.
-        # Не чаще avito_collect_interval_min, иначе не выйти из рейт-лимита 429.
-        last_enrich = runtime.get("last_enrich_at")
-        if last_enrich is not None and (
-            (_utcnow() - last_enrich).total_seconds() < settings.avito_collect_interval_min * 60
-        ):
-            return
-        runtime["last_enrich_at"] = _utcnow()
-        try:
-            since = _utcnow() - timedelta(hours=24)
-            cands = await storage.unenriched_listings(
-                Source.AVITO.value, since, settings.avito_detail_max_per_run * 15
-            )
-            cands = (await _wanted_by_subscribers(cands))[: settings.avito_detail_max_per_run]
-            done = 0
-            for listing in cands:
-                if done:  # пауза между запросами (не перед первым)
-                    await asyncio.sleep(settings.avito_detail_delay_sec)
-                detail = await fetch_detail(
-                    listing.url,
-                    price=listing.price,
-                    proxy=settings.avito_proxy or None,
-                )
-                if detail is None:
-                    log.warning(
-                        "Обогащение Авито: блок/ошибка после %d/%d — жду следующего сбора",
-                        done,
-                        len(cands),
-                    )
-                    break
-                await storage.save_enrichment(
-                    listing.source.value,
-                    listing.external_id,
-                    enriched_at=_utcnow(),
-                    description=detail.description,
-                    deposit_rub=detail.deposit_rub,
-                    commission_pct=detail.commission_pct,
-                    commission_rub=detail.commission_rub,
-                    deposit_due_rub=detail.deposit_due_rub,
-                    deposit_installments=detail.deposit_installments,
-                    upfront_payments=detail.upfront_payments,
-                    utilities_rub=detail.utilities_rub,
-                    utilities_included=detail.utilities_included,
-                    meters_included=detail.meters_included,
-                    photos=detail.photos,
-                    deposit_present=detail.deposit_present,
-                    commission_present=detail.commission_present,
-                )
-                done += 1
-            if done:
-                log.info("Обогащение Авито: %d лотов", done)
-        except Exception:  # noqa: BLE001
-            log.exception("Ошибка обогащения Авито")
-
     immediate_delivery = asyncio.Event()
+    preparer = AvitoPreparer(storage, personal_store, settings, immediate_delivery.set)
+    source_intervals = {
+        Source.CIAN.value: settings.collect_interval_min,
+        Source.YANDEX.value: settings.yandex_collect_interval_min,
+    }
+    if settings.avito_enabled:
+        source_intervals[Source.AVITO.value] = settings.avito_collect_interval_min
+    source_locks = {source: asyncio.Lock() for source in source_intervals}
 
-    async def collect_job() -> None:
-        total = 0
-        notify_delivery = None if settings.avito_enabled else immediate_delivery.set
-        try:
-            await storage.recompute_market_stats(window_days=settings.market_window_days)
-            agg: dict[str, list[str]] = {}
-            for p in profiles:
-                new, statuses = await pipeline.collect_only(p, on_new=notify_delivery)
-                total += new
-                for src, st in statuses.items():
-                    agg.setdefault(src, []).append(st)
-            log.info("Сбор: новых лотов = %d", total)
-            runtime["last_collect_at"] = _utcnow()
-            runtime["last_collect_new"] = total
-            await _check_source_health(agg)  # 🔴/🟢 при смене состояния площадки
-            # Сразу дообогащаем свежий Авито — до vision-прохода и постинга.
-            await enrich_job()
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Ошибка сбора")
-            await _alert_admin(
-                f"⚠️ Джоб сбора упал: {type(exc).__name__}: {exc}",
-                key="job:collect",
-                cooldown_h=1,
-            )
-        if total and notify_delivery is None:
-            immediate_delivery.set()
+    async def collect_job(source: str) -> int:
+        # Covers startup and scheduled invocations of the same source.
+        lock = source_locks[source]
+        if lock.locked():
+            return 0
+        async with lock:
+            total = 0
+            try:
+                if source == Source.CIAN.value:
+                    await storage.recompute_market_stats(window_days=settings.market_window_days)
+                selected_profiles = profiles
+                if source == Source.AVITO.value:
+                    # Avito's search is city-wide; profile filters are applied in
+                    # our database. Fetch each city's largest requested limit once.
+                    by_city = {}
+                    for profile in profiles:
+                        key = profile.city.strip().casefold()
+                        previous = by_city.get(key)
+                        if previous is None or profile.collect_limit > previous.collect_limit:
+                            by_city[key] = profile
+                    selected_profiles = list(by_city.values())
+                agg: dict[str, list[str]] = {}
+                for profile in selected_profiles:
+                    new, statuses = await pipeline.collect_only(
+                        profile, source=source, on_new=immediate_delivery.set,
+                    )
+                    total += new
+                    for src, status in statuses.items():
+                        agg.setdefault(src, []).append(status)
+                log.info("Сбор [%s]: новых лотов = %d", source, total)
+                runtime["last_collect_at"] = _utcnow()
+                runtime["last_collect_new"] = total
+                await _check_source_health(agg)
+                if source == Source.AVITO.value:
+                    await preparer.run()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Ошибка сбора [%s]", source)
+                await _alert_admin(
+                    f"⚠️ Джоб сбора {source} упал: {type(exc).__name__}: {exc}",
+                    key=f"job:collect:{source}", cooldown_h=1,
+                )
+            return total
 
     async def public_job() -> None:
         if public_paused["on"]:
@@ -823,7 +790,12 @@ async def _serve(settings: Settings) -> None:
             await _alert_admin(phone_texts[(part, ok)], key=f"phone:{part}", cooldown_h=0)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(collect_job, "interval", minutes=max(1, settings.collect_interval_min))
+    for source, interval in source_intervals.items():
+        scheduler.add_job(
+            collect_job, "interval", minutes=max(1, interval), args=[source],
+            id=f"collect_{source}", max_instances=1, coalesce=True,
+        )
+        log.info("Расписание %s: каждые %g мин", source, interval)
     if phone_monitor is not None:
         scheduler.add_job(phone_job, "interval", minutes=max(1, settings.avito_phone_check_min))
     # Публичный постинг: по часам-пикам (MSK), иначе — почасовой запасной режим.
@@ -869,9 +841,10 @@ async def _serve(settings: Settings) -> None:
         # На старте — сбор + первый vision-проход (чтобы БД и личка сразу со свежими
         # данными и анализом). Публичный постинг НЕ дёргаем: иначе каждый рестарт =
         # пачка постов в канал. Он пойдёт по расписанию (раз в poll_interval_min).
-        await collect_job()
+        await asyncio.gather(*(collect_job(source) for source in source_intervals))
         await vision_job()
 
+    startup_task = None
     try:
         if bot is not None:
             dp = Dispatcher(storage=MemoryStorage())
@@ -944,9 +917,11 @@ async def _serve(settings: Settings) -> None:
                 if not _is_admin(message):
                     return
                 await message.answer("⏳ Запускаю сбор…")
-                await collect_job()
+                counts = await asyncio.gather(*(
+                    collect_job(source) for source in source_intervals
+                ))
                 await message.answer(
-                    f"✅ Собрано, новых: {runtime['last_collect_new']}. /health — детали."
+                    f"✅ Собрано, новых: {sum(counts)}. /health — детали."
                 )
 
             @dp.message(Command("pausepublic"))
@@ -1096,7 +1071,7 @@ async def _serve(settings: Settings) -> None:
 
                 asyncio.create_task(_bg())  # не блокируем поллинг на минуты
 
-            asyncio.create_task(startup_jobs())  # параллельно с поллингом
+            startup_task = asyncio.create_task(startup_jobs())  # параллельно с поллингом
             log.info("Бот на связи: /start /new /myfilters /status /buy · админ: /admin")
             await dp.start_polling(bot)
         else:
@@ -1106,6 +1081,9 @@ async def _serve(settings: Settings) -> None:
         log.info("Остановка serve по сигналу")
     finally:
         scheduler.shutdown(wait=False)
+        if startup_task is not None:
+            startup_task.cancel()
+            await asyncio.gather(startup_task, return_exceptions=True)
         delivery_task.cancel()
         await asyncio.gather(delivery_task, return_exceptions=True)
         if bot is not None:

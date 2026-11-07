@@ -32,6 +32,7 @@ from ..models import (
     RawListing,
     Source,
 )
+from . import avito_access
 from .base import HttpCollector
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,8 @@ class YandexCollector(HttpCollector):
         self._fallback_hold_sec = fallback_hold_sec
         self._fallback_until = 0.0
         self._pagination_paused_until = 0.0
+        self._query_paused_until: dict[str, float] = {}
+        self._query_failures: dict[str, int] = {}
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         region = REGION_SLUG.get(profile.city.strip().lower(), "moskva")
@@ -147,6 +150,8 @@ class YandexCollector(HttpCollector):
         self, client: AsyncSession, url: str,
     ) -> tuple[list[dict], bool]:
         """Пробуем каждый настроенный маршрут не больше одного раза."""
+        if time.monotonic() < self._query_paused_until.get(url, 0):
+            raise CollectorBlockedError("Яндекс: пауза после отказа обоих маршрутов")
         prefer_backup = self._on_fallback()
         if prefer_backup:
             routes = (True, False)
@@ -160,7 +165,10 @@ class YandexCollector(HttpCollector):
             route = "резервный прокси" if via_backup else "основной маршрут"
             try:
                 if via_backup:
-                    async with self._search_session(self._fallback_proxy) as backup:
+                    async with (
+                        avito_access.proxy_lock(self._fallback_proxy),
+                        self._search_session(self._fallback_proxy) as backup,
+                    ):
                         offers = await self._get_offers(backup, url)
                 else:
                     offers = await self._get_offers(client, url)
@@ -173,8 +181,13 @@ class YandexCollector(HttpCollector):
                 self._fallback_until = time.monotonic() + self._fallback_hold_sec
             if failures:
                 logger.warning("Яндекс: %s. Выдача получена (%s)", failures[0], route)
+            self._query_failures.pop(url, None)
+            self._query_paused_until.pop(url, None)
             return offers, via_backup
 
+        failures_count = min(self._query_failures.get(url, 0) + 1, 3)
+        self._query_failures[url] = failures_count
+        self._query_paused_until[url] = time.monotonic() + 300 * 2 ** (failures_count - 1)
         raise CollectorBlockedError(f"Яндекс: {'; '.join(failures)}")
 
     @staticmethod

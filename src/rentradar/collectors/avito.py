@@ -23,6 +23,7 @@ import re
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from typing import NamedTuple
 
 from curl_cffi import requests as cffi_requests
@@ -71,12 +72,38 @@ _rotator = _FingerprintRotator(_IMPERSONATE_PROFILES)
 _blocked_until: dict[str, float] = {}
 _request_locks: dict[str, asyncio.Lock] = {}
 _block_cooldown_seconds = 12 * 60.0
+_block_attempts: dict[str, int] = {}
+_pending_recovery: dict[str, bool] = {}
+_last_request_at: dict[str, float] = {}
+_request_delay_seconds = 0.0
 
 
 def set_request_cooldown(seconds: float) -> None:
     """Use the existing configured source interval for all Avito callers."""
     global _block_cooldown_seconds
     _block_cooldown_seconds = max(1.0, seconds)
+
+
+def set_request_delay(seconds: float) -> None:
+    global _request_delay_seconds
+    _request_delay_seconds = max(0.0, seconds)
+
+
+def _pause_requests(key: str, resp: object | None = None) -> None:
+    failures = min(_block_attempts.get(key, 0) + 1, 7)
+    _block_attempts[key] = failures
+    delay = min(_block_cooldown_seconds * 2 ** (failures - 1), 30 * 60)
+    retry = (getattr(resp, "headers", {}) or {}).get("Retry-After", "")
+    try:
+        retry_seconds = float(retry)
+    except (ValueError, TypeError):
+        try:
+            retry_seconds = parsedate_to_datetime(retry).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            retry_seconds = 0.0
+    delay = max(delay, retry_seconds)
+    _blocked_until[key] = time.monotonic() + delay
+    logger.warning("avito: пауза после отказа %.0f секунд", delay)
 
 
 def _blocking_get(
@@ -116,7 +143,20 @@ async def _avito_fetch_html(
     async with lock:
         if time.monotonic() < _blocked_until.get(key, 0):
             return None
-        return await _fetch_with_profiles(url, params=params, proxy=proxy, timeout=timeout)
+        wait = _last_request_at.get(key, 0) + _request_delay_seconds - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            async with avito_access.proxy_lock(proxy):
+                result = await _fetch_with_profiles(
+                    url, params=params, proxy=proxy, timeout=timeout,
+                )
+            if result is not None:
+                _block_attempts[key] = max(0, _block_attempts.get(key, 0) - 1)
+                _blocked_until.pop(key, None)
+            return result
+        finally:
+            _last_request_at[key] = time.monotonic()
 
 
 async def _fetch_with_profiles(
@@ -137,17 +177,14 @@ async def _fetch_with_profiles(
             "доступ ограничен", "проверка безопасности", "подтвердите, что вы не робот",
         ))
         if resp.status_code in (429, 439) or challenge:
-            retry = (getattr(resp, "headers", {}) or {}).get("Retry-After", "")
-            delay = max(_block_cooldown_seconds, float(retry) if str(retry).isdigit() else 0)
-            _blocked_until[key] = time.monotonic() + delay
-            logger.warning("avito: HTTP %s, пауза запросов %.0f секунд",
-                           resp.status_code, delay)
+            logger.warning("avito: HTTP %s, запросы приостановлены", resp.status_code)
+            _pause_requests(key, resp)
             return None
         blocked = resp.status_code != 200
         if not blocked:
             _rotator.mark_good(imp)
             return resp.text
-    _blocked_until[key] = time.monotonic() + _block_cooldown_seconds
+    _pause_requests(key)
     return None
 
 
@@ -166,26 +203,29 @@ def _block_kind(resp: object) -> str | None:
 async def _fetch_with_access(
     access: avito_access.AvitoAccess, url: str, *, params: dict | None, timeout: float,
 ) -> str | None:
-    """Мобильный прокси: curl_cffi с куками и UA профиля браузера.
-
-    При блоке — прогрев/смена IP и повтор."""
+    """One probe after cooldown; recovery never triggers an immediate retry."""
     key = access.proxy or "direct"
-    for attempt in range(2):
-        try:
-            resp = await asyncio.to_thread(
-                _blocking_get, url, avito_access.IMPERSONATE, params, access.proxy, timeout,
-                access.cookies, access.headers,
-            )
-        except Exception as exc:  # noqa: BLE001 — сеть/прокси (телефон переподключается)
-            logger.warning("avito via proxy: %s: %s", type(exc).__name__, exc)
-            break
-        kind = _block_kind(resp)
-        if kind is None:
-            return resp.text
-        logger.warning("avito: HTTP %s (%s), попытка %d", resp.status_code, kind, attempt + 1)
-        if attempt or not await access.recover(ip_banned=kind == "ip"):
-            break
-    _blocked_until[key] = time.monotonic() + _block_cooldown_seconds
+    if key in _pending_recovery:
+        ip_banned = _pending_recovery.pop(key)
+        if not await access.recover(ip_banned=ip_banned):
+            _pending_recovery[key] = ip_banned
+            _pause_requests(key)
+            return None
+    try:
+        resp = await asyncio.to_thread(
+            _blocking_get, url, avito_access.IMPERSONATE, params, access.proxy, timeout,
+            access.cookies, access.headers,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("avito via proxy: %s: %s", type(exc).__name__, exc)
+        _pause_requests(key)
+        return None
+    kind = _block_kind(resp)
+    if kind is None:
+        return resp.text
+    logger.warning("avito: HTTP %s (%s), запросы приостановлены", resp.status_code, kind)
+    _pending_recovery[key] = kind == "ip"
+    _pause_requests(key, resp)
     return None
 # Полноразмерные фото (1280x960) в JSON страницы объявления — экранированы: \"1280x960\":\"URL\".
 _FULL_PHOTO_RE = re.compile(r'\\"1280x960\\":\\"(https://[^\\"]+?)\\"')

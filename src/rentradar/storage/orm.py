@@ -79,6 +79,8 @@ class ListingRow(Base):
     analyzed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     # Дообогащение с детальной страницы площадки (Авито)
     enriched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    prepared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    detail_attempted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     photos: Mapped[list] = mapped_column(JSON, default=list)
     contact_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
 

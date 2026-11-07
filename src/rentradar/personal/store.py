@@ -15,6 +15,7 @@ from sqlalchemy import case, func, select, text
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..models import Listing
 from ..storage import SqlStorage
 from ..storage.orm import ListingRow, ManualPaymentRow, SubscriberRow, UserFilterRow, UserSentRow
 from .access import TARIFFS, TRIAL, Access, access_of, add_hours, normalize_pause, utcnow
@@ -108,6 +109,28 @@ class PersonalStore:
                 await session.execute(select(UserFilterRow).where(UserFilterRow.active.is_(True)))
             ).scalars()
             return [_row_to_filter(r) for r in rows]
+
+    async def pending_listings(self, listings: list[Listing], now: datetime) -> list[Listing]:
+        """Cards with at least one active, matching, unhandled recipient."""
+        active = {}
+        filters = []
+        for flt in await self.all_active_filters():
+            if flt.user_id not in active:
+                active[flt.user_id] = await self.is_active(flt.user_id, now)
+            if active[flt.user_id]:
+                filters.append(flt)
+        result = []
+        for listing in listings:
+            for flt in filters:
+                if (not flt.include_backlog and flt.last_checked_at is not None
+                        and flt.created_at is not None and listing.collected_at < flt.created_at):
+                    continue
+                if matches(listing, flt) and not await self.was_sent(
+                    flt.user_id, listing.content_key,
+                ):
+                    result.append(listing)
+                    break
+        return result
 
     async def admin_stats(self, now: datetime) -> dict[str, int]:
         rows = await self.lifecycle_candidates()
@@ -486,4 +509,5 @@ def _row_to_filter(row: UserFilterRow) -> UserFilter:
         # NULL у старых строк → True (по умолчанию показываем всё).
         include_backlog=row.include_backlog if row.include_backlog is not None else True,
         last_checked_at=row.last_checked_at,
+        created_at=row.created_at,
     )

@@ -131,12 +131,21 @@ class Listing(BaseModel):
     # Дообогащение с детальной страницы (Авито: описание/залог/комиссия/полноразмер-
     # фото). None = либо всё было в выдаче (Циан/Яндекс), либо ещё не дошла очередь.
     enriched_at: datetime | None = None
+    # Preparation also completes when details are temporarily unavailable. Keep
+    # that attempt separate from successful, complete enrichment.
+    prepared_at: datetime | None = None
+    detail_attempted_at: datetime | None = None
 
     photos: list[str] = Field(default_factory=list)
     contact_hash: str | None = None
 
     published_at: datetime | None = None
     collected_at: datetime
+
+    @property
+    def available_at(self) -> datetime:
+        """A prepared Avito card can become deliverable after a filter's check."""
+        return max(self.collected_at, self.prepared_at or self.collected_at)
 
     @field_validator("city", "district", "address", "metro")
     @classmethod

@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import median
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -80,6 +80,8 @@ class SqlStorage(Storage):
                             row.deposit_installments = False
                             row.upfront_payments = {}
                             row.enriched_at = None
+                            row.prepared_at = None
+                            row.detail_attempted_at = None
                         else:
                             # These collectors provide payment fields on each
                             # search card, so use their current snapshot.
@@ -158,7 +160,7 @@ class SqlStorage(Storage):
                 await session.execute(
                     select(ListingRow)
                     .where(ListingRow.city == city)
-                    .where(ListingRow.collected_at >= since)
+                    .where(or_(ListingRow.collected_at >= since, ListingRow.prepared_at >= since))
                     .order_by(ListingRow.published_at.desc(), ListingRow.collected_at.desc())
                 )
             ).scalars()
@@ -180,21 +182,42 @@ class SqlStorage(Storage):
             ).scalars()
             return [_row_to_listing(r) for r in rows]
 
-    async def unenriched_listings(self, source: str, since: datetime, limit: int) -> list[Listing]:
+    async def unenriched_listings(
+        self, source: str, since: datetime, limit: int | None,
+        *, retry_before: datetime | None = None,
+    ) -> list[Listing]:
         """Свежие лоты площадки, ещё не дообогащённые с детальной страницы.
         Новейшие сначала — свежак важнее для постинга, хвост догоним позже."""
         async with self._session() as session:
-            rows = (
-                await session.execute(
-                    select(ListingRow)
-                    .where(ListingRow.source == source)
-                    .where(ListingRow.collected_at >= since)
-                    .where(ListingRow.enriched_at.is_(None))
-                    .order_by(ListingRow.collected_at.desc())
-                    .limit(limit)
-                )
-            ).scalars()
+            query = select(ListingRow).where(
+                ListingRow.source == source,
+                ListingRow.collected_at >= since,
+                ListingRow.enriched_at.is_(None),
+            )
+            if retry_before is not None:
+                query = query.where(or_(
+                    ListingRow.detail_attempted_at.is_(None),
+                    ListingRow.detail_attempted_at <= retry_before,
+                ))
+            rows = (await session.execute(
+                query.order_by(ListingRow.collected_at.desc()).limit(limit)
+            )).scalars()
             return [_row_to_listing(r) for r in rows]
+
+    async def mark_prepared(
+        self, listing: Listing, now: datetime,
+    ) -> None:
+        """Release a failed detail attempt using its known search-card fields."""
+        async with self._session() as session:
+            await session.execute(update(ListingRow).where(
+                ListingRow.source == listing.source.value,
+                ListingRow.external_id == listing.external_id,
+                ListingRow.price == listing.price,
+                ListingRow.collected_at == listing.collected_at,
+            ).values(
+                prepared_at=func.coalesce(ListingRow.prepared_at, now), detail_attempted_at=now,
+            ))
+            await session.commit()
 
     async def save_enrichment(
         self,
@@ -261,6 +284,8 @@ class SqlStorage(Storage):
                     and row.commission_rub is None)
             )
             row.enriched_at = None if incomplete else enriched_at
+            row.prepared_at = row.prepared_at or enriched_at
+            row.detail_attempted_at = enriched_at
             await session.commit()
 
     async def save_photo_analysis(
@@ -479,6 +504,12 @@ def _migrate_add_missing_columns(connection: Connection) -> None:
             connection.execute(
                 text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}')
             )
+            if table.name == "listings" and column.name == "prepared_at":
+                # Existing cards were already eligible for the old sender's
+                # search-data fallback. Migration must not turn them into fresh ads.
+                connection.execute(text(
+                    "UPDATE listings SET prepared_at=collected_at WHERE source='avito'"
+                ))
 
 
 def _to_row(listing: Listing) -> ListingRow:
@@ -523,6 +554,8 @@ def _to_row(listing: Listing) -> ListingRow:
         flagged=listing.flagged,
         analyzed_at=listing.analyzed_at,
         enriched_at=listing.enriched_at,
+        prepared_at=listing.prepared_at,
+        detail_attempted_at=listing.detail_attempted_at,
         photos=listing.photos,
         contact_hash=listing.contact_hash,
         published_at=listing.published_at,
@@ -570,6 +603,8 @@ def _row_to_listing(row: ListingRow) -> Listing:
         flagged=bool(row.flagged),
         analyzed_at=row.analyzed_at,
         enriched_at=row.enriched_at,
+        prepared_at=row.prepared_at,
+        detail_attempted_at=row.detail_attempted_at,
         photos=list(row.photos or []),
         contact_hash=row.contact_hash,
         published_at=row.published_at,

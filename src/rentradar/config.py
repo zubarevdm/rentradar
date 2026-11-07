@@ -72,7 +72,10 @@ class Settings(BaseSettings):
     avito_detail_delay_sec: float = 10.0
     # Как часто РЕАЛЬНО дёргать Авито, минут (независимо от общего сбора). У Авито
     # жёсткий рейт-лимит по IP: собираем его реже Циан/Яндекса, чтобы не словить 429.
-    avito_collect_interval_min: int = 12
+    avito_collect_interval_min: float = Field(default=5, ge=1)
+    yandex_collect_interval_min: float = Field(default=5, ge=1)
+    avito_block_cooldown_min: float = Field(default=5, ge=1)
+    avito_request_delay_sec: float = Field(default=10, ge=0)
     # Сколько страниц выдачи Авито тянуть за проход (меньше = меньше нагрузка на IP).
     avito_max_pages: int = 2
 
