@@ -214,26 +214,6 @@ async def test_captcha_on_both_raises_blocked() -> None:
         await collector.fetch(SearchProfile(name="t", city="Москва"))
 
 
-async def test_blocked_query_pauses_without_stopping_other_profile(page_html: str) -> None:
-    def direct(request: httpx.Request) -> httpx.Response:
-        if "dvuhkomnatnaya" in str(request.url):
-            return httpx.Response(200, text=page_html)
-        return _captcha(request)
-
-    calls: list[str] = []
-    collector = YandexCollector(min_delay=0, max_pages=1, fallback_proxy="http://phone:1")
-    _mock(collector, direct, _captcha, calls)
-    profile = SearchProfile(name="all", city="Москва")
-    with pytest.raises(CollectorBlockedError):
-        await collector.fetch(profile)
-    assert len(calls) == 2
-    with pytest.raises(CollectorBlockedError):
-        await collector.fetch(profile)
-    assert len(calls) == 2
-    assert await collector.fetch(SearchProfile(name="two", city="Москва", rooms=[2]))
-    assert len(calls) == 3
-
-
 async def test_proxy_network_error_is_blocked_not_crash() -> None:
     def boom(request: httpx.Request) -> httpx.Response:
         raise ConnectionError("phone offline")

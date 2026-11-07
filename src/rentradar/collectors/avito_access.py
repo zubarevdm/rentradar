@@ -24,12 +24,6 @@ WARM_URL = "https://www.avito.ru/moskva/kvartiry/sdam/na_dlitelnyy_srok-ASgBAgIC
 IMPERSONATE = "firefox135"
 # Чаще не пытаемся: если прогрев/смена IP не помогли, ждём обычную паузу источника.
 _MIN_RECOVER_GAP = 120.0
-_proxy_locks: dict[str | None, asyncio.Lock] = {}
-
-
-def proxy_lock(proxy: str | None) -> asyncio.Lock:
-    """Hold while using a shared phone, including its IP rotation and warmup."""
-    return _proxy_locks.setdefault(proxy, asyncio.Lock())
 
 
 class AvitoAccess:

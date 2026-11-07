@@ -133,7 +133,6 @@ class Pipeline:
 
     async def collect_only(
         self, profile: SearchProfile, *, on_new: Callable[[], None] | None = None,
-        source: str | None = None,
     ) -> tuple[int, dict[str, str]]:
         """Только собрать и сохранить (без скоринга/постинга) — для частого сбора,
         который питает и публичный канал, и персонального бота.
@@ -144,8 +143,6 @@ class Pipeline:
         new_total = 0
         statuses: dict[str, str] = {}
         for collector in self._collectors:
-            if source is not None and collector.source_name != source:
-                continue
             try:
                 raw_items = await collector.fetch(profile, limit=profile.collect_limit)
             except CollectorBlockedError as exc:

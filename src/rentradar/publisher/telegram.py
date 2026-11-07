@@ -63,12 +63,10 @@ class TelegramPublisher(Publisher):
         via_relay: bool = False,
         cian_jpeg_proxy_enabled: bool = False,
         storage: SqlStorage | None = None,
-        prepare_personal_separately: bool = False,
     ) -> None:
         self._dry_run = dry_run
         self._bot = bot
         self._storage = storage
-        self._prepare_personal_separately = prepare_personal_separately
         self._avito_proxy = avito_proxy or None  # прокси для дозагрузки фото Авито (VPS)
         # Кап фото по каналу (Telegram: альбом ≤ 10). Личка — больше, канал — меньше.
         self._max_personal = max(1, min(10, max_photos_personal))
@@ -224,14 +222,9 @@ class TelegramPublisher(Publisher):
         # страницу здесь — оттуда полноразмер-фото (1280x960) и залог/комиссия.
         # Патчим лот ДО render(), чтобы в посте появилась строка «Заехать».
         # Обогащённый лот уже несёт всё это в БД. В dry-run сеть не трогаем.
-        fetch_avito_details = not (self._prepare_personal_separately and use_custom_emoji)
         avito_full: list[str] | None = None
-        rental_terms_unavailable = (
-            not fetch_avito_details and scored.listing.source == Source.AVITO
-            and scored.listing.enriched_at is None
-        )
-        if (fetch_avito_details and not self._dry_run
-                and self._bot is not None and self._storage is not None
+        rental_terms_unavailable = False
+        if (not self._dry_run and self._bot is not None and self._storage is not None
                 and scored.listing.source == Source.AVITO):
             cached = await self._storage.get_listing(
                 Source.AVITO.value, scored.listing.external_id,
@@ -239,8 +232,7 @@ class TelegramPublisher(Publisher):
             if cached is not None:
                 scored = scored.model_copy(update={"listing": cached})
         if (
-            fetch_avito_details
-            and not self._dry_run
+            not self._dry_run
             and self._bot is not None
             and scored.listing.source == Source.AVITO
             and scored.listing.enriched_at is None

@@ -47,7 +47,6 @@ class UserFilter(BaseModel):
     # Когда фильтр проверяли в прошлый раз. None = ещё ни разу (холодный старт).
     # Используется диспетчером, чтобы отличить «свежие» лоты от старого бэклога.
     last_checked_at: datetime | None = None
-    created_at: datetime | None = None
 
     def clamp_interval(self) -> int:
         return max(MIN_INTERVAL_MIN, min(MAX_INTERVAL_MIN, self.interval_min))

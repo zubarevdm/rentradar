@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 from ..config import SearchProfile, Settings
 from ..interfaces import Publisher, ScoringEngine
-from ..models import Listing, ScoredListing, Source, dedupe_cross_source
+from ..models import Listing, ScoredListing, dedupe_cross_source
 from ..storage import SqlStorage
 from .filters import MIN_INTERVAL_MIN, UserFilter, matches
 from .store import PersonalStore
@@ -31,14 +31,12 @@ class PersonalDispatcher:
         scoring: ScoringEngine,
         publisher: Publisher,
         settings: Settings,
-        require_prepared_avito: bool = False,
     ) -> None:
         self._ps = store
         self._storage = storage
         self._scoring = scoring
         self._publisher = publisher
         self._settings = settings
-        self._require_prepared_avito = require_prepared_avito
         self._dispatch_lock = asyncio.Lock()
 
     async def run_due(self, now: datetime) -> int:
@@ -73,15 +71,9 @@ class PersonalDispatcher:
         listings = await self._storage.recent_listings(flt.city, since)  # newest first
         # Одна квартира с 2-3 площадок → шлём только одну (дешевле; при равной цене
         # приоритет Avito>Cian>Yandex), чтобы не дублировать в личке.
-        listings = [lst for lst in listings if lst.available_at <= now and matches(lst, flt)]
-        if self._require_prepared_avito:
-            listings = [lst for lst in listings if (
-                lst.source != Source.AVITO
-                or lst.prepared_at is not None or lst.enriched_at is not None
-            )]
-        listings = dedupe_cross_source(listings)
+        listings = dedupe_cross_source(lst for lst in listings if lst.collected_at <= now)
         profile = SearchProfile(name=flt.name, city=flt.city)
-        matched = listings
+        matched = [lst for lst in listings if matches(lst, flt)]  # newest first
 
         # Две дорожки. СВЕЖИЕ (появились с прошлой проверки) идут вперёд и почти без
         # лимита — их и надо ловить в моменте. Старый БЭКЛОГ досылаем мягко ПОСЛЕ
@@ -100,10 +92,7 @@ class PersonalDispatcher:
             )
 
         def _is_fresh(lst: Listing) -> bool:
-            available = lst.collected_at
-            if flt.created_at is None or lst.collected_at >= flt.created_at:
-                available = lst.available_at
-            return last is None or available > last
+            return last is None or lst.collected_at > last
 
         ordered = sorted(matched, key=lambda lst: not _is_fresh(lst))  # свежие первыми
 
