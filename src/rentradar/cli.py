@@ -671,6 +671,17 @@ async def _serve(settings: Settings) -> None:
         await storage.save_photo_analysis(listing.source.value, listing.external_id, **fields)
         return listing.model_copy(update=fields)
 
+    async def _analyze_public(listing: Listing) -> Listing:
+        """Анализ с повтором: 429 у Polza — разовый лимит провайдера, не баланс."""
+        for attempt in range(3):
+            try:
+                return await _analyze_and_save(listing)
+            except VisionQuotaError as exc:
+                if "429" not in str(exc) or attempt == 2:
+                    raise
+                await asyncio.sleep(10 * (attempt + 1))
+        raise AssertionError("unreachable")
+
     async def _pick_showcase(passed: list[ScoredListing]) -> list[ScoredListing]:
         """Vision только для финалистов слота: N лучших по скору ещё не постившихся
         лотов с фото → анализ → в канал самые красивые (appeal ≥ порога)."""
@@ -685,7 +696,7 @@ async def _serve(settings: Settings) -> None:
             listing = c.listing
             if listing.analyzed_at is None:
                 try:
-                    listing = await _analyze_and_save(listing)
+                    listing = await _analyze_public(listing)
                 except VisionQuotaError as exc:
                     await _alert_admin(
                         f"⚠️ Vision (паблик): кончился баланс/лимит API или неверный ключ. "
