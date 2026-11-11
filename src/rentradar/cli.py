@@ -31,7 +31,7 @@ from .collectors import avito_access
 from .collectors.avito import fetch_detail, set_request_cooldown
 from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .errors import CollectorBlockedError
-from .models import ScoredListing, Source, source_rank
+from .models import Listing, ScoredListing, Source, source_rank
 from .personal import PersonalStore
 from .personal.access import TARIFFS, TRIAL, access_of, moscow_when, plural
 from .personal.bot import build_router
@@ -545,6 +545,10 @@ async def _serve(settings: Settings) -> None:
                 )
             # Паблик-гейт по «красоте»: в канал только приличный ремонт.
             passed = [c for c in candidates if _passes_public_gate(c, settings)]
+            if analyzer is not None and settings.vision_public_finalists > 0:
+                passed = await _pick_showcase(passed)
+                if not passed:
+                    return
             # Канал голодает из-за отставшего vision? Кандидаты по скору есть, но
             # ни один не проанализирован → молчать нельзя, алертим админа.
             if candidates and not passed:
@@ -561,7 +565,10 @@ async def _serve(settings: Settings) -> None:
             # лучшие сделки бережём для бота. Кросс-дедуп одной квартиры с разных
             # площадок (дешевле/приоритет) — чтобы не постить дубли.
             passed = _dedupe_scored(passed)
-            n = len(await pipeline.publish_top(passed, by_appeal=settings.vision_enabled and settings.public_rank_by_appeal))
+            by_appeal = (settings.vision_enabled and settings.public_rank_by_appeal) or (
+                analyzer is not None and settings.vision_public_finalists > 0
+            )
+            n = len(await pipeline.publish_top(passed, by_appeal=by_appeal))
             runtime["last_public_at"] = _utcnow()
             runtime["last_public_n"] = n
             log.info(
@@ -641,12 +648,74 @@ async def _serve(settings: Settings) -> None:
                     cooldown_h=0,
                 )
 
+    async def _analyze_and_save(listing: Listing) -> Listing:
+        """Vision по фото лота → сохранить в БД; вернуть лот с результатом анализа."""
+        analysis = await analyzer.analyze(listing.photos[: settings.vision_max_images])
+        # Нет фото самой квартиры (только дом/двор/рендеры) → ремонт и красоту
+        # НЕ определить: renovation/appeal = None. Такой лот пройдёт только под
+        # фильтр «любой» и не попадёт в WOW-канал (appeal неизвестен).
+        no_interior = bool(analysis and analysis.no_interior)
+        best_urls = (
+            [listing.photos[i] for i in analysis.best_photos if i < len(listing.photos)]
+            if analysis and not no_interior
+            else []
+        )
+        fields = {
+            "renovation": None if no_interior else (analysis.renovation if analysis else None),
+            "has_furniture": analysis.has_furniture if analysis else None,
+            "appeal": None if no_interior else (analysis.appeal if analysis else None),
+            "best_photos": best_urls,
+            "flagged": bool(analysis and analysis.contact_overlay),
+            "analyzed_at": _utcnow(),
+        }
+        await storage.save_photo_analysis(listing.source.value, listing.external_id, **fields)
+        return listing.model_copy(update=fields)
+
+    async def _pick_showcase(passed: list[ScoredListing]) -> list[ScoredListing]:
+        """Vision только для финалистов слота: N лучших по скору ещё не постившихся
+        лотов с фото → анализ → в канал самые красивые (appeal ≥ порога)."""
+        pool: list[ScoredListing] = []
+        for c in sorted(_dedupe_scored(passed), key=lambda c: c.score.total, reverse=True):
+            if len(pool) >= settings.vision_public_finalists:
+                break
+            if c.listing.photos and not await storage.was_posted(c.listing.content_key):
+                pool.append(c)
+        finalists: list[ScoredListing] = []
+        for c in pool:
+            listing = c.listing
+            if listing.analyzed_at is None:
+                try:
+                    listing = await _analyze_and_save(listing)
+                except VisionQuotaError as exc:
+                    await _alert_admin(
+                        f"⚠️ Vision (паблик): кончился баланс/лимит API или неверный ключ. "
+                        f"Слот публикую без оценки красоты.\n\n{exc}",
+                        key="vision", cooldown_h=6,
+                    )
+                    return pool  # лучше пост по скору, чем пустой слот
+                except Exception:  # noqa: BLE001
+                    log.exception("Vision (паблик): сбой на лоте %s", listing.url)
+                    continue
+            finalists.append(c.model_copy(update={"listing": listing}))
+        ok = [
+            c for c in finalists
+            if not c.listing.flagged
+            and c.listing.renovation not in settings.public_block_renovations
+            and (c.listing.appeal or 0) >= settings.public_min_appeal
+        ]
+        ok.sort(key=lambda c: (c.listing.appeal or 0, c.score.total), reverse=True)
+        log.info(
+            "Паблик: vision по %d финалистам, appeal %s, прошло порог %d",
+            len(finalists), [c.listing.appeal for c in finalists], len(ok),
+        )
+        return ok
+
     async def vision_job() -> None:
         """Проанализировать свежие необработанные лоты (выбор фото + ремонт), закэшировать.
         Только реальные лоты (прошли фрод-фильтр) и с фото; кап на вызовы за проход.
         При ошибке «кончился баланс/лимит» — уведомить админа и прекратить проход
         (постинг при этом продолжается как обычно, без анализа)."""
-        if analyzer is None:
+        if analyzer is None or not settings.vision_enabled:
             return
         try:
             since = _utcnow() - timedelta(hours=24)
@@ -688,9 +757,7 @@ async def _serve(settings: Settings) -> None:
                             analyzed_at=_utcnow(),
                         )
                         continue
-                    analysis = await analyzer.analyze(
-                        listing.photos[: settings.vision_max_images]
-                    )
+                    await _analyze_and_save(listing)
                 except VisionQuotaError as exc:
                     await _alert_admin(
                         "⚠️ Vision: похоже, кончился баланс или лимит API "
@@ -713,27 +780,6 @@ async def _serve(settings: Settings) -> None:
                     )
                     continue
                 alert_state.pop("vision", None)  # успех → следующий сбой снова алертнёт
-                # Нет фото самой квартиры (только дом/двор/рендеры) → ремонт и красоту
-                # НЕ определить: renovation/appeal = None. Такой лот пройдёт только под
-                # фильтр «любой» и не попадёт в WOW-канал (appeal неизвестен).
-                no_interior = bool(analysis and analysis.no_interior)
-                best_urls = (
-                    [listing.photos[i] for i in analysis.best_photos]
-                    if analysis and not no_interior
-                    else []
-                )
-                reno = None if no_interior else (analysis.renovation if analysis else None)
-                appeal = None if no_interior else (analysis.appeal if analysis else None)
-                await storage.save_photo_analysis(
-                    listing.source.value,
-                    listing.external_id,
-                    renovation=reno,
-                    has_furniture=(analysis.has_furniture if analysis else None),
-                    appeal=appeal,
-                    best_photos=best_urls,
-                    flagged=bool(analysis and analysis.contact_overlay),
-                    analyzed_at=_utcnow(),
-                )
                 analyzed += 1
             if analyzed:
                 log.info("Vision: проанализировано %d", analyzed)
