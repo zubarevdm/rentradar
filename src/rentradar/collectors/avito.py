@@ -170,7 +170,7 @@ async def _fetch_with_access(
 
     При блоке — прогрев/смена IP и повтор."""
     key = access.proxy or "direct"
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             resp = await asyncio.to_thread(
                 _blocking_get, url, avito_access.IMPERSONATE, params, access.proxy, timeout,
@@ -183,7 +183,8 @@ async def _fetch_with_access(
         if kind is None:
             return resp.text
         logger.warning("avito: HTTP %s (%s), попытка %d", resp.status_code, kind, attempt + 1)
-        if attempt or not await access.recover(ip_banned=kind == "ip"):
+        # 1-й блок — прогрев (или смена IP, если IP); не помогло — сразу новый IP.
+        if attempt == 2 or not await access.recover(ip_banned=kind == "ip", retry=attempt == 1):
             break
     _blocked_until[key] = time.monotonic() + _block_cooldown_seconds
     return None

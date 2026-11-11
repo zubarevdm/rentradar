@@ -24,6 +24,8 @@ WARM_URL = "https://www.avito.ru/moskva/kvartiry/sdam/na_dlitelnyy_srok-ASgBAgIC
 IMPERSONATE = "firefox135"
 # Чаще не пытаемся: если прогрев/смена IP не помогли, ждём обычную паузу источника.
 _MIN_RECOVER_GAP = 120.0
+# Куки прогрева обычно живут ~15 мин. Если блок пришёл раньше — подозреваем IP: меняем его.
+_WARM_HOLD_SEC = 600.0
 
 
 class AvitoAccess:
@@ -42,6 +44,7 @@ class AvitoAccess:
         self._rotate_cmd = rotate_cmd
         self._rotate_wait = rotate_wait_sec
         self._last_recover = 0.0
+        self._last_warm_ok = 0.0
         self.user_agent = ""
         self.cookies: dict[str, str] = {}
         self._load()
@@ -103,6 +106,7 @@ class AvitoAccess:
             logger.warning("avito: прогрев упал: %s: %s", type(exc).__name__, exc)
             return False
         self._save()
+        self._last_warm_ok = time.monotonic()
         logger.info("avito: прогрев браузером ок, кук %d", len(self.cookies))
         return True
 
@@ -128,13 +132,23 @@ class AvitoAccess:
         logger.info("avito: IP сменён")
         return True
 
-    async def recover(self, *, ip_banned: bool) -> bool:
-        """Попробовать вернуть доступ. True — можно повторить запрос."""
-        if time.monotonic() - self._last_recover < _MIN_RECOVER_GAP:
+    async def recover(self, *, ip_banned: bool, retry: bool = False) -> bool:
+        """Попробовать вернуть доступ. True — можно повторить запрос.
+
+        retry — повтор в том же запросе после неудачного прогрева: паузу не ждём
+        и сразу меняем IP. Блок вскоре после удачного прогрева тоже считаем
+        проблемой IP: свежие куки не держатся — прогревать на нём бесполезно."""
+        now = time.monotonic()
+        if not retry and now - self._last_recover < _MIN_RECOVER_GAP:
             return False
-        self._last_recover = time.monotonic()
-        if ip_banned and not await self.rotate_ip():
-            return False
+        self._last_recover = now
+        held = now - self._last_warm_ok
+        rotate = ip_banned or retry or (self._last_warm_ok and held < _WARM_HOLD_SEC)
+        if rotate:
+            if not ip_banned and not retry:
+                logger.info("avito: блок через %.0f с после прогрева — меняем IP", held)
+            if not await self.rotate_ip() and (ip_banned or retry):
+                return False
         return await self.warm()
 
 
@@ -163,30 +177,38 @@ class PhoneMonitor:
     """Здоровье телефона-прокси: сам прокси и управление (adb для смены IP).
 
     Сбой засчитываем после `fail_after` подряд проверок — смена IP рвёт связь
-    на полминуты, это не повод будить админа. Сообщаем только смену состояния.
+    на полминуты, это не повод будить админа. Сообщаем смену состояния и, пока
+    часть лежит, напоминаем раз в `remind_sec` (one-shot алерт легко пропустить).
     """
 
-    def __init__(self, *, proxy: str, control_cmd: str = "", fail_after: int = 3) -> None:
+    def __init__(
+        self, *, proxy: str, control_cmd: str = "", fail_after: int = 3,
+        remind_sec: float = 7200.0,
+    ) -> None:
         self._checks = {"proxy": lambda: _proxy_ok(proxy)}
         if control_cmd:
             self._checks["control"] = lambda: _run_ok(control_cmd)
         self._fail_after = fail_after
         self._fails = dict.fromkeys(self._checks, 0)
-        self._down: set[str] = set()
+        self._down: dict[str, float] = {}  # часть -> когда последний раз сообщили
+        self._remind = remind_sec
 
     async def check(self) -> list[tuple[str, bool]]:
-        """[(часть, теперь_работает)] — только изменившиеся состояния."""
+        """[(часть, теперь_работает)] — смены состояния и напоминания о лежащих."""
         changes: list[tuple[str, bool]] = []
+        now = time.monotonic()
         for name, probe in self._checks.items():
             if await probe():
                 self._fails[name] = 0
-                if name in self._down:
-                    self._down.discard(name)
+                if self._down.pop(name, None) is not None:
                     changes.append((name, True))
                 continue
             self._fails[name] += 1
-            if self._fails[name] >= self._fail_after and name not in self._down:
-                self._down.add(name)
+            if self._fails[name] < self._fail_after:
+                continue
+            last = self._down.get(name)
+            if last is None or now - last >= self._remind:
+                self._down[name] = now
                 changes.append((name, False))
         return changes
 

@@ -8,9 +8,11 @@ class FakeAccess(avito_access.AvitoAccess):
     def __init__(self, tmp_path):
         super().__init__(proxy="http://phone:1056", cookies_path=tmp_path / "c.json")
         self.recovered: list[bool] = []
+        self.retries: list[bool] = []
 
-    async def recover(self, *, ip_banned: bool) -> bool:
+    async def recover(self, *, ip_banned: bool, retry: bool = False) -> bool:
         self.recovered.append(ip_banned)
+        self.retries.append(retry)
         self.cookies = {"ok": "1"}
         return True
 
@@ -53,12 +55,52 @@ def test_ip_ban_requests_rotation(monkeypatch, tmp_path):
     assert html == "ok" and access.recovered == [True]
 
 
-def test_gives_up_after_one_recovery(monkeypatch, tmp_path):
+def test_second_block_retries_on_new_ip(monkeypatch, tmp_path):
     html, access, _ = _run(monkeypatch, tmp_path, [
         _resp(439, "проверка безопасности"), _resp(439, "проверка безопасности"),
+        _resp(200, "ok"),
     ])
-    assert html is None and access.recovered == [False]
+    assert html == "ok" and access.retries == [False, True]
+
+
+def test_gives_up_after_two_recoveries(monkeypatch, tmp_path):
+    html, access, _ = _run(monkeypatch, tmp_path, [_resp(439, "проверка безопасности")] * 3)
+    assert html is None and access.retries == [False, True]
     assert avito._blocked_until["http://phone:1056"] > 0
+
+
+def _counting_access(tmp_path):
+    access = avito_access.AvitoAccess(
+        proxy=None, cookies_path=tmp_path / "c.json", rotate_cmd="true", rotate_wait_sec=0,
+    )
+    calls: list[str] = []
+
+    async def warm():
+        calls.append("warm")
+        access._last_warm_ok = avito_access.time.monotonic()
+        return True
+
+    async def rotate():
+        calls.append("rotate")
+        return True
+
+    access.warm, access.rotate_ip = warm, rotate
+    return access, calls
+
+
+def test_block_soon_after_warm_rotates_ip(tmp_path):
+    access, calls = _counting_access(tmp_path)
+    assert asyncio.run(access.recover(ip_banned=False))
+    access._last_recover -= 1000  # прошла пауза между восстановлениями
+    assert asyncio.run(access.recover(ip_banned=False))
+    assert calls == ["warm", "rotate", "warm"]
+
+
+def test_retry_skips_gap_and_rotates(tmp_path):
+    access, calls = _counting_access(tmp_path)
+    assert asyncio.run(access.recover(ip_banned=False))
+    assert asyncio.run(access.recover(ip_banned=False, retry=True))
+    assert calls == ["warm", "rotate", "warm"]
 
 
 def test_recover_is_rate_limited(tmp_path):
@@ -86,6 +128,19 @@ def test_phone_monitor_alerts_only_on_sustained_change():
     seen = [asyncio.run(mon.check()) for _ in range(8)]
     # Два сбоя и восстановление — тишина; три подряд — алерт один раз; возврат — алерт.
     assert seen == [[], [], [], [], [], [("proxy", False)], [], [("proxy", True)]]
+
+
+def test_phone_monitor_reminds_while_down():
+    mon = avito_access.PhoneMonitor(proxy="http://phone:1056", fail_after=1, remind_sec=100)
+
+    async def probe():
+        return False
+
+    mon._checks = {"proxy": probe}
+    assert asyncio.run(mon.check()) == [("proxy", False)]
+    assert asyncio.run(mon.check()) == []
+    mon._down["proxy"] -= 200  # прошло больше remind_sec
+    assert asyncio.run(mon.check()) == [("proxy", False)]
 
 
 def test_session_roundtrip_keeps_user_agent(tmp_path):
