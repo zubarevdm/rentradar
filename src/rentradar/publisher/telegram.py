@@ -31,7 +31,8 @@ from aiogram.types import (
 from ..collectors.avito import fetch_detail
 from ..config import Settings, load_emoji
 from ..interfaces import Publisher
-from ..models import Listing, ScoreBreakdown, ScoredListing, Source
+from ..models import Listing, ScoreBreakdown, ScoredListing, Source, _normalize_text
+from ..personal.metro_data import ALIASES, ROUTES
 from ..photos import telegram_photo
 
 logger = logging.getLogger(__name__)
@@ -139,7 +140,10 @@ class TelegramPublisher(Publisher):
 
         # 1) Локация: метро + время пешком.
         # В личке — кастом-бейдж линии метро; в канале — обычный 📍.
-        marker = _line_circle(listing.metro_line_color, em) if use_custom_emoji else "📍"
+        marker = (
+            _line_circle(listing.metro_line_color, em, listing.metro)
+            if use_custom_emoji else "📍"
+        )
         if listing.metro:
             loc = f"м. {html.escape(listing.metro[:80])}"
             if listing.metro_distance_min is not None:
@@ -637,17 +641,45 @@ _MSK_LINES: dict[str, tuple[int, int, int]] = {
     "12": (161, 179, 212), # Бутовская — серо-голубая
     "14": (255, 168, 175), # МЦК — бело-красная (по данным светло-коралловая)
     "15": (222, 100, 161), # Некрасовская — розовая
+    "16": (3, 121, 95),    # Троицкая — тёмно-бирюзовая (так красят Циан и Яндекс)
+    "17": (75, 75, 75),    # Рублёво-Архангельская — графитовая
+    "D1": (246, 166, 0),   # МЦД-1 — жёлто-оранжевый
+    "D2": (223, 70, 124),  # МЦД-2 — розовый
+    "D3": (233, 91, 12),   # МЦД-3 — оранжевый
+    "D4": (64, 178, 128),  # МЦД-4 — зелёный
 }
 
 
-def _nearest_line(r: int, g: int, b: int) -> str:
+def _station_lines() -> dict[str, set[str]]:
+    """Станция (нормализованное имя, вкл. старые названия) → номера её линий."""
+    index: dict[str, set[str]] = {}
+    for line, _label, path in ROUTES:
+        for name in path.split("|"):
+            for key in (name, *ALIASES.get(name, ())):
+                index.setdefault(_normalize_text(key), set()).add(line)
+    return index
+
+
+_STATION_LINES = _station_lines()
+
+
+def _metro_line(station: str | None, r: int, g: int, b: int) -> str:
+    """Линия станции: из линий, через которые она реально проходит, — ближайшая
+    по цвету площадки. Цвет сам по себе ненадёжен (у площадок свои палитры,
+    МЦД-2 и Некрасовская оба розовые), поэтому подсказкой служит только он."""
+    key = _normalize_text(station or "").removeprefix("метро ").strip()
+    candidates = _STATION_LINES.get(key) or set(_MSK_LINES)
+    candidates = [n for n in _MSK_LINES if n in candidates] or list(_MSK_LINES)
     return min(
-        _MSK_LINES,
+        candidates,
         key=lambda n: sum((c - v) ** 2 for c, v in zip(_MSK_LINES[n], (r, g, b), strict=True)),
     )
 
 
-def _line_circle(hex_color: str | None, emoji_map: dict | None = None) -> str:
+
+def _line_circle(
+    hex_color: str | None, emoji_map: dict | None = None, station: str | None = None,
+) -> str:
     """Hex цвета линии → значок линии. Если задан кастом-эмодзи линии (emoji_map
     ['lines'][номер]) — он; иначе стандартный цветной кружок. Нет цвета → 📍."""
     em = emoji_map or {}
@@ -661,13 +693,15 @@ def _line_circle(hex_color: str | None, emoji_map: dict | None = None) -> str:
     except ValueError:
         return _ce(em, "metro", "📍")
 
-    # Стандартный цветной кружок — он же fallback внутри <tg-emoji>.
+    line = _metro_line(station, r, g, b)
+    lr, lg, lb = _MSK_LINES[line]
+    # Стандартный цветной кружок по цвету линии — он же fallback внутри <tg-emoji>.
     circle = min(
-        _CIRCLES, key=lambda it: (it[2][0] - r) ** 2 + (it[2][1] - g) ** 2 + (it[2][2] - b) ** 2
+        _CIRCLES, key=lambda it: (it[2][0] - lr) ** 2 + (it[2][1] - lg) ** 2 + (it[2][2] - lb) ** 2
     )[1]
     lines = em.get("lines") or {}
     if lines:
-        eid = lines.get(_nearest_line(r, g, b))
+        eid = lines.get(line)
         if eid:
             return f'<tg-emoji emoji-id="{eid}">{circle}</tg-emoji>'
     return circle

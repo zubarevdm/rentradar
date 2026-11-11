@@ -112,7 +112,7 @@ def test_renovation_line_shown_when_enabled(sample_listing: Listing) -> None:
 def test_custom_emoji_only_in_personal(sample_listing: Listing) -> None:
     emoji = {"home": "111", "price": "222", "lines": {"3": "333"}}
     scored = ScoredListing(
-        listing=sample_listing.model_copy(update={"metro_line_color": "0042a5"}),
+        listing=sample_listing.model_copy(update={"metro_line_color": "0042a5", "metro": "Щёлковская"}),
         score=ScoreBreakdown(total=80.0, signals=[]),
     )
     pub = TelegramPublisher(dry_run=True, emoji=emoji)
