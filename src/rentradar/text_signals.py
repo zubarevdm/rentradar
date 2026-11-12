@@ -52,6 +52,9 @@ _OFFPLATFORM_MARKERS = (
 )
 
 
+_PHONE_RE = re.compile(r"(?<![\d+])(?:\+\s?7|7|8)(?:[\s\-().]{0,2}\d){10}(?![\d])")
+
+
 def solicits_offplatform(text: str | None) -> bool:
     """Уводит ли объявление общение с площадки (телеграм/вотсап/телефон/@ник).
     Режем всех — легитимные «пишите в тг» тоже обходят бан площадки обфускацией, а
@@ -68,5 +71,7 @@ def solicits_offplatform(text: str | None) -> bool:
         return True
     if re.search(r"@[a-zа-я0-9_]{4,}", low):  # @username
         return True
-    digits = re.sub(r"\D", "", low)  # телефон: +7/8 + 10 цифр
-    return bool(re.search(r"(?:\+?7|8)\d{10}", digits))
+    # Телефон: +7/8 и 10 цифр одним номером; внутри допускаем пробелы, дефисы,
+    # скобки и точки (и обфускацию «8 9 1 6…»). Склеивать ВСЕ цифры описания
+    # нельзя: «10 этаж, 65 м², 2026 год, 75 000» давали ложный «номер» у 15% лотов.
+    return bool(_PHONE_RE.search(low))

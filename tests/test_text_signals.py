@@ -35,3 +35,11 @@ def test_agent_detection_deobfuscates_latin() -> None:
 
     assert looks_like_agent("У нас бoльшaя бaза квapтир, подберем вариант") is True
     assert looks_like_agent("Сдаётся квapтиpa от собcтвeнника") is False
+
+
+def test_offplatform_phone_not_glued_from_listing_numbers() -> None:
+    # Регресс: склейка всех цифр описания давала ложный «телефон» у ~15% лотов.
+    text = "10 этаж из 12, 65 м2, дом 2026 года. Цена 75 000, залог 75000, 8 минут до метро"
+    assert solicits_offplatform(text) is False
+    assert solicits_offplatform("тел +7(916)123-45-67") is True
+    assert solicits_offplatform("8 9 1 6 1 2 3 4 5 6 7") is True
