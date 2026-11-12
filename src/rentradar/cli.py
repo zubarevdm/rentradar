@@ -1041,6 +1041,28 @@ async def _serve(settings: Settings) -> None:
                     f"Доставлено объявлений за 24 ч: {delivered}"
                 )
 
+            @dp.message(Command("users"))
+            async def _users(message: Message) -> None:
+                """Админ: сколько людей запускало бота и кто последний."""
+                if not _is_admin(message):
+                    return
+                now = _utcnow()
+                r = await personal_store.users_report(now)
+                msk = timedelta(hours=3)
+                rows = []
+                for uid, name, created, ref in r["recent"]:
+                    who = f"@{html.escape(name)}" if name else f"<code>{uid}</code>"
+                    when = (created + msk).strftime("%d.%m %H:%M") if created else "?"
+                    rows.append(f"{when} · {who}" + (" · по приглашению" if ref else ""))
+                await message.answer(
+                    "👥 <b>Запускали бота</b>\n"
+                    f"Всего: {r['total']}\n"
+                    f"Сегодня (UTC): {r['today']} · за 7 дн: {r['d7']}"
+                    f" · за 30 дн: {r['d30']}\n"
+                    f"Создали поиск: {r['with_filter']} из {r['total']}\n\n"
+                    "<b>Последние (МСК):</b>\n" + ("\n".join(rows) or "—")
+                )
+
             @dp.message(Command("admin"))
             async def _admin_help(message: Message) -> None:
                 """Админ: список админ-команд."""
@@ -1051,6 +1073,7 @@ async def _serve(settings: Settings) -> None:
                     "🛠 <b>Админ-команды</b>\n"
                     "/health — состояние системы\n"
                     "/stats — подписчики\n"
+                    "/users — сколько людей запускало бота\n"
                     "/collectnow — собрать сейчас\n"
                     "/postnow — опубликовать топ в канал\n"
                     "/paid &lt;telegram_id&gt; &lt;24h|3d|7d|30d&gt; "

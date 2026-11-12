@@ -132,6 +132,32 @@ class PersonalStore:
             "active_filters": filters,
         }
 
+    async def users_report(self, now: datetime, last: int = 10) -> dict:
+        """Кто запускал бота: запись подписчика создаёт первый /start."""
+        async with self._session() as session:
+            created = list(await session.scalars(select(SubscriberRow.created_at)))
+            with_filter = (
+                await session.scalar(select(func.count(func.distinct(UserFilterRow.user_id))))
+                or 0
+            )
+            recent = (
+                await session.execute(
+                    select(
+                        SubscriberRow.telegram_id, SubscriberRow.username,
+                        SubscriberRow.created_at, SubscriberRow.referred_by,
+                    ).order_by(SubscriberRow.created_at.desc()).limit(last)
+                )
+            ).all()
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return {
+            "total": len(created),
+            "today": sum(c is not None and c >= today for c in created),
+            "d7": sum(c is not None and c >= now - timedelta(days=7) for c in created),
+            "d30": sum(c is not None and c >= now - timedelta(days=30) for c in created),
+            "with_filter": with_filter,
+            "recent": [tuple(r) for r in recent],
+        }
+
     async def touch_filter(self, filter_id: int, now: datetime) -> None:
         async with self._session() as session:
             row = await session.get(UserFilterRow, filter_id)
