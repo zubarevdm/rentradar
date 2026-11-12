@@ -35,6 +35,7 @@ from ..models import (
 from .base import HttpCollector
 
 logger = logging.getLogger(__name__)
+_BACKUP_TIMEOUT_SEC = 60.0
 
 BASE = "https://realty.yandex.ru"
 _PAGINATION_PAUSE_SEC = 1800.0
@@ -118,10 +119,10 @@ class YandexCollector(HttpCollector):
     def _on_fallback(self) -> bool:
         return self._fallback_proxy is not None and time.monotonic() < self._fallback_until
 
-    def _search_session(self, proxy: str | None) -> AsyncSession:
+    def _search_session(self, proxy: str | None, timeout: float | None = None) -> AsyncSession:
         # На VPS httpx получал SmartCaptcha даже через телефон; профиль Chrome
         # возвращал выдачу по обоим маршрутам.
-        return AsyncSession(impersonate="chrome", proxy=proxy, timeout=self._timeout)
+        return AsyncSession(impersonate="chrome", proxy=proxy, timeout=timeout or self._timeout)
 
     async def _get_offers(self, client: AsyncSession, url: str) -> list[dict]:
         await self._throttle()
@@ -160,7 +161,12 @@ class YandexCollector(HttpCollector):
             route = "резервный прокси" if via_backup else "основной маршрут"
             try:
                 if via_backup:
-                    async with self._search_session(self._fallback_proxy) as backup:
+                    # Выдача ~3,8 МБ, а сотовая сеть по вечерам (18–22 МСК) медленная:
+                    # 20 с не хватало — 54 таймаута за сутки. Резерву даём минуту.
+                    backup_session = self._search_session(
+                        self._fallback_proxy, max(self._timeout, _BACKUP_TIMEOUT_SEC)
+                    )
+                    async with backup_session as backup:
                         offers = await self._get_offers(backup, url)
                 else:
                     offers = await self._get_offers(client, url)

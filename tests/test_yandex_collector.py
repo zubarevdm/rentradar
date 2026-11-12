@@ -164,7 +164,10 @@ def test_studio_lowercase_key() -> None:
 
 # ── резервный прокси при капче ─────────────────────────────────────────────
 def _mock(collector: YandexCollector, direct, backup, calls: list[str]) -> None:
-    def factory(proxy: str | None) -> httpx.AsyncClient:
+    timeouts = collector.__dict__.setdefault("_test_timeouts", [])
+
+    def factory(proxy: str | None, timeout: float | None = None) -> httpx.AsyncClient:
+        timeouts.append(timeout)
         return httpx.AsyncClient(
             transport=httpx.MockTransport(lambda request: wrapped(request, proxy)),
             trust_env=False,
@@ -195,6 +198,8 @@ async def test_captcha_falls_back_to_proxy_and_holds(page_html: str) -> None:
 
     assert len(await collector.fetch(profile)) == 3
     assert calls == ["direct", "backup"]
+    # Резерв (сотовая сеть) получает длинный таймаут, основной маршрут — обычный.
+    assert collector._test_timeouts[-1] == 60.0
     # Пока держимся резерва — основной IP не трогаем.
     calls.clear()
     assert len(await collector.fetch(profile)) == 3
