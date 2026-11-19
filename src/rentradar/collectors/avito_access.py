@@ -28,6 +28,33 @@ _MIN_RECOVER_GAP = 120.0
 _WARM_HOLD_SEC = 600.0
 
 
+def _freeze_geoip_db() -> None:
+    """Не давать Camoufox «обновлять» geoip-базу, если она уже скачана.
+
+    Раз в сутки он перекачивает её с GitHub; 19.11.2026 адрес стал отдавать 404,
+    и из-за этого падал каждый прогрев. Для телефона (всегда РФ) старая база годится.
+    """
+    try:
+        from camoufox import geolocation
+    except ImportError:
+        return
+    if getattr(geolocation, "_rr_frozen", False):
+        return
+    original = geolocation.needs_update
+
+    def needs_update(config=None) -> bool:
+        try:
+            cfg = config if config is not None else geolocation.load_geoip_config()
+            if geolocation.get_mmdb_path("ipv4", cfg).exists():
+                return False
+        except Exception:  # noqa: BLE001 — внутренности camoufox: решает оригинал
+            pass
+        return original(config)
+
+    geolocation.needs_update = needs_update
+    geolocation._rr_frozen = True
+
+
 class AvitoAccess:
     def __init__(
         self,
@@ -85,6 +112,7 @@ class AvitoAccess:
         }
         if self.proxy:
             options |= {"proxy": {"server": self.proxy}, "geoip": True}
+            _freeze_geoip_db()
         try:
             async with AsyncCamoufox(**options) as ctx:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()

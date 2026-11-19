@@ -270,7 +270,7 @@ def _build_collectors(settings: Settings) -> list:
             rotate_wait_sec=settings.avito_rotate_wait_sec,
         ))
     collectors: list = [
-        CianCollector(),
+        CianCollector(fallback_proxy=settings.cian_fallback_proxy or None),
         YandexCollector(fallback_proxy=settings.yandex_fallback_proxy or None),
     ]
     if settings.avito_enabled:

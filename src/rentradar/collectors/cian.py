@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime
 from math import ceil, isfinite
 
@@ -21,6 +22,7 @@ from curl_cffi import CurlError
 from curl_cffi.requests import AsyncSession
 
 from ..config import SearchProfile
+from ..errors import CollectorBlockedError
 from ..models import (
     DealType,
     Listing,
@@ -118,20 +120,47 @@ _PRIME_HEADERS = {
 class CianCollector(HttpCollector):
     source_name = Source.CIAN.value
 
-    def __init__(self, *, max_pages: int = 5, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *,
+        max_pages: int = 5,
+        fallback_proxy: str | None = None,
+        fallback_hold_sec: float = 1800.0,
+        **kwargs: object,
+    ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self._max_pages = max_pages
+        self._fallback_proxy = fallback_proxy or None
+        self._fallback_hold_sec = fallback_hold_sec
+        self._fallback_until = 0.0
 
-    def _client(self, *, follow_redirects: bool = False) -> _CffiClient:  # type: ignore[override]
-        return _CffiClient(follow_redirects=follow_redirects, proxy=self._proxy)
+    def _client(  # type: ignore[override]
+        self, *, follow_redirects: bool = False, proxy: str | None = None
+    ) -> _CffiClient:
+        return _CffiClient(follow_redirects=follow_redirects, proxy=proxy or self._proxy)
 
     # ── сбор ─────────────────────────────────────────────────────────────
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
+        """Сбор напрямую; при капче — через резервный прокси (телефон), держимся его 30 мин."""
+        if self._fallback_proxy and time.monotonic() < self._fallback_until:
+            return await self._fetch_via(profile, limit, self._fallback_proxy)
+        try:
+            return await self._fetch_via(profile, limit, None)
+        except CollectorBlockedError:
+            if not self._fallback_proxy:
+                raise
+            logger.info("cian: капча на прямом IP — идём через резервный прокси")
+            self._fallback_until = time.monotonic() + self._fallback_hold_sec
+            return await self._fetch_via(profile, limit, self._fallback_proxy)
+
+    async def _fetch_via(
+        self, profile: SearchProfile, limit: int, proxy: str | None
+    ) -> list[RawListing]:
         region = _region_for(profile.city)
         results: list[RawListing] = []
         # follow_redirects=True нужен для прогрева (сайт может редиректить);
         # на сам API-вызов редирект запрещаем явно — там это сигнал блокировки.
-        async with self._client(follow_redirects=True) as client:
+        async with self._client(follow_redirects=True, proxy=proxy) as client:
             await self._prime_session(client)
             for page in range(1, self._max_pages + 1):
                 query = self.build_query(profile, region=region, page=page)

@@ -112,7 +112,7 @@ async def test_fetch_raises_on_captcha_redirect(monkeypatch: pytest.MonkeyPatch)
 
     collector = CianCollector(min_delay=0.0)
 
-    def fake_client(*, follow_redirects: bool = False) -> httpx.AsyncClient:
+    def fake_client(*, follow_redirects: bool = False, proxy=None) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     monkeypatch.setattr(collector, "_client", fake_client)
@@ -137,7 +137,7 @@ async def test_fetch_parses_offers(monkeypatch: pytest.MonkeyPatch, cian_data: d
     monkeypatch.setattr(
         collector,
         "_client",
-        lambda *, follow_redirects=False: httpx.AsyncClient(
+        lambda *, follow_redirects=False, proxy=None: httpx.AsyncClient(
             transport=httpx.MockTransport(handler)
         ),
     )
@@ -148,3 +148,34 @@ async def test_fetch_parses_offers(monkeypatch: pytest.MonkeyPatch, cian_data: d
     assert len(raws) == 2
     listings = [collector.normalize(r) for r in raws]
     assert all(listing is not None for listing in listings)
+
+
+async def test_blocked_direct_falls_back_to_proxy_and_holds(monkeypatch) -> None:
+    from rentradar.errors import CollectorBlockedError
+
+    calls: list[str | None] = []
+
+    async def fake_via(self, profile, limit, proxy):
+        calls.append(proxy)
+        if proxy is None:
+            raise CollectorBlockedError("captcha")
+        return ["ok"]
+
+    monkeypatch.setattr(CianCollector, "_fetch_via", fake_via)
+    c = CianCollector(fallback_proxy="http://phone:1", min_delay=0.0)
+    profile = SearchProfile(name="t", city="Москва")
+    assert await c.fetch(profile) == ["ok"]
+    assert await c.fetch(profile) == ["ok"]
+    assert calls == [None, "http://phone:1", "http://phone:1"]
+
+
+async def test_blocked_without_fallback_raises(monkeypatch) -> None:
+    import pytest
+    from rentradar.errors import CollectorBlockedError
+
+    async def fake_via(self, profile, limit, proxy):
+        raise CollectorBlockedError("captcha")
+
+    monkeypatch.setattr(CianCollector, "_fetch_via", fake_via)
+    with pytest.raises(CollectorBlockedError):
+        await CianCollector(min_delay=0.0).fetch(SearchProfile(name="t", city="Москва"))
