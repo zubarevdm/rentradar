@@ -13,6 +13,7 @@ from pathlib import Path
 from statistics import median
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -37,6 +38,10 @@ class SqlStorage(Storage):
         self._session = async_sessionmaker(self._engine, expire_on_commit=False)
 
     async def init(self, *, migration_now: datetime | None = None, pause_max_days: int = 2) -> None:
+        async with self._engine.connect() as conn:
+            # Active reads from the bot and dispatcher must not block collection commits.
+            await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+            await conn.commit()
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_migrate_add_missing_columns)
@@ -326,17 +331,29 @@ class SqlStorage(Storage):
                     if area and area > 0:
                         ppm.setdefault(key, []).append(price / area)
 
-            for segment_key, price_list in prices.items():
-                ppm_list = ppm.get(segment_key, [])
-                stat = await session.get(MarketStatRow, segment_key)
-                if stat is None:
-                    stat = MarketStatRow(segment_key=segment_key)
-                    session.add(stat)
-                stat.median_price = float(median(price_list))
-                stat.median_price_per_m2 = float(median(ppm_list)) if ppm_list else None
-                stat.sample_size = len(price_list)
-
-            await session.commit()
+            if prices:
+                values = [
+                    {
+                        "segment_key": key,
+                        "median_price": float(median(price_list)),
+                        "median_price_per_m2": float(median(ppm[key])) if key in ppm else None,
+                        "sample_size": len(price_list),
+                    }
+                    for key, price_list in prices.items()
+                ]
+                stat = insert(MarketStatRow)
+                await session.execute(
+                    stat.on_conflict_do_update(
+                        index_elements=[MarketStatRow.segment_key],
+                        set_={
+                            "median_price": stat.excluded.median_price,
+                            "median_price_per_m2": stat.excluded.median_price_per_m2,
+                            "sample_size": stat.excluded.sample_size,
+                        },
+                    ),
+                    values,
+                )
+                await session.commit()
             return len(prices)
 
     async def dispose(self) -> None:

@@ -57,6 +57,8 @@ async def test_due_filters_by_interval(ps: PersonalStore) -> None:
     assert not any(i == fid for i, _ in await ps.due_filters(now + timedelta(minutes=1)))
     # Через интервал — снова due.
     assert any(i == fid for i, _ in await ps.due_filters(now + timedelta(minutes=6)))
+    await ps.touch_filter(fid, now - timedelta(minutes=6))
+    assert not any(i == fid for i, _ in await ps.due_filters(now))
 
 
 # ── подписка / триал ───────────────────────────────────────────────────────

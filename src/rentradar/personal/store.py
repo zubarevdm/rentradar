@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from itertools import batched
 
-from sqlalchemy import case, func, select, text
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -161,10 +161,13 @@ class PersonalStore:
 
     async def touch_filter(self, filter_id: int, now: datetime) -> None:
         async with self._session() as session:
-            row = await session.get(UserFilterRow, filter_id)
-            if row is not None:
-                row.last_checked_at = now
-                await session.commit()
+            await session.execute(
+                update(UserFilterRow)
+                .where(UserFilterRow.id == filter_id)
+                .where(or_(UserFilterRow.last_checked_at.is_(None), UserFilterRow.last_checked_at < now))
+                .values(last_checked_at=now)
+            )
+            await session.commit()
 
     # ── подписка / триал ────────────────────────────────────────────────
     @asynccontextmanager

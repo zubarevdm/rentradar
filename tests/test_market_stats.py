@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -51,6 +54,17 @@ async def test_recompute_median_for_segment(storage: SqlStorage) -> None:
         assert await provider.sample_size(seg) == 3
         # медиана ₽/м² = 60000/40 = 1500
         assert await provider.median_price_per_m2(seg) == pytest.approx(1500.0)
+
+
+async def test_market_stats_commit_during_open_reader(storage: SqlStorage):
+    await storage.upsert_listings([_listing("1", 50_000, 40.0)])
+    with closing(sqlite3.connect(storage._engine.url.database)) as reader:
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM market_stats").fetchone()
+        assert await asyncio.wait_for(storage.recompute_market_stats(), timeout=2) == 3
+        assert reader.execute("SELECT count(*) FROM market_stats").fetchone() == (0,)
+    provider = SqlMarketStatsProvider(storage)
+    assert await provider.median_price(_listing("1", 50_000, 40.0).segment_key) == 50_000
 
 
 async def test_missing_segment_returns_none(storage: SqlStorage) -> None:
