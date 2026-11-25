@@ -26,8 +26,10 @@ export CLAUDE_CODE_OAUTH_TOKEN="$TOKEN"
 TS="$(date +%Y%m%d-%H%M%S)"
 BRANCH="cc/$TS"
 cd "$WT" || { echo '{"status":"error","msg":"cd worktree failed"}'; exit 0; }
-git fetch -q origin 2>/dev/null
-git checkout -q -B "$BRANCH" origin/main 2>/dev/null
+git fetch -q origin && git checkout -q -b "$BRANCH" origin/main || {
+    echo '{"status":"error","msg":"cannot prepare a clean GitHub base"}'
+    exit 1
+}
 git clean -qfd 2>/dev/null
 
 # Claude правит код. acceptEdits + узкий allowedTools: правки и тесты без запросов,
@@ -53,9 +55,16 @@ DIFFSTAT="$(git diff --cached --stat 2>/dev/null | tail -30)"
 PYTEST_RC=$?
 PYTEST_TAIL="$(tail -4 /tmp/rentradar-cc-pytest.log)"
 
-git commit -q -m "cc: $TASK" 2>/dev/null
-git push -qf origin "$BRANCH" 2>/dev/null
-echo "$BRANCH" > "$REPO/.cc_pending"
+if [ "$PYTEST_RC" -ne 0 ]; then
+    jq -cn --arg msg "$PYTEST_TAIL" '{status:"error",msg:$msg}'
+    exit 1
+fi
+git commit -q -m "cc: $TASK" && git push -q origin "$BRANCH" || {
+    echo '{"status":"error","msg":"could not publish tested candidate"}'
+    exit 1
+}
+printf '%s %s\n' "$BRANCH" "$(git rev-parse HEAD)" > "$REPO/.cc_pending.tmp"
+mv "$REPO/.cc_pending.tmp" "$REPO/.cc_pending" || exit 1
 
 jq -c -n --arg br "$BRANCH" --arg s "$SUMMARY" --arg ds "$DIFFSTAT" \
   --argjson ch "$CHANGED" --argjson rc "$PYTEST_RC" --arg pt "$PYTEST_TAIL" --argjson c "$COST" \

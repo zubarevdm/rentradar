@@ -159,7 +159,7 @@ async def test_blocked_direct_falls_back_to_proxy_and_holds(monkeypatch) -> None
         calls.append(proxy)
         if proxy is None:
             raise CollectorBlockedError("captcha")
-        return ["ok"]
+        yield ["ok"]
 
     monkeypatch.setattr(CianCollector, "_fetch_via", fake_via)
     c = CianCollector(fallback_proxy="http://phone:1", min_delay=0.0)
@@ -171,11 +171,41 @@ async def test_blocked_direct_falls_back_to_proxy_and_holds(monkeypatch) -> None
 
 async def test_blocked_without_fallback_raises(monkeypatch) -> None:
     import pytest
+
     from rentradar.errors import CollectorBlockedError
 
     async def fake_via(self, profile, limit, proxy):
-        raise CollectorBlockedError("captcha")
+        if proxy is None:
+            raise CollectorBlockedError("captcha")
+        yield []
 
     monkeypatch.setattr(CianCollector, "_fetch_via", fake_via)
     with pytest.raises(CollectorBlockedError):
         await CianCollector(min_delay=0.0).fetch(SearchProfile(name="t", city="Москва"))
+
+
+async def test_valid_first_page_survives_bad_card_and_later_block(
+    collector, cian_data, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from rentradar.config import Settings
+    from rentradar.pipeline import Pipeline
+
+    valid = _extract_offers(cian_data)[0]
+    malformed = dict(valid, cianId=42, geo=["bad"])
+    batch = [_wrap_offer(valid), _wrap_offer(malformed)]
+    async def pages(profile, *, limit):
+        yield batch
+        raise CollectorBlockedError("page two")
+    monkeypatch.setattr(collector, "fetch_pages", pages)
+    storage = AsyncMock()
+    async def save(listings):
+        return listings, listings
+    storage.upsert_changes.side_effect = save
+    pipeline = Pipeline(collectors=[collector], storage=storage, scoring=None,
+                        publisher=None, settings=Settings())
+    assert await pipeline.collect_only(SearchProfile(city="Москва", name="test")) == (
+        1, {"cian": "partial"},
+    )
+    assert storage.upsert_changes.await_count == 1

@@ -41,19 +41,6 @@ class TastyScoringEngine(ScoringEngine):
     def __init__(self, market: MarketStatsProvider) -> None:
         self._market = market
 
-    async def _resolve_segment(self, listing: Listing) -> tuple[str | None, bool]:
-        """Найти самый узкий сегмент с достаточной выборкой.
-
-        Возвращает (ключ, is_coarse). is_coarse=True, если пришлось спуститься до
-        самого грубого уровня (город+комнаты, без района) — там сравнение
-        ненадёжно (дешёвый район выглядит «недооценкой» против медианы по городу).
-        """
-        keys = listing.segment_keys
-        for key in keys:
-            if await self._market.sample_size(key) >= MIN_SAMPLE:
-                return key, (key == keys[-1] and len(keys) > 1)
-        return None, False
-
     async def score(self, listing: Listing, profile: SearchProfile) -> ScoreBreakdown:
         # ── фрод-фильтр (hard rules) ─────────────────────────────────────
         fraud = profile.fraud
@@ -66,10 +53,10 @@ class TastyScoringEngine(ScoringEngine):
             return _reject("увод с площадки в описании", flags=["offplatform"])
 
         flags: list[str] = []
-        segment, is_coarse = await self._resolve_segment(listing)
+        keys = listing.segment_keys
+        segment, median_price, median_ppm = await self._market.resolve_market(keys, MIN_SAMPLE)
         has_market = segment is not None
-        median_price = await self._market.median_price(segment) if has_market else None
-        median_ppm = await self._market.median_price_per_m2(segment) if has_market else None
+        is_coarse = segment == keys[-1] and len(keys) > 1
 
         # Демпфер для грубого (city-wide) сегмента: дешёвый район ≠ выгодная
         # сделка. Умножаем дисконт на престижность района, чтобы окраины не

@@ -89,3 +89,9 @@ def test_dedupe_cross_source_keeps_distinct_flats() -> None:
     b = _same_flat(Source.CIAN, 60_000, "c2").model_copy(update={"address": "ул. Другая, 9"})
     out = dedupe_cross_source([a, b])
     assert len(out) == 2  # разные адреса → разные квартиры, не схлопываем
+
+
+def test_weak_location_cannot_merge_unrelated_apartments():
+    one = _same_flat(Source.CIAN, 50000, "one").model_copy(update={"address": None})
+    two = one.model_copy(update={"external_id": "two"})
+    assert one.content_key != two.content_key

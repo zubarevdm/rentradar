@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -71,7 +72,7 @@ async def _build_pipeline(
         collectors=[FakeCollector(listings)],
         storage=storage,
         scoring=PlaceholderScoringEngine(),
-        publisher=TelegramPublisher(dry_run=True),
+        publisher=AsyncMock(publish=AsyncMock(return_value=True)),
         settings=settings,
         post_delay=0,
         max_per_cycle=max_per_cycle,

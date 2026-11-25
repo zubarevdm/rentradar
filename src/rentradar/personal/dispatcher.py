@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from time import monotonic
 from weakref import WeakValueDictionary
 
 from ..config import SearchProfile, Settings
+from ..errors import DeliveryDeferred, DeliveryUncertain
 from ..interfaces import Publisher, ScoringEngine
-from ..models import Listing, ScoredListing, dedupe_cross_source
+from ..models import Listing, ScoredListing, source_rank
 from ..storage import SqlStorage
 from .filters import MIN_INTERVAL_MIN, UserFilter, matches
 from .store import PersonalStore
@@ -41,6 +43,36 @@ class PersonalDispatcher:
         self._settings = settings
         self._user_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._dispatch_slots = asyncio.Semaphore(4)
+        self._pending: dict[int, dict[tuple[str, str], Listing]] = {}
+        self._workers: dict[int, asyncio.Task] = {}
+
+    async def queue_changes(self, listings: list[Listing]) -> None:
+        """A slow chat holds only its own batch. The scheduled scan recovers after restart."""
+        if getattr(self._publisher, "simulated", False):
+            return
+        users = {flt.user_id for flt in await self._ps.all_active_filters()
+                 if flt.clamp_interval() == MIN_INTERVAL_MIN and flt.last_checked_at is not None}
+        for user_id in users:
+            batch = self._pending.setdefault(user_id, {})
+            batch.update(((lst.source.value, lst.external_id), lst) for lst in listings)
+            if user_id not in self._workers:
+                self._workers[user_id] = asyncio.create_task(self._drain_changes(user_id))
+
+    async def _drain_changes(self, user_id: int) -> None:
+        try:
+            while batch := self._pending.pop(user_id, None):
+                await self._dispatch_users(
+                    {user_id: []}, datetime.now(UTC).replace(tzinfo=None),
+                    immediate=True, batch=list(batch.values()),
+                )
+        finally:
+            self._workers.pop(user_id, None)
+
+    async def close(self) -> None:
+        tasks = list(self._workers.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_due(self, now: datetime) -> int:
         """Прогнать все фильтры, у которых наступил интервал. Вернуть число отправок."""
@@ -60,7 +92,10 @@ class PersonalDispatcher:
 
     async def _dispatch_users(
         self, users: dict[int, list[int]], now: datetime, *, immediate: bool,
+        batch: list[Listing] | None = None,
     ) -> int:
+        started = monotonic()
+
         async def dispatch_user(user_id: int, due_ids: list[int]) -> int:
             lock = self._user_locks.get(user_id)
             if lock is None:
@@ -77,11 +112,12 @@ class PersonalDispatcher:
                             if last is None or flt.clamp_interval() != MIN_INTERVAL_MIN:
                                 continue
                         elif filter_id not in due_ids or (
-                            last is not None and now - last < timedelta(minutes=flt.clamp_interval())
+                            last is not None
+                            and now - last < timedelta(minutes=flt.clamp_interval())
                         ):
                             continue
                         sent, complete = await self._dispatch_one(
-                            filter_id, flt, now, fresh_only=immediate,
+                            filter_id, flt, now, started=started, fresh_only=immediate, batch=batch,
                         )
                         total += sent
                         if complete and not immediate:
@@ -95,19 +131,37 @@ class PersonalDispatcher:
         ))
 
     async def _dispatch_one(
-        self, filter_id: int, flt: UserFilter, now: datetime, *, fresh_only: bool = False,
+        self,
+        filter_id: int,
+        flt: UserFilter,
+        now: datetime,
+        *,
+        started: float,
+        fresh_only: bool = False,
+        batch: list[Listing] | None = None,
     ) -> tuple[int, bool]:
+        if getattr(self._publisher, "simulated", False):
+            return 0, False
         if not await self._ps.is_active(flt.user_id, now):
             return 0, True
         since = now - timedelta(hours=self._settings.personal_lookback_hours)
-        if fresh_only and flt.last_checked_at is not None:
+        attempts = await self._ps.attempts_for(flt.user_id)
+        if (fresh_only or not flt.include_backlog) and flt.last_checked_at and not attempts:
             since = max(since, flt.last_checked_at)
-        listings = await self._storage.recent_listings(flt.city, since)  # newest first
-        # Одна квартира с 2-3 площадок → шлём только одну (дешевле; при равной цене
-        # приоритет Avito>Cian>Yandex), чтобы не дублировать в личке.
-        listings = dedupe_cross_source(lst for lst in listings if lst.collected_at <= now)
+        listings = (batch if batch is not None else
+                    await self._ps.candidates(flt, since))
         profile = SearchProfile(name=flt.name, city=flt.city)
-        matched = [lst for lst in listings if matches(lst, flt)]  # newest first
+        copies: dict[str, list[Listing]] = defaultdict(list)
+        for listing in listings:
+            if listing.collected_at <= now and listing.photos and matches(listing, flt):
+                copies[listing.content_key].append(listing)
+        matched = [
+            listing
+            for group in copies.values()
+            for listing in sorted(
+                group, key=lambda item: source_rank(item.source.value, item.price)
+            )
+        ]
 
         # Две дорожки. СВЕЖИЕ (появились с прошлой проверки) идут вперёд и почти без
         # лимита — их и надо ловить в моменте. Старый БЭКЛОГ досылаем мягко ПОСЛЕ
@@ -126,12 +180,16 @@ class PersonalDispatcher:
             )
 
         def _is_fresh(lst: Listing) -> bool:
-            return last is None or lst.collected_at > last
+            return (
+                batch is not None
+                or last is None
+                or lst.collected_at > last
+                or lst.content_key in attempts
+            )
 
         ordered = sorted(matched, key=lambda lst: not _is_fresh(lst))  # свежие первыми
 
         sent = sent_fresh = sent_backlog = fresh_attempts = backlog_attempts = 0
-        access_lost = False
         pending_fresh = False
         handled: set[str] = set()  # content_key, которые уже пометили показанными
         seen = await self._ps.sent_keys(flt.user_id, {lst.content_key for lst in ordered})
@@ -150,44 +208,65 @@ class PersonalDispatcher:
                 continue
             if not fresh and backlog_attempts >= backlog_cap:
                 break
-            if not await self._ps.is_active(flt.user_id, now):
-                access_lost = True
-                break
+            attempt = attempts.get(content_key)
+            if attempt and attempt.retry_at > now:
+                pending_fresh = True
+                continue
+            if not await self._ps.is_active(
+                flt.user_id, now + timedelta(seconds=monotonic() - started)
+            ):
+                return sent, False
 
+            current = await self._storage.get_listing(listing.source.value, listing.external_id)
+            if current is None or not matches(current, flt):
+                continue
+            listing = current
             score = await self._scoring.score(listing, profile)
             if not score.is_publishable:  # отсекаем скам/мусор
-                await self._ps.mark_sent(flt.user_id, content_key)
-                handled.add(content_key)
+                # A later photo, price or description can make this listing eligible.
                 continue
 
             if fresh:
                 fresh_attempts += 1
             else:
                 backlog_attempts += 1
-            ok = await self._publisher.publish(
-                ScoredListing(listing=listing, score=score),
-                channel=str(flt.user_id),
-                use_custom_emoji=True,  # личка — можно кастом-эмодзи
-            )
-            if not ok and fresh:
+            sending_at = now + timedelta(seconds=monotonic() - started)
+            if not await self._ps.claim_delivery(flt.user_id, content_key, sending_at):
+                continue
+            try:
+                ok = await self._publisher.publish(
+                    ScoredListing(listing=listing, score=score),
+                    channel=str(flt.user_id), use_custom_emoji=True,
+                )
+            except DeliveryDeferred as exc:
+                ok = False
+                state, delay = "rate_limited", timedelta(seconds=exc.seconds)
+            except DeliveryUncertain:
+                ok = False
+                state, delay = "uncertain", timedelta(minutes=15)
+            else:
+                state = "retry"
+                delay = timedelta(
+                    seconds=min(900, 20 * 2 ** min(attempt.attempts if attempt else 0, 6))
+                )
+            finished = now + timedelta(seconds=monotonic() - started)
+            if not ok:
+                await self._ps.defer_delivery(flt.user_id, content_key, state, finished + delay)
                 pending_fresh = True
                 continue
-            await self._ps.mark_sent(flt.user_id, content_key, delivered=ok, now=now)
+            await self._ps.mark_sent(flt.user_id, content_key, delivered=True, now=finished)
+            logger.info(
+                "delivery_ack user=%s source=%s collected_to_ack_seconds=%.2f",
+                flt.user_id,
+                listing.source.value,
+                (finished - (listing.first_seen_at or listing.collected_at)).total_seconds(),
+            )
             handled.add(content_key)
-            if not ok:
-                continue
             sent += 1
             if fresh:
                 sent_fresh += 1
             else:
                 sent_backlog += 1
-
-        # Режим «только новые» на холодном старте: остальной бэклог помечаем
-        # показанным, чтобы он не капал потом (пользователь выбрал не показывать его).
-        if cold and not flt.include_backlog and not access_lost and not pending_fresh:
-            for listing in ordered:
-                if listing.content_key not in handled and listing.content_key not in seen:
-                    await self._ps.mark_sent(flt.user_id, listing.content_key)
 
         if sent:
             logger.info(

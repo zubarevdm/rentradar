@@ -169,11 +169,11 @@ async def test_flood_retry_then_success(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(bot.album_calls) == 1  # повтор прошёл
 
 
-async def test_dry_run_returns_true_without_calls() -> None:
+async def test_dry_run_reports_simulation_without_calls() -> None:
     bot = FakeBot()
     pub = TelegramPublisher(dry_run=True, bot=bot)  # type: ignore[arg-type]
     ok = await pub.publish(_scored(photos=["https://img/1.jpg"]), channel="@ch")
-    assert ok is True
+    assert ok is None
     assert not bot.photo_calls and not bot.message_calls and not bot.album_calls
 
 
@@ -235,3 +235,35 @@ async def test_text_post_has_no_link_preview() -> None:
     pub = TelegramPublisher(dry_run=False, bot=bot)
     assert await pub.publish(_scored(photos=[]), channel="42")
     assert bot.message_calls[0]["disable_web_page_preview"] is True
+
+
+async def test_ambiguous_ack_does_not_send_another_representation():
+    from unittest.mock import AsyncMock
+
+    from aiogram.exceptions import TelegramNetworkError
+
+    from rentradar.errors import DeliveryUncertain
+
+    bot = FakeBot()
+    bot.send_photo = AsyncMock(side_effect=TelegramNetworkError(method=object(), message="timeout"))
+    pub = TelegramPublisher(dry_run=False, bot=bot)
+    with pytest.raises(DeliveryUncertain):
+        await pub.publish(_scored(photos=["https://img/1.jpg"]), channel="123")
+    assert bot.send_photo.await_count == 1
+    assert not bot.message_calls
+
+
+async def test_reuses_confirmed_telegram_photo_id():
+    from unittest.mock import AsyncMock
+
+    bot = FakeBot()
+    bot.send_photo = AsyncMock(
+        return_value=SimpleNamespace(photo=[SimpleNamespace(file_id="file-1")])
+    )
+    pub = TelegramPublisher(dry_run=False, bot=bot)
+    candidate = _scored(photos=["https://img/1.jpg"])
+    assert await pub.publish(candidate, channel="123")
+    assert await pub.publish(candidate, channel="456")
+    assert [call.kwargs["photo"] for call in bot.send_photo.await_args_list] == [
+        "https://img/1.jpg", "file-1",
+    ]

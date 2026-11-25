@@ -13,7 +13,7 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .models import DealType, PropertyType
+from .models import DealType, Listing, PropertyType
 
 
 class Settings(BaseSettings):
@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     # Частота центрального сбора площадок в минутах (питает канал и личного бота).
     # Дробные минуты допустимы: 2.5 = 150 секунд. У Авито свой интервал сбора.
     collect_interval_min: float = 2.5
+    yandex_collect_interval_min: float = 0  # zero follows the shared collection interval
     # Окно для расчёта рыночных медиан, дней (старые цены не тянут медиану).
     # Сами лоты НЕ удаляются — окно влияет только на расчёт, история хранится.
     market_window_days: int = 90
@@ -284,6 +285,23 @@ class SearchProfile(BaseModel):
     area_max: float | None = None
     metro_only: bool = False
     collect_limit: int = Field(default=50, ge=1, le=150)
+
+    def accepts(self, listing: Listing) -> bool:
+        return (
+            listing.city == self.city
+            and listing.deal_type == self.deal_type
+            and (not self.rooms or listing.rooms in self.rooms)
+            and (not self.property_types or listing.property_type in self.property_types)
+            and (not self.metro_only or bool(listing.metro))
+            and (self.price_min is None or listing.price >= self.price_min)
+            and (self.price_max is None or listing.price <= self.price_max)
+            and (
+                self.area_min is None or listing.area is not None and listing.area >= self.area_min
+            )
+            and (
+                self.area_max is None or listing.area is not None and listing.area <= self.area_max
+            )
+        )
 
     # Порог TastyScore для публикации, [0..100].
     publish_threshold: float = 60.0

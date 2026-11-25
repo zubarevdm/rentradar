@@ -141,23 +141,25 @@ class CianCollector(HttpCollector):
 
     # ── сбор ─────────────────────────────────────────────────────────────
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
-        """Сбор напрямую; при капче — через резервный прокси (телефон), держимся его 30 мин."""
-        if self._fallback_proxy and time.monotonic() < self._fallback_until:
-            return await self._fetch_via(profile, limit, self._fallback_proxy)
-        try:
-            return await self._fetch_via(profile, limit, None)
-        except CollectorBlockedError:
-            if not self._fallback_proxy:
-                raise
-            logger.info("cian: капча на прямом IP — идём через резервный прокси")
-            self._fallback_until = time.monotonic() + self._fallback_hold_sec
-            return await self._fetch_via(profile, limit, self._fallback_proxy)
+        return [raw async for page in self.fetch_pages(profile, limit=limit) for raw in page]
 
-    async def _fetch_via(
-        self, profile: SearchProfile, limit: int, proxy: str | None
-    ) -> list[RawListing]:
+    async def fetch_pages(self, profile: SearchProfile, *, limit: int):
+        proxy = self._fallback_proxy if time.monotonic() < self._fallback_until else None
+        yielded = False
+        try:
+            async for page in self._fetch_via(profile, limit, proxy):
+                yielded = True
+                yield page
+        except CollectorBlockedError:
+            if yielded or proxy or not self._fallback_proxy:
+                raise
+            self._fallback_until = time.monotonic() + self._fallback_hold_sec
+            async for page in self._fetch_via(profile, limit, self._fallback_proxy):
+                yield page
+
+    async def _fetch_via(self, profile: SearchProfile, limit: int, proxy: str | None):
         region = _region_for(profile.city)
-        results: list[RawListing] = []
+        remaining = limit
         # follow_redirects=True нужен для прогрева (сайт может редиректить);
         # на сам API-вызов редирект запрещаем явно — там это сигнал блокировки.
         async with self._client(follow_redirects=True, proxy=proxy) as client:
@@ -170,13 +172,13 @@ class CianCollector(HttpCollector):
                 offers = _extract_offers(data)
                 if not offers:
                     break
-                for offer in offers:
-                    raw = _wrap_offer(offer)
-                    if raw is not None:
-                        results.append(raw)
-                    if len(results) >= limit:
-                        return results
-        return results
+                batch = [raw for offer in offers if isinstance(offer, dict)
+                         and (raw := _wrap_offer(offer)) is not None][:remaining]
+                if batch:
+                    yield batch
+                    remaining -= len(batch)
+                if remaining <= 0:
+                    break
 
     async def _prime_session(self, client: object) -> None:
         """Прогреть сессию: зайти на страницу Циан, чтобы получить cookies.

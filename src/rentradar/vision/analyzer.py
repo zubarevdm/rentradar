@@ -149,7 +149,7 @@ class LLMPhotoAnalyzer:
         self._timeout = timeout
 
     async def analyze(self, photo_urls: list[str]) -> PhotoAnalysis | None:
-        urls = [u for u in photo_urls if u][: self._max_images]
+        urls = photo_urls[: self._max_images]
         if not urls:
             return None
         # Ловим ЛЮБЫЕ ошибки, кроме квоты: битый URL фото (httpx.InvalidURL — не
@@ -161,20 +161,23 @@ class LLMPhotoAnalyzer:
                 images = await self._fetch_images(client, urls)
                 if not images:
                     return None
-                content = await self._call(client, images)
+                content = await self._call(client, [data for _, data in images])
         except VisionQuotaError:
             raise  # пусть оркестратор уведомит админа
         except Exception as exc:  # noqa: BLE001
             logger.warning("vision-вызов не удался: %s: %s", type(exc).__name__, exc)
             return None
-        return parse_analysis(content, len(urls))
+        result = parse_analysis(content, len(images))
+        if result is not None:
+            result.best_photos = [images[i][0] for i in result.best_photos]
+        return result
 
     async def _fetch_images(
         self, client: httpx.AsyncClient, urls: list[str]
-    ) -> list[str]:
+    ) -> list[tuple[int, str]]:
         """Скачать фото и завернуть в data-URI (base64). Битые молча пропускаем."""
-        out: list[str] = []
-        for url in urls:
+        out: list[tuple[int, str]] = []
+        for index, url in enumerate(urls):
             try:
                 resp = await client.get(url)
                 resp.raise_for_status()
@@ -184,7 +187,7 @@ class LLMPhotoAnalyzer:
             if not mime.startswith("image/"):
                 mime = _mime_from_url(url)
             b64 = base64.b64encode(resp.content).decode("ascii")
-            out.append(f"data:{mime};base64,{b64}")
+            out.append((index, f"data:{mime};base64,{b64}"))
         return out
 
     async def _call(self, client: httpx.AsyncClient, images: list[str]) -> str:

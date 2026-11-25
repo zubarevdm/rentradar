@@ -6,18 +6,22 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-BRANCH="$(cat "$REPO/.cc_pending" 2>/dev/null | tr -d ' \r\n')"
-[ -z "$BRANCH" ] && { echo '{"status":"nothing"}'; exit 0; }
-
-cd "$REPO" || { echo '{"status":"error","msg":"cd repo failed"}'; exit 0; }
-git fetch -q origin 2>/dev/null
-git checkout -q main 2>/dev/null
-if ! git merge -q --no-edit "origin/$BRANCH" >/tmp/rentradar-cc-merge.log 2>&1; then
-  git merge --abort 2>/dev/null
-  jq -c -n --arg b "$BRANCH" '{status:"conflict",branch:$b}'
-  exit 0
-fi
-git push -q origin main 2>/dev/null
-git push -q origin --delete "$BRANCH" 2>/dev/null   # прибрать влитую ветку с GitHub
+fail() { jq -cn --arg msg "$1" '{status:"error",msg:$msg}'; exit 1; }
+exec 9>"/tmp/rentradar-cc.lock"
+flock -n 9 || fail "another release is running"
+[ -s "$REPO/.cc_pending" ] || { echo '{"status":"nothing"}'; exit 0; }
+read -r BRANCH tested < "$REPO/.cc_pending" || fail "invalid release record"
+[[ "$BRANCH" == cc/* && "$tested" =~ ^[[:xdigit:]]{40}$ ]] || fail "candidate requires a tested commit"
+cd "$REPO" || fail "cannot open deployment"
+git diff --quiet && git diff --cached --quiet || fail "working tree has changes"
+git fetch -q origin || fail "fetch failed"
+target=$(git rev-parse --verify "refs/remotes/origin/$BRANCH^{commit}") || fail "unknown branch"
+[ "$target" = "$tested" ] || fail "candidate changed after testing"
+git merge-base --is-ancestor origin/main "$target" || fail "candidate must be rebased and tested"
+git merge-base --is-ancestor HEAD "$target" || fail "deployment has diverged"
+git push -q origin "$target:refs/heads/main" || fail "GitHub rejected release"
+remote=$(git ls-remote origin refs/heads/main) || fail "cannot verify published release"
+[ "${remote%%[[:space:]]*}" = "$target" ] || fail "GitHub SHA changed"
+git switch --detach "$target" || fail "cannot deploy verified GitHub SHA"
 rm -f "$REPO/.cc_pending"
-jq -c -n --arg b "$BRANCH" '{status:"applied",branch:$b}'
+jq -cn --arg b "$BRANCH" '{status:"applied",branch:$b}'

@@ -11,6 +11,7 @@ import html
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -395,8 +396,15 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
 
     @router.message(Command("menu"))
     async def show_menu(message: Message, state: FSMContext) -> None:
+        started = monotonic()
         await state.clear()
         await message.answer("Выбери действие 👇", reply_markup=_main_menu())
+
+        logger.info(
+            "menu_reply handler_ms=%.0f command_to_reply_seconds=%.2f",
+            (monotonic() - started) * 1000,
+            (datetime.now(UTC) - message.date).total_seconds(),
+        )
 
     @router.callback_query(F.data.startswith("nav:"))
     async def navigate(cq: CallbackQuery, state: FSMContext, bot: Bot) -> None:
@@ -1015,6 +1023,7 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
             return
         _, ref_id = await store.save_filter(flt, now=_utcnow())
         await state.clear()
+        await cq.answer("Фильтр сохранён")
         await _notify_activation(bot, ref_id)
         since = _utcnow() - timedelta(hours=settings.personal_lookback_hours)
         found = await store.count_new_matches(flt, since)
@@ -1037,7 +1046,6 @@ def build_router(store: PersonalStore, settings: Settings) -> Router:
         await cq.message.edit_text(
             "✅ Фильтр сохранён!\n\n" + _describe(flt) + tail, reply_markup=_main_menu()
         )
-        await cq.answer("Готово")
 
     # ── кнопка «Добавить» / удаление фильтра / оплата ───────────────────
     @router.callback_query(F.data == "new_filter")

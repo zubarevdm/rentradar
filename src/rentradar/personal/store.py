@@ -12,12 +12,21 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from itertools import batched
 
-from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..models import Listing
 from ..storage import SqlStorage
-from ..storage.orm import ListingRow, ManualPaymentRow, SubscriberRow, UserFilterRow, UserSentRow
+from ..storage.orm import (
+    DeliveryAttemptRow,
+    ListingRow,
+    ManualPaymentRow,
+    SubscriberRow,
+    UserFilterRow,
+    UserSentRow,
+)
+from ..storage.repository import _row_to_listing
 from .access import TARIFFS, TRIAL, Access, access_of, add_hours, normalize_pause, utcnow
 from .filters import UserFilter, matches
 
@@ -28,14 +37,79 @@ class PersonalStore:
         self._session = storage._session  # общий sessionmaker
         self._pause_max = pause_max_days  # максимум дней заморозки на паузе
 
+    async def candidates(self, flt: UserFilter, since: datetime) -> list[Listing]:
+        seen = select(UserSentRow.id).where(
+            UserSentRow.user_id == flt.user_id, UserSentRow.content_key == ListingRow.content_key,
+            UserSentRow.delivered.is_not(False),
+        ).exists()
+        query = select(ListingRow).where(
+            ListingRow.city == flt.city, ListingRow.collected_at >= since, ~seen,
+            ListingRow.flagged.is_(False),
+        )
+        if flt.rooms:
+            query = query.where(ListingRow.rooms.in_(flt.rooms))
+        if flt.price_min is not None:
+            query = query.where(ListingRow.price >= flt.price_min)
+        if flt.price_max is not None:
+            query = query.where(ListingRow.price <= flt.price_max)
+        query = query.order_by(
+            func.coalesce(ListingRow.published_at, ListingRow.collected_at).desc(),
+            ListingRow.collected_at.desc(),
+            ListingRow.id.desc(),
+        )
+        async with self._session() as session:
+            return [_row_to_listing(row) for row in await session.scalars(query)]
+
     async def count_new_matches(self, flt: UserFilter, since: datetime) -> int:
         """Сколько свежих лотов подходит под фильтр и ещё не отправлено юзеру."""
-        listings = await self._storage.recent_listings(flt.city, since)
-        cnt = 0
-        for listing in listings:
-            if matches(listing, flt) and not await self.was_sent(flt.user_id, listing.content_key):
-                cnt += 1
-        return cnt
+        listings = await self.candidates(flt, since)
+        keys = {
+            listing.content_key for listing in listings if listing.photos and matches(listing, flt)
+        }
+        return len(keys - await self.sent_keys(flt.user_id, keys))
+
+    async def prune_attempts(self, since: datetime) -> None:
+        async with self._session() as session:
+            await session.execute(
+                delete(DeliveryAttemptRow).where(DeliveryAttemptRow.retry_at < since)
+            )
+            await session.commit()
+
+    async def attempts_for(self, user_id: int) -> dict[str, DeliveryAttemptRow]:
+        async with self._session() as session:
+            rows = await session.scalars(select(DeliveryAttemptRow).where(
+                DeliveryAttemptRow.user_id == user_id,
+            ))
+            return {row.content_key: row for row in rows}
+
+    async def claim_delivery(self, user_id: int, key: str, now: datetime) -> bool:
+        # An interrupted request is ambiguous until the lease expires.
+        lease = now + timedelta(minutes=15)
+        async with self._write() as session:
+            delivered = await session.scalar(select(UserSentRow.id).where(
+                UserSentRow.user_id == user_id, UserSentRow.content_key == key,
+                UserSentRow.delivered.is_not(False),
+            ))
+            if delivered is not None:
+                return False
+            stmt = insert(DeliveryAttemptRow).values(
+                user_id=user_id, content_key=key, attempts=1,
+                state="sending", first_attempt_at=now, retry_at=lease,
+            )
+            result = await session.execute(stmt.on_conflict_do_update(
+                index_elements=["user_id", "content_key"],
+                set_={"state": "sending", "retry_at": lease,
+                      "attempts": DeliveryAttemptRow.attempts + 1},
+                where=DeliveryAttemptRow.retry_at <= now,
+            ))
+            return result.rowcount == 1
+
+    async def defer_delivery(self, user_id: int, key: str, state: str, retry_at: datetime) -> None:
+        async with self._session() as session:
+            await session.execute(update(DeliveryAttemptRow).where(
+                DeliveryAttemptRow.user_id == user_id, DeliveryAttemptRow.content_key == key,
+            ).values(state=state, retry_at=retry_at))
+            await session.commit()
 
     # ── фильтры ─────────────────────────────────────────────────────────
     async def upsert_filter(
@@ -164,7 +238,11 @@ class PersonalStore:
             await session.execute(
                 update(UserFilterRow)
                 .where(UserFilterRow.id == filter_id)
-                .where(or_(UserFilterRow.last_checked_at.is_(None), UserFilterRow.last_checked_at < now))
+                .where(
+                    or_(
+                        UserFilterRow.last_checked_at.is_(None), UserFilterRow.last_checked_at < now
+                    )
+                )
                 .values(last_checked_at=now)
             )
             await session.commit()
@@ -440,7 +518,8 @@ class PersonalStore:
             for keys in batched(content_keys, 500):
                 rows = await session.scalars(
                     select(UserSentRow.content_key)
-                    .where(UserSentRow.user_id == user_id, UserSentRow.content_key.in_(keys))
+                    .where(UserSentRow.user_id == user_id, UserSentRow.content_key.in_(keys),
+                           UserSentRow.delivered.is_not(False))
                 )
                 seen.update(rows)
         return seen
@@ -470,6 +549,13 @@ class PersonalStore:
         )
         async with self._session() as session:
             await session.execute(statement)
+            if delivered:
+                await session.execute(
+                    delete(DeliveryAttemptRow).where(
+                        DeliveryAttemptRow.user_id == user_id,
+                        DeliveryAttemptRow.content_key == content_key,
+                    )
+                )
             await session.commit()
 
     async def count_delivered(self, user_id: int | None, since: datetime) -> int:

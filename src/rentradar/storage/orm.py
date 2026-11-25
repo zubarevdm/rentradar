@@ -77,6 +77,7 @@ class ListingRow(Base):
     best_photos: Mapped[list] = mapped_column(JSON, default=list)
     flagged: Mapped[bool] = mapped_column(Boolean, default=False)  # скам-оверлей на фото
     analyzed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    vision_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Дообогащение с детальной страницы площадки (Авито)
     enriched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     photos: Mapped[list] = mapped_column(JSON, default=list)
@@ -193,3 +194,15 @@ class UserSentRow(Base):
     # Реально доставлено (а не отсеяно скорингом/помечено пропущенным бэклогом).
     # NULL у строк до миграции — «неизвестно», в счётчики доставок не входят.
     delivered: Mapped[bool | None] = mapped_column(Boolean, default=False, nullable=True)
+
+
+class DeliveryAttemptRow(Base):
+    """Durable retry and acknowledgement state for one recipient and apartment."""
+
+    __tablename__ = "delivery_attempts"
+    user_id: Mapped[int] = mapped_column(primary_key=True)
+    content_key: Mapped[str] = mapped_column(String(24), primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    state: Mapped[str] = mapped_column(String(24))
+    retry_at: Mapped[datetime] = mapped_column(DateTime)
+    first_attempt_at: Mapped[datetime] = mapped_column(DateTime)

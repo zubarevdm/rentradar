@@ -141,7 +141,9 @@ async def test_relay_uses_small_jpeg_upload_when_urls_fail(monkeypatch):
 
     monkeypatch.setattr(bot, "send_photo", reject_urls)
     pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
-    assert await pub.publish(_scored(photos=["https://images.cdn-cian.ru/photo.jpg"]), channel="test")
+    assert await pub.publish(
+        _scored(photos=["https://images.cdn-cian.ru/photo.jpg"]), channel="test"
+    )
     photo = bot.photo_calls[0]["photo"]
     assert isinstance(photo, BufferedInputFile) and len(photo.data) <= 7_000
     with Image.open(BytesIO(photo.data)) as uploaded:
@@ -169,7 +171,7 @@ async def test_cian_jpeg_proxy_sends_three_validated_urls():
     assert await publisher.publish(_scored(photos=original), channel="test")
     media = bot.album_calls[0]["media"]
     assert len(media) == 3 and not bot.message_calls
-    for photo, source in zip(media, original):
+    for photo, source in zip(media, original[:len(media)], strict=True):
         parsed = urlsplit(photo.media)
         assert parsed.hostname == "wsrv.nl"
         query = parse_qs(parsed.query)
@@ -218,3 +220,15 @@ async def test_avito_via_relay_falls_back_to_text_quickly(monkeypatch):
     photos = ["https://10.img.avito.st/a", "https://20.img.avito.st/b", "https://evil.example/c"]
     assert await pub.publish(_avito_scored(photos), channel="test")
     assert len(bot.message_calls) == 1
+
+
+async def test_personal_card_retries_instead_of_acknowledging_text_only(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    bot = FakeBot(fail={"photo", "album"})
+    pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
+    monkeypatch.setattr(pub, "_download_relay_preview", AsyncMock(return_value=None))
+    assert not await pub.publish(
+        _scored(photos=["https://img/a"]), channel="123", use_custom_emoji=True,
+    )
+    assert not bot.message_calls

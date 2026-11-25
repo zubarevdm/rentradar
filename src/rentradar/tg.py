@@ -4,13 +4,13 @@ import socket
 from ipaddress import IPv4Address
 from urllib.parse import urlsplit
 
-from aiohttp.abc import AbstractResolver
-from aiohttp.resolver import ThreadedResolver
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
+from aiohttp.abc import AbstractResolver
+from aiohttp.resolver import ThreadedResolver
 
 from .config import Settings
 

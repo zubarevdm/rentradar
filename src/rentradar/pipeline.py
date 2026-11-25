@@ -15,9 +15,9 @@ from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from .config import SearchProfile, Settings
-from .errors import CollectorBlockedError
+from .errors import CollectionSkipped, CollectorBlockedError, DeliveryDeferred, DeliveryUncertain
 from .interfaces import BaseCollector, Publisher, ScoringEngine, Storage
-from .models import ScoredListing
+from .models import Listing, ScoredListing
 
 logger = logging.getLogger(__name__)
 
@@ -53,25 +53,7 @@ class Pipeline:
         """
         candidates: list[ScoredListing] = []
         for collector in self._collectors:
-            try:
-                raw_items = await collector.fetch(profile)
-            except CollectorBlockedError as exc:
-                logger.warning(
-                    "profile=%s source=%s: блокировка (%s)",
-                    profile.name,
-                    collector.source_name,
-                    exc,
-                )
-                continue
-            listings = [n for r in raw_items if (n := collector.normalize(r))]
-            fresh = await self._storage.upsert_listings(listings)
-            logger.info(
-                "profile=%s source=%s collected=%d new=%d",
-                profile.name,
-                collector.source_name,
-                len(listings),
-                len(fresh),
-            )
+            fresh, _ = await self.collect_source(collector, profile)
             for listing in fresh:
                 score = await self._scoring.score(listing, profile)
                 if not score.is_publishable:
@@ -115,7 +97,15 @@ class Pipeline:
             seen.add(content_key)
             if published and self._post_delay:
                 await asyncio.sleep(self._post_delay)  # антифлуд между постами
-            ok = await self._publisher.publish(scored, channel=channel)
+            try:
+                ok = await self._publisher.publish(scored, channel=channel)
+            except DeliveryDeferred:
+                break
+            except DeliveryUncertain:
+                logger.warning("Unconfirmed channel publication key=%s", content_key)
+                continue
+            if ok is None:
+                continue
             if not ok:
                 # Не отправилось — НЕ помечаем, попадёт в следующий цикл.
                 logger.warning("пост не отправлен: %s", scored.listing.url)
@@ -140,42 +130,84 @@ class Pipeline:
         Возвращает (число новых лотов, {source: 'ok'|'blocked'|'error'}) — статус по
         каждой площадке нужен health-мониторингу (алерт админам при падении). Сбой
         одной площадки не мешает остальным."""
-        new_total = 0
-        statuses: dict[str, str] = {}
+        total = 0
+        statuses = {}
         for collector in self._collectors:
-            try:
-                raw_items = await collector.fetch(profile, limit=profile.collect_limit)
-            except CollectorBlockedError as exc:
-                logger.warning(
-                    "collect %s [%s]: блок (%s)", profile.name, collector.source_name, exc
-                )
-                statuses[collector.source_name] = "blocked"
-                continue
-            except Exception:  # noqa: BLE001 — неожиданная ошибка площадки не валит сбор
-                logger.exception(
-                    "collect %s [%s]: ошибка", profile.name, collector.source_name
-                )
-                statuses[collector.source_name] = "error"
-                continue
-            listings = [n for r in raw_items if (n := collector.normalize(r))]
-            fresh = await self._storage.upsert_listings(listings)
-            new_total += len(fresh)
-            if fresh and on_new is not None:
-                on_new()
-            statuses[collector.source_name] = "ok"
-        return new_total, statuses
+            fresh, status = await self.collect_source(
+                collector, profile, on_changes=(lambda _: on_new()) if on_new else None,
+            )
+            total += len(fresh)
+            statuses[collector.source_name] = status
+        return total, statuses
+
+    async def collect_source(
+        self, collector: BaseCollector, profile: SearchProfile,
+        on_changes: Callable[[list[Listing]], None] | None = None,
+    ) -> tuple[list[Listing], str]:
+        fresh: list[Listing] = []
+        saved = rejected = 0
+        try:
+            async for page in collector.fetch_pages(profile, limit=profile.collect_limit):
+                listings = []
+                for raw in page:
+                    try:
+                        listing = collector.normalize(raw)
+                    except (
+                        ValueError,
+                        TypeError,
+                        AttributeError,
+                        KeyError,
+                        IndexError,
+                        OverflowError,
+                    ):
+                        logger.warning(
+                            "Invalid listing source=%s id=%s",
+                            collector.source_name,
+                            raw.external_id,
+                        )
+                        listing = None
+                    if listing is None:
+                        rejected += 1
+                    else:
+                        listings.append(listing)
+                new, changed = await self._storage.upsert_changes(listings)
+                fresh.extend(new)
+                saved += len(listings)
+                if changed and on_changes:
+                    on_changes(changed)
+        except CollectionSkipped:
+            return fresh, "skipped"
+        except CollectorBlockedError as exc:
+            logger.warning(
+                "collect %s [%s]: блок (%s), saved=%d",
+                profile.name,
+                collector.source_name,
+                exc,
+                saved,
+            )
+            return fresh, "partial" if saved else "blocked"
+        except Exception:
+            logger.exception("Collection failed source=%s saved=%d", collector.source_name, saved)
+            return fresh, "partial" if saved else "error"
+        logger.info("collect source=%s saved=%d new=%d rejected=%d",
+                    collector.source_name, saved, len(fresh), rejected)
+        return fresh, "partial" if rejected and saved else ("error" if rejected else "ok")
 
     async def score_recent(
-        self, profile: SearchProfile, since: datetime, *, min_score: float | None = None
+        self, profile: SearchProfile, since: datetime, *, min_score: float | None = None,
+        listings: list[Listing] | None = None
     ) -> list[ScoredListing]:
         """Оценить свежие (по `since`) лоты города из БД — кандидаты для публикации.
         `min_score` — порог «вкусности» (None → publish_threshold профиля). Канал
         передаёт свой (низкий) порог: там отбор по красоте, а не по выгодности.
         Дедуп против истории постинга делает `publish_top`."""
         threshold = min_score if min_score is not None else profile.publish_threshold
-        listings = await self._storage.recent_listings(profile.city, since)  # type: ignore[attr-defined]
+        if listings is None:
+            listings = await self._storage.recent_listings(profile.city, since)  # type: ignore[attr-defined]
         out: list[ScoredListing] = []
         for listing in listings:
+            if not profile.accepts(listing):
+                continue
             score = await self._scoring.score(listing, profile)
             if score.is_publishable and score.total >= threshold:
                 out.append(ScoredListing(listing=listing, score=score))

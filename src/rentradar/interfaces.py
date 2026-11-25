@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 
 from .config import SearchProfile
 from .models import (
@@ -28,6 +28,11 @@ class BaseCollector(ABC):
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         """Вернуть сырые объявления, подходящие под профиль (свежие — первыми)."""
 
+    async def fetch_pages(
+        self, profile: SearchProfile, *, limit: int
+    ) -> AsyncIterator[list[RawListing]]:
+        yield await self.fetch(profile, limit=limit)
+
     @abstractmethod
     def normalize(self, raw: RawListing) -> Listing | None:
         """Привести сырое объявление к `Listing`. None — если данные битые."""
@@ -35,6 +40,14 @@ class BaseCollector(ABC):
 
 class MarketStatsProvider(ABC):
     """Источник рыночных медиан для сегмента (нужен скорингу)."""
+
+    async def resolve_market(
+        self, keys: list[str], minimum: int,
+    ) -> tuple[str | None, float | None, float | None]:
+        for key in keys:
+            if await self.sample_size(key) >= minimum:
+                return key, await self.median_price(key), await self.median_price_per_m2(key)
+        return None, None, None
 
     @abstractmethod
     async def median_price(self, segment_key: str) -> float | None:
@@ -68,6 +81,12 @@ class Storage(ABC):
     async def upsert_listings(self, listings: Sequence[Listing]) -> list[Listing]:
         """Сохранить объявления; вернуть только НОВЫЕ (по fingerprint) — дедуп."""
 
+    async def upsert_changes(
+        self, listings: Sequence[Listing]
+    ) -> tuple[list[Listing], list[Listing]]:
+        new = await self.upsert_listings(listings)
+        return new, new
+
     @abstractmethod
     async def was_posted(self, fingerprint: str) -> bool:
         """Постили ли уже этот лот (идемпотентность публикатора)."""
@@ -83,7 +102,7 @@ class Publisher(ABC):
     @abstractmethod
     async def publish(
         self, scored: ScoredListing, *, channel: str, use_custom_emoji: bool = False
-    ) -> bool:
+    ) -> bool | None:
         """Опубликовать оценённый лот. True — если реально отправлено.
 
         `use_custom_emoji` включает кастом-эмодзи (для личных чатов, не для канала).

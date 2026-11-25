@@ -88,11 +88,8 @@ def matches(listing: Listing, flt: UserFilter) -> bool:
     ):
         return False
 
-    # Без посредников: явная комиссия > 0 = агент; риелторские фразы в описании —
-    # тоже агент (даже если комиссия «0»). Неизвестная комиссия (None) допускается,
-    # если текст чистый — иначе отсеяли бы весь Авито (у него комиссии нет в данных).
     if flt.no_commission:
-        if listing.commission_amount is not None and listing.commission_amount > 0:
+        if listing.commission_amount != 0:
             return False
         if looks_like_agent(listing.description):
             return False

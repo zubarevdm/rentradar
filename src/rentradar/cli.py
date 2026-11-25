@@ -26,11 +26,9 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import ccagent
-from .collectors import AvitoCollector, CianCollector, YandexCollector
-from .collectors import avito_access
+from .collectors import AvitoCollector, CianCollector, YandexCollector, avito_access
 from .collectors.avito import fetch_detail, set_request_cooldown
 from .config import SearchProfile, Settings, load_emoji, load_profiles
-from .errors import CollectorBlockedError
 from .models import Listing, ScoredListing, Source, source_rank
 from .personal import PersonalStore
 from .personal.access import TARIFFS, TRIAL, access_of, moscow_when, plural
@@ -219,31 +217,14 @@ async def _collect(settings: Settings) -> None:
         return
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
     await storage.init(pause_max_days=settings.pause_max_days)
-    collectors = _build_collectors(settings)
+    pipeline, publisher = _build_pipeline(settings, storage)
     try:
         for profile in profiles:
-            for collector in collectors:
-                try:
-                    raws = await collector.fetch(profile)
-                    listings = [n for r in raws if (n := collector.normalize(r))]
-                    fresh = await storage.upsert_listings(listings)
-                    log.info(
-                        "collect %s [%s]: получено=%d, новых=%d",
-                        profile.name,
-                        collector.source_name,
-                        len(listings),
-                        len(fresh),
-                    )
-                except CollectorBlockedError as exc:
-                    log.warning(
-                        "collect %s [%s]: блокировка (%s)",
-                        profile.name,
-                        collector.source_name,
-                        exc,
-                    )
+            await pipeline.collect_only(profile)
         total = await storage.count_listings()
         log.info("Всего объявлений в БД: %d", total)
     finally:
+        await publisher.close()
         await storage.dispose()
 
 
@@ -383,8 +364,9 @@ async def _serve(settings: Settings) -> None:
             protect_public=settings.protect_content_public,
         )
 
+    collectors = _build_collectors(settings)
     pipeline = Pipeline(
-        collectors=_build_collectors(settings),
+        collectors=collectors,
         storage=storage,
         scoring=TastyScoringEngine(SqlMarketStatsProvider(storage)),
         publisher=publisher,
@@ -438,7 +420,11 @@ async def _serve(settings: Settings) -> None:
                 active[flt.user_id] = await personal_store.is_active(flt.user_id, now)
             if active[flt.user_id]:
                 filters.append(flt)
-        return [lst for lst in listings if any(matches(lst, f) for f in filters)]
+        # Details can confirm that a currently unknown fee is zero.
+        provisional = [f.model_copy(update={"no_commission": False}) for f in filters]
+        return [lst for lst in listings if any(
+            matches(lst, f) for f in (provisional if lst.commission_amount is None else filters)
+        )]
 
     async def enrich_job() -> None:
         """Дообогатить свежие Авито-лоты с детальных страниц: описание, залог,
@@ -477,10 +463,10 @@ async def _serve(settings: Settings) -> None:
                         len(cands),
                     )
                     break
-                await storage.save_enrichment(
+                changed = await storage.save_enrichment(
                     listing.source.value,
                     listing.external_id,
-                    enriched_at=_utcnow(),
+                    enriched_at=_utcnow(), expected_price=listing.price,
                     description=detail.description,
                     deposit_rub=detail.deposit_rub,
                     commission_pct=detail.commission_pct,
@@ -495,6 +481,8 @@ async def _serve(settings: Settings) -> None:
                     deposit_present=detail.deposit_present,
                     commission_present=detail.commission_present,
                 )
+                if changed is not None:
+                    notify_changes([changed])
                 done += 1
             if done:
                 log.info("Обогащение Авито: %d лотов", done)
@@ -503,29 +491,50 @@ async def _serve(settings: Settings) -> None:
 
     immediate_delivery = asyncio.Event()
     enrichment_requested = asyncio.Event()
+    changes: dict[tuple[str, str], Listing] = {}
+    source_locks = {collector.source_name: asyncio.Lock() for collector in collectors}
+    collection_slots = asyncio.Semaphore(2)
+    latest_counts: dict[str, int] = {}
+    source_checked: dict[str, datetime] = {}
 
-    async def collect_job() -> None:
+    def notify_changes(batch: list[Listing]) -> None:
+        changes.update(((lst.source.value, lst.external_id), lst) for lst in batch)
+        immediate_delivery.set()
+
+    async def collect_source_job(collector) -> int | None:
+        source = collector.source_name
+        lock = source_locks[source]
+        if lock.locked():
+            return None
         total = 0
-        try:
-            await storage.recompute_market_stats(window_days=settings.market_window_days)
-            agg: dict[str, list[str]] = {}
-            for p in profiles:
-                new, statuses = await pipeline.collect_only(p, on_new=immediate_delivery.set)
-                total += new
-                for src, st in statuses.items():
-                    agg.setdefault(src, []).append(st)
-            log.info("Сбор: новых лотов = %d", total)
+        states = []
+        async with lock:
+            for profile in profiles:
+                async with collection_slots:
+                    fresh, status = await pipeline.collect_source(
+                        collector, profile, notify_changes
+                    )
+                total += len(fresh)
+                states.append(status)
+            if any(status != "skipped" for status in states):
+                latest_counts[source] = total
+                source_checked[source] = _utcnow()
             runtime["last_collect_at"] = _utcnow()
-            runtime["last_collect_new"] = total
-            enrichment_requested.set()
-            await _check_source_health(agg)  # 🔴/🟢 при смене состояния площадки
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Ошибка сбора")
-            await _alert_admin(
-                f"⚠️ Джоб сбора упал: {type(exc).__name__}: {exc}",
-                key="job:collect",
-                cooldown_h=1,
-            )
+            runtime["last_collect_new"] = sum(latest_counts.values())
+            await _check_source_health({source: states})
+            if source == Source.AVITO.value:
+                enrichment_requested.set()
+            log.info("Сбор %s: новых лотов = %d, статусы=%s", source, total, states)
+        return total
+
+    async def collect_job() -> list[int | None]:
+        return await asyncio.gather(*(collect_source_job(c) for c in collectors))
+
+    async def market_job() -> None:
+        await personal_store.prune_attempts(
+            _utcnow() - timedelta(hours=settings.personal_lookback_hours)
+        )
+        await storage.recompute_market_stats(window_days=settings.market_window_days)
 
     async def public_job() -> None:
         if public_paused["on"]:
@@ -534,11 +543,15 @@ async def _serve(settings: Settings) -> None:
         try:
             since = _utcnow() - timedelta(hours=settings.public_lookback_hours)
             candidates = []
+            city_listings = {}
             for p in profiles:
+                if p.city not in city_listings:
+                    city_listings[p.city] = await storage.recent_listings(p.city, since)
                 # Канал: свой (низкий) порог вкусности — отбор по красоте, лучшие
                 # сделки бережём боту (см. public_min_score).
                 candidates.extend(
-                    await pipeline.score_recent(p, since, min_score=settings.public_min_score)
+                    await pipeline.score_recent(p, since, min_score=settings.public_min_score,
+                                                listings=city_listings[p.city])
                 )
             # Паблик-гейт по «красоте»: в канал только приличный ремонт.
             passed = [c for c in candidates if _passes_public_gate(c, settings)]
@@ -550,7 +563,11 @@ async def _serve(settings: Settings) -> None:
             # ни один не проанализирован → молчать нельзя, алертим админа.
             if candidates and not passed:
                 n_unanalyzed = sum(1 for c in candidates if c.listing.analyzed_at is None)
-                if n_unanalyzed == len(candidates) and settings.vision_enabled and settings.public_require_analyzed:
+                if (
+                    n_unanalyzed == len(candidates)
+                    and settings.vision_enabled
+                    and settings.public_require_analyzed
+                ):
                     await _alert_admin(
                         f"⚠️ Канал голодает: все {n_unanalyzed} кандидатов слота не "
                         "прошли vision-анализ (vision отстаёт или стоит). "
@@ -622,15 +639,19 @@ async def _serve(settings: Settings) -> None:
         «Лежит» — только после SOURCE_DOWN_AFTER неудачных сборов подряд: разовый
         сбой (капча, смена IP телефона) сам проходит на следующем сборе."""
         for src, results in agg.items():
-            if "ok" in results:
+            observed = [status for status in results if status != "skipped"]
+            if not observed:
+                continue
+            if "ok" in observed or "partial" in observed:
                 source_fails[src] = 0
-                state = "ok"
+                state = "ok" if all(s == "ok" for s in observed) else "partial"
             else:
                 source_fails[src] = source_fails.get(src, 0) + 1
-                state = "down" if source_fails[src] >= SOURCE_DOWN_AFTER else "ok"
-            if source_health.get(src, "ok") == state:
-                continue
+                state = "down" if source_fails[src] >= SOURCE_DOWN_AFTER else "degraded"
+            previous = source_health.get(src)
             source_health[src] = state
+            if previous == state or (state != "down" and previous != "down"):
+                continue
             if state == "down":
                 await _alert_admin(
                     f"🔴 Площадка <b>{src}</b> перестала собираться "
@@ -648,6 +669,8 @@ async def _serve(settings: Settings) -> None:
     async def _analyze_and_save(listing: Listing) -> Listing:
         """Vision по фото лота → сохранить в БД; вернуть лот с результатом анализа."""
         analysis = await analyzer.analyze(listing.photos[: settings.vision_max_images])
+        if analysis is None:
+            raise ValueError("Vision returned no usable analysis")
         # Нет фото самой квартиры (только дом/двор/рендеры) → ремонт и красоту
         # НЕ определить: renovation/appeal = None. Такой лот пройдёт только под
         # фильтр «любой» и не попадёт в WOW-канал (appeal неизвестен).
@@ -665,7 +688,11 @@ async def _serve(settings: Settings) -> None:
             "flagged": bool(analysis and analysis.contact_overlay),
             "analyzed_at": _utcnow(),
         }
-        await storage.save_photo_analysis(listing.source.value, listing.external_id, **fields)
+        saved = await storage.save_photo_analysis(
+            listing.source.value, listing.external_id, expected_photos=listing.photos, **fields,
+        )
+        if not saved:
+            raise ValueError("Photo set changed during analysis")
         return listing.model_copy(update=fields)
 
     async def _analyze_public(listing: Listing) -> Listing:
@@ -761,7 +788,7 @@ async def _serve(settings: Settings) -> None:
                             renovation=None,
                             has_furniture=None,
                             appeal=None,
-                            best_photos=[],
+                            best_photos=[], expected_photos=listing.photos,
                             analyzed_at=_utcnow(),
                         )
                         continue
@@ -777,15 +804,7 @@ async def _serve(settings: Settings) -> None:
                     return  # не долбим API дальше в этом проходе
                 except Exception:  # noqa: BLE001
                     log.exception("Vision: сбой на лоте %s — пропускаю", listing.url)
-                    await storage.save_photo_analysis(
-                        listing.source.value,
-                        listing.external_id,
-                        renovation=None,
-                        has_furniture=None,
-                        appeal=None,
-                        best_photos=[],
-                        analyzed_at=_utcnow(),
-                    )
+                    await storage.defer_analysis(listing, _utcnow() + timedelta(minutes=30))
                     continue
                 alert_state.pop("vision", None)  # успех → следующий сбой снова алертнёт
                 analyzed += 1
@@ -799,9 +818,9 @@ async def _serve(settings: Settings) -> None:
                 cooldown_h=1,
             )
 
-    async def personal_job(*, immediate: bool = False) -> None:
+    async def personal_job() -> None:
         try:
-            n = await (personal.run_immediate(_utcnow()) if immediate else personal.run_due(_utcnow()))
+            n = await personal.run_due(_utcnow())
             if n:
                 log.info("Личная рассылка: отправлено %d", n)
         except Exception as exc:  # noqa: BLE001
@@ -878,7 +897,15 @@ async def _serve(settings: Settings) -> None:
             await _alert_admin(phone_texts[(part, ok)], key=f"phone:{part}", cooldown_h=0)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(collect_job, "interval", minutes=max(1, settings.collect_interval_min))
+    intervals = {
+        Source.AVITO.value: settings.avito_collect_interval_min,
+        Source.YANDEX.value: settings.yandex_collect_interval_min,
+    }
+    for collector in collectors:
+        minutes = max(settings.collect_interval_min, intervals.get(collector.source_name, 0), 1)
+        scheduler.add_job(collect_source_job, "interval", args=[collector], minutes=minutes,
+                          id=f"collect-{collector.source_name}", coalesce=True)
+    scheduler.add_job(market_job, "interval", minutes=30, next_run_time=datetime.now(UTC))
     if phone_monitor is not None:
         scheduler.add_job(phone_job, "interval", minutes=max(1, settings.avito_phone_check_min))
     # Публичный постинг: по часам-пикам (MSK), иначе — почасовой запасной режим.
@@ -916,7 +943,12 @@ async def _serve(settings: Settings) -> None:
         while True:
             await immediate_delivery.wait()
             immediate_delivery.clear()
-            await personal_job(immediate=True)
+            batch = list(changes.values())
+            changes.clear()
+            try:
+                await personal.queue_changes(batch)
+            except Exception:
+                log.exception("Immediate dispatch failed; scheduled scan will recover")
 
     async def enrichment_worker() -> None:
         while True:
@@ -961,16 +993,18 @@ async def _serve(settings: Settings) -> None:
                 if not _is_admin(message):
                     return
                 now = _utcnow()
+                health_icons = {"ok": "🟢", "partial": "🟡", "down": "🔴", "degraded": "🟡"}
                 if source_health:
                     src = "  ".join(
-                        f"{'🟢' if s == 'ok' else '🔴'} {n}"
+                        f"{health_icons[s]} {n} (+{latest_counts.get(n, 0)}, "
+                        f"{int((now - source_checked[n]).total_seconds())} с назад)"
                         for n, s in sorted(source_health.items())
                     )
                 else:
                     src = "ещё не собирал"
                 total = await storage.count_listings()
                 since = now - timedelta(hours=24)
-                vqueue = (len(await storage.unanalyzed_listings("Москва", since, 10_000))
+                vqueue = (await storage.count_unanalyzed("Москва", since)
                           if analyzer is not None else "отключён")
                 try:
                     import resource
@@ -1007,9 +1041,11 @@ async def _serve(settings: Settings) -> None:
                 if not _is_admin(message):
                     return
                 await message.answer("⏳ Запускаю сбор…")
-                await collect_job()
+                counts = await collect_job()
+                running = sum(count is None for count in counts)
                 await message.answer(
-                    f"✅ Собрано, новых: {runtime['last_collect_new']}. /health — детали."
+                    f"Новых объявлений: {sum(count or 0 for count in counts)}. "
+                    f"Уже выполнялось сборов: {running}. /health — детали."
                 )
 
             @dp.message(Command("pausepublic"))
@@ -1192,10 +1228,13 @@ async def _serve(settings: Settings) -> None:
         log.info("Остановка serve по сигналу")
     finally:
         scheduler.shutdown(wait=False)
-        tasks = [task for task in (delivery_task, enrichment_task, startup_task) if task is not None]
+        tasks = [
+            task for task in (delivery_task, enrichment_task, startup_task) if task is not None
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await personal.close()
         if bot is not None:
             await bot.session.close()
         await storage.dispose()

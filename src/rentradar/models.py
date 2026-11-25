@@ -137,6 +137,7 @@ class Listing(BaseModel):
 
     published_at: datetime | None = None
     collected_at: datetime
+    first_seen_at: datetime | None = None
 
     @field_validator("city", "district", "address", "metro")
     @classmethod
@@ -199,6 +200,9 @@ class Listing(BaseModel):
         key = f"{self.city.lower()}|{addr}|{rooms}|{area_bucket}|{price_bucket}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
+    # Persisted identity preserves historical deliveries when identity rules evolve.
+    history_key: str | None = Field(default=None, exclude=True)
+
     @property
     def content_key(self) -> str:
         """Отпечаток объекта БЕЗ учёта цены — для дедупа «той же квартиры».
@@ -207,7 +211,12 @@ class Listing(BaseModel):
         (адрес + комнаты + бакет площади) схлопывает такие повторы, чтобы один
         объект не попадал в канал дважды.
         """
-        addr = _normalize_text(self.address or self.district or "")
+        if self.history_key:
+            return self.history_key
+        if not self.address or not self.address.strip() or self.rooms is None or not self.area:
+            identity = f"{self.source.value}|{self.external_id}"
+            return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        addr = _normalize_text(self.address)
         area_bucket = int(self.area // 5) if self.area else -1
         rooms = self.rooms if self.rooms is not None else -1
         key = f"{self.city.lower()}|{addr}|{rooms}|{area_bucket}"

@@ -112,7 +112,7 @@ def test_no_commission_filter() -> None:
     f = UserFilter(user_id=1, no_commission=True)
     assert matches(_listing(commission_pct=0), f)  # без комиссии — проходит
     assert not matches(_listing(commission_pct=50), f)  # есть комиссия — агент
-    assert matches(_listing(commission_pct=None), f)  # неизвестна (Авито) + текст чист
+    assert not matches(_listing(commission_pct=None), f)  # Ноль должен быть подтверждён.
     # Риелторская фраза в описании — отсекаем даже при «комиссии 0».
     agent = _listing(commission_pct=0, description="Большая база, подберём варианты под вас")
     assert not matches(agent, f)

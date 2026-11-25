@@ -15,6 +15,7 @@ import asyncio
 import html
 import logging
 import re
+from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
@@ -22,7 +23,13 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.types import (
     BufferedInputFile,
     InputMediaPhoto,
@@ -30,6 +37,7 @@ from aiogram.types import (
 
 from ..collectors.avito import fetch_detail
 from ..config import Settings, load_emoji
+from ..errors import DeliveryDeferred, DeliveryUncertain
 from ..interfaces import Publisher
 from ..models import Listing, ScoreBreakdown, ScoredListing, Source, _normalize_text
 from ..personal.metro_data import ALIASES, ROUTES
@@ -74,6 +82,7 @@ class TelegramPublisher(Publisher):
         self._dry_run = dry_run
         self._bot = bot
         self._storage = storage
+        self._telegram_files: OrderedDict[str, str] = OrderedDict()
         self._avito_proxy = avito_proxy or None  # прокси для дозагрузки фото Авито (VPS)
         # Кап фото по каналу (Telegram: альбом ≤ 10). Личка — больше, канал — меньше.
         self._max_personal = max(1, min(10, max_photos_personal))
@@ -92,6 +101,10 @@ class TelegramPublisher(Publisher):
         self._protect_public = protect_public
         self._via_relay = via_relay
         self._cian_jpeg_proxy_enabled = cian_jpeg_proxy_enabled
+
+    @property
+    def simulated(self) -> bool:
+        return self._dry_run or self._bot is None
 
     @classmethod
     def from_settings(
@@ -125,6 +138,8 @@ class TelegramPublisher(Publisher):
             bot=bot,
             via_relay=bool(settings.telegram_api_base),
             cian_jpeg_proxy_enabled=settings.cian_jpeg_proxy_enabled,
+            protect_bot=settings.protect_content_bot,
+            protect_public=settings.protect_content_public,
             max_photos_personal=settings.max_photos_personal,
             max_photos_public=settings.max_photos_public,
             emoji=emoji,
@@ -219,7 +234,7 @@ class TelegramPublisher(Publisher):
         *,
         channel: str,
         use_custom_emoji: bool = False,
-    ) -> bool:
+    ) -> bool | None:
         """Опубликовать лот. Возвращает True только при реальной отправке.
 
         Каскад фолбэков на случай битых фото: альбом → одно фото → текст.
@@ -235,7 +250,7 @@ class TelegramPublisher(Publisher):
         avito_full: list[str] | None = None
         rental_terms_unavailable = False
         if (not self._dry_run and self._bot is not None and self._storage is not None
-                and scored.listing.source == Source.AVITO):
+                and scored.listing.source == Source.AVITO and not use_custom_emoji):
             cached = await self._storage.get_listing(
                 Source.AVITO.value, scored.listing.external_id,
             )
@@ -256,7 +271,8 @@ class TelegramPublisher(Publisher):
                 if self._storage is not None:
                     await self._storage.save_enrichment(
                         Source.AVITO.value, scored.listing.external_id,
-                        enriched_at=datetime.now(UTC).replace(tzinfo=None), **detail._asdict(),
+                        enriched_at=datetime.now(UTC).replace(tzinfo=None),
+                        expected_price=scored.listing.price, **detail._asdict(),
                     )
                 avito_full = detail.photos
                 patch: dict = {}
@@ -298,15 +314,23 @@ class TelegramPublisher(Publisher):
 
         text = self.render(scored, use_custom_emoji=use_custom_emoji,
                            rental_terms_unavailable=rental_terms_unavailable)
-        if self._dry_run or self._bot is None:
+        if self.simulated:
             logger.info("[DRY-RUN] → %s\n%s", channel, text)
-            return True
+            return None
 
         photos: list = avito_full or _select_photos(scored.listing, cap)
+        require_photo = use_custom_emoji and bool(photos)
+        if photos and _telegram_length(text) > _CAPTION_LIMIT:
+            url = html.escape(scored.listing.url, quote=True)
+            text = f"<b>{_money(scored.listing.price)} ₽ / мес.</b> · " + (
+                f'<a href="{url}">Открыть объявление</a>'
+            )
         protect = self._protect_bot if use_custom_emoji else self._protect_public
         if photos and self._via_relay and _telegram_length(text) <= _CAPTION_LIMIT:
             return await self._publish_relay_photo(
                 channel, text, photos, scored.listing.source, protect=protect,
+                alternatives=[url for url in scored.listing.photos if url not in photos],
+                require_photo=require_photo,
             )
         # Telegram не может стянуть фото Авито с CDN — скачиваем сами (наш IP
         # работает) и грузим байтами. Полноразмер уже получен выше.
@@ -339,7 +363,12 @@ class TelegramPublisher(Publisher):
                 return True
             photos = await self._download_photos(photos[:2], source=Source.CIAN)
         # Full album -> first photo -> text.
-        for level in (photos, photos[:1], []):
+        levels = [photos, photos[:1]] if len(photos) > 1 else [photos]
+        if not require_photo and photos:
+            levels.append([])
+        for level in levels:
+            if require_photo and not level:
+                continue
             if await self._try_send(channel, text, level, protect=protect):
                 return True
         logger.error("Не удалось отправить пост в %s (все фолбэки исчерпаны)", channel)
@@ -347,6 +376,7 @@ class TelegramPublisher(Publisher):
 
     async def _publish_relay_photo(
         self, channel: str, text: str, photos: list[str], source: Source, *, protect: bool,
+        alternatives: list[str] | None = None, require_photo: bool = False,
     ) -> bool:
         if source == Source.AVITO:
             urls = [_wsrv_jpeg(url) for url in photos if _is_avito_cdn(url)]
@@ -369,11 +399,18 @@ class TelegramPublisher(Publisher):
             logger.info("Telegram media delivered: source=%s mode=url count=1", source)
             return True
         preview = await self._download_relay_preview(photos[:2])
+        if preview is None:
+            remaining = [*photos[2:], *(alternatives or [])][:2]
+            if remaining:
+                preview = await self._download_relay_preview(remaining)
         if preview and await self._try_send(
             channel, text, [preview], protect=protect, photo_timeout=8,
         ):
             logger.info("Telegram media delivered: source=%s mode=uploaded-preview count=1", source)
             return True
+        if require_photo:
+            logger.warning("Telegram media unavailable: source=%s, deferring card", source)
+            return False
         logger.warning("Telegram media unavailable: source=%s, sending text", source)
         return await self._try_send(channel, text, [], protect=protect)
 
@@ -426,7 +463,10 @@ class TelegramPublisher(Publisher):
         """Одна попытка отправки на заданном уровне фолбэка (с учётом флуда).
         `protect` — запрет пересылки/сохранения (Telegram protect_content)."""
         assert self._bot is not None
-        for _ in range(2):  # повтор после ожидания флуд-лимита
+        original = photos
+        photos = [self._telegram_files.get(photo, photo) if isinstance(photo, str) else photo
+                  for photo in original]
+        for _ in range(3):  # retry a rejected cached ID or a short flood wait
             try:
                 if len(photos) >= 2 and _telegram_length(text) <= _CAPTION_LIMIT:
                     media = [
@@ -435,30 +475,49 @@ class TelegramPublisher(Publisher):
                         else InputMediaPhoto(media=url)
                         for i, url in enumerate(photos)
                     ]
-                    await self._bot.send_media_group(
+                    messages = await self._bot.send_media_group(
                         chat_id=channel, media=media, protect_content=protect,
                         request_timeout=photo_timeout
                     )
                 elif photos and _telegram_length(text) <= _CAPTION_LIMIT:
-                    await self._bot.send_photo(
+                    message = await self._bot.send_photo(
                         chat_id=channel, photo=photos[0], caption=text,
                         protect_content=protect, request_timeout=photo_timeout,
                     )
+                    messages = [message]
                 else:
+                    messages = []
                     await self._bot.send_message(
                         chat_id=channel, text=text,
                         # Превью ссылки сильно удлиняет пост — без него.
                         disable_web_page_preview=True, protect_content=protect,
                     )
+                for url, message in zip(original, messages or [], strict=False):
+                    sizes = getattr(message, "photo", None)
+                    if isinstance(url, str) and sizes:
+                        self._telegram_files[url] = sizes[-1].file_id
+                        self._telegram_files.move_to_end(url)
+                        if len(self._telegram_files) > 2048:
+                            self._telegram_files.popitem(last=False)
                 return True
             except TelegramRetryAfter as exc:
                 wait = exc.retry_after + 1
                 logger.warning("Флуд-лимит Telegram, ждём %s сек", wait)
+                if wait > 3:
+                    raise DeliveryDeferred(wait) from exc
                 await asyncio.sleep(wait)
             except TelegramBadRequest as exc:
-                # Часто — битая ссылка на фото: пусть сработает следующий фолбэк.
+                if photos != original:
+                    for url in original:
+                        if isinstance(url, str):
+                            self._telegram_files.pop(url, None)
+                    photos = original
+                    continue
+                # Rejected original media: try the next representation.
                 logger.warning("Отклонено Telegram (фото=%d): %s", len(photos), exc)
                 return False
+            except (TelegramNetworkError, TelegramServerError, TimeoutError) as exc:
+                raise DeliveryUncertain("Telegram did not confirm receipt") from exc
             except TelegramAPIError as exc:
                 logger.error("Ошибка Telegram при отправке в %s: %s", channel, exc)
                 return False
@@ -488,7 +547,7 @@ def _is_avito_cdn(url: str) -> bool:
 
 def _select_photos(listing: Listing, max_photos: int) -> list[str]:
     """Кадры для поста: отобранные vision-моделью, если есть; иначе первые. Кап лимитом."""
-    chosen = listing.best_photos or listing.photos
+    chosen = [url for url in listing.best_photos if url in listing.photos] or listing.photos
     return chosen[:max_photos]
 
 

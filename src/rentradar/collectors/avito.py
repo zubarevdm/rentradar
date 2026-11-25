@@ -29,7 +29,7 @@ from curl_cffi import requests as cffi_requests
 from selectolax.parser import HTMLParser
 
 from ..config import SearchProfile
-from ..errors import CollectorBlockedError
+from ..errors import CollectionSkipped, CollectorBlockedError
 from ..models import DealType, Listing, PropertyType, RawListing, Source
 from ..photos import detail_photos, largest_srcset
 from . import avito_access
@@ -636,7 +636,7 @@ class AvitoCollector(HttpCollector):
         # цикл (возвращаем пусто, не блок), чтобы не долбить Авито и не ловить 429.
         loop_now = asyncio.get_event_loop().time()
         if self._min_interval_sec and (loop_now - self._last_fetch_at) < self._min_interval_sec:
-            return []
+            raise CollectionSkipped("interval")
         self._last_fetch_at = loop_now
 
         region = REGION_PATH.get(profile.city.strip().lower(), "moskva")

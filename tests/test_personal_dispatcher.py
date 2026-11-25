@@ -329,3 +329,100 @@ async def test_only_real_deliveries_are_counted(env) -> None:
     assert len(pub.sent) == 3
     assert await ps.count_delivered(1, NOW - timedelta(hours=1)) == 2
     assert await ps.count_delivered(1, NOW + timedelta(minutes=1)) == 0
+
+
+async def test_overlapping_filters_keep_the_other_filters_backlog(env):
+    st, ps = env
+    await st.upsert_listings([_listing(str(i)) for i in range(3)])
+    await ps.get_or_create_subscriber(101)
+    await ps.set_paid_until(101, NOW + timedelta(days=2))
+    for include in (False, True):
+        await ps.upsert_filter(UserFilter(user_id=101, interval_min=5, include_backlog=include))
+    pub = FakePublisher()
+    dispatcher = _dispatcher(st, ps, pub, cold_start=1)
+    await dispatcher.run_due(NOW)
+    await dispatcher.run_due(NOW + timedelta(minutes=6))
+    assert {s.listing.external_id for _, s in pub.sent} == {"0", "1", "2"}
+
+
+async def test_media_refresh_and_matching_copy_reach_subscriber(env):
+    st, ps = env
+    await ps.get_or_create_subscriber(102)
+    await ps.set_paid_until(102, NOW + timedelta(days=2))
+    await ps.upsert_filter(UserFilter(user_id=102, no_commission=True, interval_min=5,
+                                      include_backlog=False))
+    cheap = _listing("1").model_copy(update={"commission_pct": 10})
+    match = cheap.model_copy(update={"source": Source.YANDEX, "external_id": "2", "photos": [],
+                                     "price": cheap.price + 2000, "commission_pct": 0})
+    await st.upsert_listings([cheap, match])
+    pub = FakePublisher()
+    dispatcher = _dispatcher(st, ps, pub)
+    assert await dispatcher.run_due(NOW) == 0
+    found = NOW + timedelta(minutes=1)
+    _, changed = await st.upsert_changes([match.model_copy(update={
+        "photos": ["updated.jpg"], "collected_at": found,
+    })])
+    assert len(changed) == 1
+    assert await dispatcher.run_immediate(found) == 1
+    assert pub.sent[0][1].listing.external_id == "2"
+
+
+async def test_failed_backlog_retries_after_restart(env):
+    from unittest.mock import AsyncMock
+
+    st, ps = env
+    listing = _listing("retry")
+    await st.upsert_listings([listing])
+    await ps.get_or_create_subscriber(103)
+    await ps.set_paid_until(103, NOW + timedelta(days=2))
+    fid = await ps.upsert_filter(UserFilter(user_id=103, interval_min=5))
+    await ps.touch_filter(fid, NOW - timedelta(minutes=10))
+    pub = FakePublisher()
+    pub.publish = AsyncMock(return_value=False)
+    assert await _dispatcher(st, ps, pub).run_due(NOW) == 0
+    attempts = await ps.attempts_for(103)
+    assert attempts[listing.content_key].state == "retry"
+    assert await _dispatcher(st, ps, FakePublisher()).run_due(NOW + timedelta(minutes=1)) == 1
+    assert await ps.attempts_for(103) == {}
+
+
+async def test_simulation_does_not_consume_personal_filter(env):
+    from rentradar.publisher import TelegramPublisher
+
+    st, ps = env
+    await ps.get_or_create_subscriber(104)
+    await ps.set_paid_until(104, NOW + timedelta(days=2))
+    fid = await ps.upsert_filter(UserFilter(user_id=104))
+    await st.upsert_listings([_listing("sim")])
+    assert await _dispatcher(st, ps, TelegramPublisher(dry_run=True)).run_due(NOW) == 0
+    assert (await ps.get_filter(fid))[1].last_checked_at is None
+    assert await ps.count_delivered(104, NOW - timedelta(days=1)) == 0
+    assert await ps.attempts_for(104) == {}
+
+
+async def test_second_batch_reaches_fast_chat_while_first_chat_is_waiting(env):
+    from datetime import UTC
+    st, ps = env
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for uid in (111, 222):
+        await ps.get_or_create_subscriber(uid)
+        await ps.set_paid_until(uid, now + timedelta(days=1))
+        fid = await ps.upsert_filter(UserFilter(user_id=uid, interval_min=5))
+        await ps.touch_filter(fid, now - timedelta(minutes=1))
+    unblock, first, second = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    class Publisher(FakePublisher):
+        async def publish(self, scored, *, channel, use_custom_emoji=False):
+            if channel == "111":
+                await unblock.wait()
+            else:
+                (first if scored.listing.external_id == "one" else second).set()
+            return True
+    dispatcher = _dispatcher(st, ps, Publisher())
+    try:
+        for name, observed in (("one", first), ("two", second)):
+            batch = await st.upsert_listings([_listing(name, collected=now)])
+            await dispatcher.queue_changes(batch)
+            await asyncio.wait_for(observed.wait(), timeout=5)
+    finally:
+        unblock.set()
+        await dispatcher.close()

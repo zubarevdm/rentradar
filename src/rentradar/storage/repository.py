@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from itertools import batched
 from pathlib import Path
 from statistics import median
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select, text, tuple_, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -56,19 +58,32 @@ class SqlStorage(Storage):
         """Сохранить НОВЫЕ лоты; вернуть их. Дубль определяется по (source,
         external_id) — это и уникальный ключ в БД. По fingerprint нельзя: при
         смене цены fingerprint меняется, и тот же лот ловил UNIQUE-конфликт."""
+        new, _ = await self.upsert_changes(listings)
+        return new
+
+    async def upsert_changes(
+        self, listings: Sequence[Listing]
+    ) -> tuple[list[Listing], list[Listing]]:
         new_items: list[Listing] = []
+        changed: list[Listing] = []
         seen_keys: set[tuple[str, str]] = set()
         async with self._session() as session:
+            if not listings:
+                return [], []
+            await session.execute(text("BEGIN IMMEDIATE"))
+            keys = {(lst.source.value, lst.external_id) for lst in listings}
+            existing = {}
+            for chunk in batched(keys, 400):
+                rows = await session.scalars(select(ListingRow).where(
+                    tuple_(ListingRow.source, ListingRow.external_id).in_(chunk)
+                ))
+                existing.update(((r.source, r.external_id), r) for r in rows)
             for listing in listings:
                 key = (listing.source.value, listing.external_id)
-                if key in seen_keys:  # дубль внутри батча
+                if key in seen_keys:
                     continue
-                row = await session.scalar(
-                    select(ListingRow).where(
-                        ListingRow.source == listing.source.value,
-                        ListingRow.external_id == listing.external_id,
-                    )
-                )
+                seen_keys.add(key)
+                row = existing.get(key)
                 if row is not None:
                     if row.price != listing.price:
                         row.price = listing.price
@@ -85,12 +100,13 @@ class SqlStorage(Storage):
                             row.deposit_installments = False
                             row.upfront_payments = {}
                             row.enriched_at = None
-                        else:
-                            # These collectors provide payment fields on each
-                            # search card, so use their current snapshot.
-                            row.deposit_rub = listing.deposit_rub
-                            row.commission_pct = listing.commission_pct
-                            row.commission_rub = listing.commission_rub
+                    if listing.source != Source.AVITO:
+                        for field in (
+                            "deposit_rub", "commission_pct", "commission_rub",
+                            "meters_included", "utilities_rub", "description",
+                        ):
+                            if field in listing.model_fields_set:
+                                setattr(row, field, getattr(listing, field))
                     # Collectors now guarantee walking minutes for this station.
                     # Replace even with None: a newly unknown/transport-only time
                     # must not retain a stale walking value from a previous card.
@@ -98,8 +114,8 @@ class SqlStorage(Storage):
                     row.metro_distance_min = listing.metro_distance_min
                     row.metro_line = listing.metro_line
                     row.metro_line_color = listing.metro_line_color
-                    if listing.photos:
-                        row.photos = listing.photos
+                    if listing.photos and listing.photos != row.photos:
+                        _replace_photos(row, listing.photos)
                     if listing.source == Source.AVITO and row.enriched_at is None:
                         # A repeated search card can add terms even when its price
                         # did not change. Keep a richer detail snapshot if present.
@@ -120,12 +136,14 @@ class SqlStorage(Storage):
                                 and listing.commission_amount is not None):
                             row.commission_pct = listing.commission_pct
                             row.commission_rub = listing.commission_rub
+                    if session.is_modified(row):
+                        row.collected_at = listing.collected_at
+                        changed.append(_row_to_listing(row))
                     continue
-                seen_keys.add(key)
                 session.add(_to_row(listing))
                 new_items.append(listing)
             await session.commit()
-        return new_items
+        return new_items, [*new_items, *changed]
 
     async def get_listing(self, source: str, external_id: str) -> Listing | None:
         """Read the latest cached conditions before sending a queued candidate."""
@@ -164,10 +182,29 @@ class SqlStorage(Storage):
                     select(ListingRow)
                     .where(ListingRow.city == city)
                     .where(ListingRow.collected_at >= since)
-                    .order_by(ListingRow.published_at.desc(), ListingRow.collected_at.desc())
+                    .order_by(
+                        func.coalesce(ListingRow.published_at, ListingRow.collected_at).desc(),
+                        ListingRow.collected_at.desc(),
+                        ListingRow.id.desc(),
+                    )
                 )
             ).scalars()
             return [_row_to_listing(r) for r in rows]
+
+    async def count_unanalyzed(self, city: str, since: datetime) -> int:
+        async with self._session() as session:
+            return (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(ListingRow)
+                    .where(
+                        ListingRow.city == city,
+                        ListingRow.collected_at >= since,
+                        ListingRow.analyzed_at.is_(None),
+                    )
+                )
+                or 0
+            )
 
     async def unanalyzed_listings(self, city: str, since: datetime, limit: int) -> list[Listing]:
         """Свежие (по `since`) лоты города, ещё не прошедшие vision-анализ.
@@ -179,6 +216,12 @@ class SqlStorage(Storage):
                     .where(ListingRow.city == city)
                     .where(ListingRow.collected_at >= since)
                     .where(ListingRow.analyzed_at.is_(None))
+                    .where(
+                        or_(
+                            ListingRow.vision_retry_at.is_(None),
+                            ListingRow.vision_retry_at <= datetime.now(UTC).replace(tzinfo=None),
+                        )
+                    )
                     .order_by(ListingRow.collected_at.asc())
                     .limit(limit)
                 )
@@ -207,6 +250,7 @@ class SqlStorage(Storage):
         external_id: str,
         *,
         enriched_at: datetime,
+        expected_price: int | None = None,
         description: str | None = None,
         deposit_rub: int | None = None,
         commission_pct: int | None = None,
@@ -220,7 +264,7 @@ class SqlStorage(Storage):
         photos: list[str] | None = None,
         deposit_present: bool = True,
         commission_present: bool = True,
-    ) -> None:
+    ) -> Listing | None:
         """Save a successfully fetched detail's payment snapshot, including unknowns.
 
         An explicit unknown payment clears an earlier amount. An absent field in
@@ -229,13 +273,20 @@ class SqlStorage(Storage):
         Missing description/photos and utility information retain their old values.
         """
         async with self._session() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
             row = await session.scalar(
                 select(ListingRow)
                 .where(ListingRow.source == source)
                 .where(ListingRow.external_id == external_id)
             )
-            if row is None:
-                return
+            if row is None or (expected_price is not None and row.price != expected_price):
+                return None
+            previous_conditions = (
+                row.commission_rub,
+                row.commission_pct,
+                row.description,
+                bool(row.photos),
+            )
             if description is not None:
                 row.description = description[:4000]
             if deposit_present:
@@ -258,14 +309,31 @@ class SqlStorage(Storage):
             row.upfront_payments = upfront_payments or {}
             if meters_included is not None:
                 row.meters_included = meters_included
-            if photos:
-                row.photos = photos
+            if photos and photos != row.photos:
+                _replace_photos(row, photos)
             incomplete = (
                 (not deposit_present and row.deposit_rub is None)
                 or (not commission_present and row.commission_pct is None
                     and row.commission_rub is None)
             )
             row.enriched_at = None if incomplete else enriched_at
+            conditions = (row.commission_rub, row.commission_pct, row.description, bool(row.photos))
+            if previous_conditions != conditions:
+                row.collected_at = max(row.collected_at, enriched_at)
+            await session.commit()
+            return _row_to_listing(row) if previous_conditions != conditions else None
+
+    async def defer_analysis(self, listing: Listing, until: datetime) -> None:
+        async with self._session() as session:
+            await session.execute(
+                update(ListingRow)
+                .where(
+                    ListingRow.source == listing.source.value,
+                    ListingRow.external_id == listing.external_id,
+                    ListingRow.analyzed_at.is_(None),
+                )
+                .values(vision_retry_at=until)
+            )
             await session.commit()
 
     async def save_photo_analysis(
@@ -279,23 +347,27 @@ class SqlStorage(Storage):
         best_photos: list[str],
         analyzed_at: datetime,
         flagged: bool = False,
-    ) -> None:
+        expected_photos: list[str] | None = None,
+    ) -> bool:
         """Записать результат vision-анализа в лот (и пометить как проанализированный)."""
         async with self._session() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
             row = await session.scalar(
                 select(ListingRow)
                 .where(ListingRow.source == source)
                 .where(ListingRow.external_id == external_id)
             )
-            if row is None:
-                return
+            if row is None or (expected_photos is not None and row.photos != expected_photos):
+                return False
             row.renovation = renovation
             row.has_furniture = has_furniture
             row.appeal = appeal
             row.best_photos = best_photos
             row.flagged = flagged
             row.analyzed_at = analyzed_at
+            row.vision_retry_at = None
             await session.commit()
+            return True
 
     async def recompute_market_stats(self, *, window_days: int | None = None) -> int:
         """Пересчитать медианы по сегментам из накопленных объявлений.
@@ -320,44 +392,32 @@ class SqlStorage(Storage):
                 query = query.where(ListingRow.collected_at >= since)
             rows = (await session.execute(query)).all()
 
-            prices: dict[str, list[int]] = {}
-            ppm: dict[str, list[float]] = {}
-            # Каждое объявление вносит вклад во ВСЕ уровни иерархии (точный,
-            # район+комнаты, город+комнаты) — так грубые сегменты набирают
-            # статзначимость и работают как fallback.
-            for city, district, rooms, price, area in rows:
-                for key in build_segment_keys(city, district, rooms, area):
-                    prices.setdefault(key, []).append(price)
-                    if area and area > 0:
-                        ppm.setdefault(key, []).append(price / area)
-
-            if prices:
-                values = [
-                    {
-                        "segment_key": key,
-                        "median_price": float(median(price_list)),
-                        "median_price_per_m2": float(median(ppm[key])) if key in ppm else None,
-                        "sample_size": len(price_list),
-                    }
-                    for key, price_list in prices.items()
-                ]
-                stat = insert(MarketStatRow)
-                await session.execute(
-                    stat.on_conflict_do_update(
-                        index_elements=[MarketStatRow.segment_key],
-                        set_={
-                            "median_price": stat.excluded.median_price,
-                            "median_price_per_m2": stat.excluded.median_price_per_m2,
-                            "sample_size": stat.excluded.sample_size,
-                        },
-                    ),
-                    values,
-                )
-                await session.commit()
-            return len(prices)
+        values = await asyncio.to_thread(_market_snapshot, rows)
+        async with self._session() as session:
+            await session.execute(delete(MarketStatRow))
+            if values:
+                await session.execute(insert(MarketStatRow), values)
+            await session.commit()
+        return len(values)
 
     async def dispose(self) -> None:
         await self._engine.dispose()
+
+
+def _market_snapshot(rows) -> list[dict]:
+    prices: dict[str, list[int]] = {}
+    ppm: dict[str, list[float]] = {}
+    for city, district, rooms, price, area in rows:
+        for key in build_segment_keys(city, district, rooms, area):
+            prices.setdefault(key, []).append(price)
+            if area and area > 0:
+                ppm.setdefault(key, []).append(price / area)
+    return [
+        {"segment_key": key, "median_price": float(median(amounts)),
+         "median_price_per_m2": float(median(ppm[key])) if key in ppm else None,
+         "sample_size": len(amounts)}
+        for key, amounts in prices.items()
+    ]
 
 
 class SqlMarketStatsProvider(MarketStatsProvider):
@@ -365,6 +425,20 @@ class SqlMarketStatsProvider(MarketStatsProvider):
 
     def __init__(self, storage: SqlStorage) -> None:
         self._session = storage._session  # общий sessionmaker
+
+    async def resolve_market(
+        self, keys: list[str], minimum: int,
+    ) -> tuple[str | None, float | None, float | None]:
+        async with self._session() as session:
+            rows = await session.scalars(select(MarketStatRow).where(
+                MarketStatRow.segment_key.in_(keys), MarketStatRow.sample_size >= minimum,
+            ))
+            segments = {row.segment_key: row for row in rows}
+        for key in keys:
+            if key in segments:
+                row = segments[key]
+                return key, row.median_price, row.median_price_per_m2
+        return None, None, None
 
     async def _get(self, segment_key: str) -> MarketStatRow | None:
         async with self._session() as session:
@@ -547,9 +621,18 @@ def _to_row(listing: Listing) -> ListingRow:
     )
 
 
+def _replace_photos(row: ListingRow, photos: list[str]) -> None:
+    row.photos = photos
+    row.best_photos = [url for url in (row.best_photos or []) if url in photos]
+    row.analyzed_at = None
+    row.vision_retry_at = None
+
+
 def _row_to_listing(row: ListingRow) -> Listing:
     """Восстановить доменный Listing из строки БД (для рендера в персональном боте)."""
     return Listing(
+        history_key=row.content_key,
+        first_seen_at=row.created_at,
         source=Source(row.source),
         external_id=row.external_id,
         url=row.url,

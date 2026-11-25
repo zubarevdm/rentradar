@@ -75,7 +75,9 @@ _AN = datetime(2026, 6, 27, 12, 0, 0)  # метка «проанализиров
 
 
 def test_public_gate_requires_analyzed_and_renovation(sample_listing: Listing) -> None:
-    s = Settings(vision_enabled=True)  # legacy vision mode: блокируем needs_repair/soviet, требуем analyzed, appeal≥75
+    s = Settings(
+        vision_enabled=True
+    )  # legacy vision mode: блокируем needs_repair/soviet, требуем analyzed, appeal≥75
     an = {"analyzed_at": _AN, "appeal": 88}  # красивый интерьер, проходит WOW-порог
     soviet = sample_listing.model_copy(update={"renovation": "soviet", **an})
     designer = sample_listing.model_copy(update={"renovation": "designer", **an})
@@ -140,3 +142,20 @@ def test_mvp_public_gate_accepts_unanalyzed_and_any_renovation(sample_listing):
             "price": 50000, "flagged": False,
         })
         assert _passes_public_gate(_scored(listing), settings)
+
+
+async def test_best_index_maps_back_to_original_after_failed_download(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    from rentradar.vision.analyzer import LLMPhotoAnalyzer
+
+    analyzer = LLMPhotoAnalyzer(api_key="test", base_url="https://example.test", model="test")
+    def handler(request):
+        return httpx.Response(404 if request.url.path == "/bad" else 200, content=b"jpeg")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("rentradar.vision.analyzer.httpx.AsyncClient", lambda **kw: client)
+    monkeypatch.setattr(analyzer, "_call", AsyncMock(return_value='{"best_photos":[0]}'))
+    result = await analyzer.analyze(["https://example.test/bad", "https://example.test/good"])
+    assert result.best_photos == [1]

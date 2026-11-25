@@ -100,3 +100,31 @@ async def test_recollect_same_listing_changed_price(storage: SqlStorage) -> None
     again = await storage.upsert_listings([_listing("1", 55_000, 40.0)])  # цена другая
     assert again == []  # уже есть — не новый, без ошибки
     assert await storage.count_listings() == 1
+
+
+async def test_expired_segment_disappears_from_snapshot(storage):
+    old = _listing("old", 55000, 40, datetime.now(UTC).replace(tzinfo=None) - timedelta(days=40))
+    await storage.upsert_listings([old])
+    await storage.recompute_market_stats(window_days=60)
+    assert await storage.recompute_market_stats(window_days=10) == 0
+    assert await SqlMarketStatsProvider(storage).sample_size(old.segment_key) == 0
+
+
+async def test_unchanged_price_refreshes_terms_and_invalidates_stale_photos(storage):
+    before = _listing("same", 55000, 40).model_copy(update={"commission_pct": 0})
+    await storage.upsert_listings([before])
+    await storage.save_photo_analysis(
+        "cian",
+        "same",
+        renovation=None,
+        has_furniture=None,
+        appeal=90,
+        best_photos=["p.jpg"],
+        analyzed_at=before.collected_at,
+    )
+    updated = before.model_copy(update={"commission_pct": 25, "photos": ["new.jpg"]})
+    new, changed = await storage.upsert_changes([updated])
+    assert not new and len(changed) == 1
+    assert changed[0].commission_pct == 25
+    assert changed[0].best_photos == []
+    assert changed[0].analyzed_at is None
