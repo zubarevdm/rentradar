@@ -10,6 +10,7 @@ import re
 from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from itertools import batched
 
 from sqlalchemy import case, func, select, text
 from sqlalchemy.dialects.sqlite import insert
@@ -429,6 +430,17 @@ class PersonalStore:
                 .where(UserSentRow.content_key == content_key)
             )
             return found is not None
+
+    async def sent_keys(self, user_id: int, content_keys: Collection[str]) -> set[str]:
+        seen: set[str] = set()
+        async with self._session() as session:
+            for keys in batched(content_keys, 500):
+                rows = await session.scalars(
+                    select(UserSentRow.content_key)
+                    .where(UserSentRow.user_id == user_id, UserSentRow.content_key.in_(keys))
+                )
+                seen.update(rows)
+        return seen
 
     async def mark_sent(
         self,

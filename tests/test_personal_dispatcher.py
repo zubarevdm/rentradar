@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -121,6 +122,41 @@ async def test_immediate_checks_complete_filter_without_waiting(env) -> None:
     assert await disp.run_immediate(found) == 0
     await disp.run_due(NOW + timedelta(minutes=31))
     assert [(ch, s.listing.external_id) for ch, s in pub.sent] == [("100", "1"), ("101", "1")]
+
+
+async def test_slow_recipient_does_not_delay_another_due_recipient(env):
+    st, ps = env
+    await st.upsert_listings([_listing("shared")])
+    for user in (100, 101):
+        await ps.get_or_create_subscriber(user)
+        await ps.set_paid_until(user, NOW + timedelta(days=1))
+        await ps.upsert_filter(UserFilter(user_id=user, interval_min=5))
+
+    unblock = asyncio.Event()
+    slow_started = asyncio.Event()
+    fast_sent = asyncio.Event()
+
+    class IndependentPublisher(FakePublisher):
+        async def publish(self, scored, *, channel, use_custom_emoji=False):
+            if channel == "100":
+                slow_started.set()
+                await unblock.wait()
+            else:
+                await slow_started.wait()
+                fast_sent.set()
+            return await super().publish(scored, channel=channel, use_custom_emoji=use_custom_emoji)
+
+    pub = IndependentPublisher()
+    dispatcher = _dispatcher(st, ps, pub)
+    first = asyncio.create_task(dispatcher.run_due(NOW))
+    try:
+        await asyncio.wait_for(fast_sent.wait(), timeout=5)
+        duplicate = asyncio.create_task(dispatcher.run_due(NOW))
+    finally:
+        unblock.set()
+        assert await first == 2
+    assert await duplicate == 0
+    assert sorted(channel for channel, _ in pub.sent) == ["100", "101"]
 
 
 async def test_failed_immediate_delivery_survives_restart(env) -> None:

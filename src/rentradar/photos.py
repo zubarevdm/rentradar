@@ -8,6 +8,21 @@ from io import BytesIO
 from PIL import Image, ImageOps
 
 
+def telegram_preview(data: bytes) -> bytes:
+    """Fit a single JPEG preview into the relay's small-request path."""
+    with Image.open(BytesIO(data)) as original:
+        photo = ImageOps.exif_transpose(original).convert("RGB")
+        for edge in (480, 384, 320, 256, 192, 128):
+            preview = photo.copy()
+            preview.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+            for quality in (72, 55, 38):
+                output = BytesIO()
+                preview.save(output, format="JPEG", quality=quality, optimize=True)
+                if output.tell() <= 7_000:
+                    return output.getvalue()
+    raise ValueError("Photo preview exceeds the relay upload budget")
+
+
 def telegram_photo(data: bytes) -> tuple[bytes, str]:
     """Validate a source image; convert WebP to JPEG without resizing.
 

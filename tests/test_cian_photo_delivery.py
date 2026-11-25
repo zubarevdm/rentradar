@@ -8,7 +8,7 @@ import pytest
 from aiogram.types import BufferedInputFile
 from PIL import Image
 
-from rentradar.photos import telegram_photo
+from rentradar.photos import telegram_photo, telegram_preview
 from rentradar.publisher import TelegramPublisher
 from tests.test_publisher_send import FakeBot, _scored
 
@@ -100,20 +100,62 @@ async def test_relay_falls_back_to_text_without_upload(monkeypatch):
     bot = FakeBot()
 
     async def reject(**kwargs):
-        assert kwargs["request_timeout"] == 8
+        assert kwargs["request_timeout"] in (8, 12)
         raise TelegramBadRequest(
             method=SendPhoto(chat_id="test", photo="invalid"), message="invalid URL"
         )
 
-    async def forbidden(*args, **kwargs):
-        pytest.fail("Relay must not fall back to multipart uploads")
+    async def no_preview(*args, **kwargs):
+        return None
 
     monkeypatch.setattr(bot, "send_media_group", reject)
     monkeypatch.setattr(bot, "send_photo", reject)
     pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
-    monkeypatch.setattr(pub, "_download_photos", forbidden)
+    monkeypatch.setattr(pub, "_download_relay_preview", no_preview)
     assert await pub.publish(_scored(photos=["https://img/a", "https://img/b"]), channel="test")
     assert len(bot.message_calls) == 1
+
+
+async def test_relay_uses_small_jpeg_upload_when_urls_fail(monkeypatch):
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendPhoto
+
+    original_client = httpx.AsyncClient
+    original = webp()
+
+    def client(**kwargs):
+        return original_client(**kwargs, transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=original)
+        ))
+
+    monkeypatch.setattr("rentradar.publisher.telegram.httpx.AsyncClient", client)
+    bot = FakeBot()
+    send_photo = bot.send_photo
+
+    async def reject_urls(**kwargs):
+        if isinstance(kwargs["photo"], str):
+            raise TelegramBadRequest(
+                method=SendPhoto(chat_id="test", photo=kwargs["photo"]), message="invalid URL"
+            )
+        await send_photo(**kwargs)
+
+    monkeypatch.setattr(bot, "send_photo", reject_urls)
+    pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
+    assert await pub.publish(_scored(photos=["https://images.cdn-cian.ru/photo.jpg"]), channel="test")
+    photo = bot.photo_calls[0]["photo"]
+    assert isinstance(photo, BufferedInputFile) and len(photo.data) <= 7_000
+    with Image.open(BytesIO(photo.data)) as uploaded:
+        assert uploaded.format == "JPEG" and uploaded.size == (480, 360)
+    assert not bot.message_calls
+
+
+def test_noisy_preview_fits_relay_limit():
+    photo = BytesIO()
+    Image.effect_noise((1600, 1200), 85).save(photo, "PNG")
+    result = telegram_preview(photo.getvalue())
+    assert len(result) <= 7_000
+    with Image.open(BytesIO(result)) as image:
+        assert image.format == "JPEG"
 
 
 async def test_cian_jpeg_proxy_sends_three_validated_urls():
@@ -169,10 +211,10 @@ async def test_avito_via_relay_falls_back_to_text_quickly(monkeypatch):
     bot = FakeBot(fail={"album", "photo"})
     pub = TelegramPublisher(dry_run=False, bot=bot, via_relay=True)
 
-    async def forbidden(*args, **kwargs):
-        pytest.fail("Relay must not upload Avito photos as multipart")
+    async def no_preview(*args, **kwargs):
+        return None
 
-    monkeypatch.setattr(pub, "_download_photos", forbidden)
+    monkeypatch.setattr(pub, "_download_relay_preview", no_preview)
     photos = ["https://10.img.avito.st/a", "https://20.img.avito.st/b", "https://evil.example/c"]
     assert await pub.publish(_avito_scored(photos), channel="test")
     assert len(bot.message_calls) == 1

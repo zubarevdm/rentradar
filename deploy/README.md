@@ -12,6 +12,11 @@
 3. В `.env` на сервере: `RENTRADAR_TELEGRAM_API_BASE=https://<имя>.<аккаунт>.workers.dev`
 4. Проверка: `curl https://<имя>.<аккаунт>.workers.dev/bot<токен>/getMe` → `"ok":true`.
 
+Если один из адресов DNS relay зависает на TLS, проверь адреса отдельно через
+`curl --resolve` и укажи рабочий в `RENTRADAR_TELEGRAM_RELAY_IPV4`. Имя хоста
+для TLS и проверки сертификата сохраняется. С включённым Telegram-прокси
+резолвинг выполняет прокси. При смене адресов relay обнови или очисти настройку.
+
 Если `*.workers.dev` тоже недоступен с сервера — привязать свой домен к воркеру
 (Workers → Triggers → Custom Domains).
 

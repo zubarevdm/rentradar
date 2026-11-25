@@ -43,7 +43,7 @@ from .publisher import TelegramPublisher
 from .scoring import TastyScoringEngine
 from .storage import SqlMarketStatsProvider, SqlStorage
 from .storage.orm import SubscriberRow
-from .tg import make_bot
+from .tg import POLL_TIMEOUT, make_bot
 from .vision import VisionQuotaError, build_analyzer
 
 log = logging.getLogger("rentradar")
@@ -502,24 +502,23 @@ async def _serve(settings: Settings) -> None:
             log.exception("Ошибка обогащения Авито")
 
     immediate_delivery = asyncio.Event()
+    enrichment_requested = asyncio.Event()
 
     async def collect_job() -> None:
         total = 0
-        notify_delivery = None if settings.avito_enabled else immediate_delivery.set
         try:
             await storage.recompute_market_stats(window_days=settings.market_window_days)
             agg: dict[str, list[str]] = {}
             for p in profiles:
-                new, statuses = await pipeline.collect_only(p, on_new=notify_delivery)
+                new, statuses = await pipeline.collect_only(p, on_new=immediate_delivery.set)
                 total += new
                 for src, st in statuses.items():
                     agg.setdefault(src, []).append(st)
             log.info("Сбор: новых лотов = %d", total)
             runtime["last_collect_at"] = _utcnow()
             runtime["last_collect_new"] = total
+            enrichment_requested.set()
             await _check_source_health(agg)  # 🔴/🟢 при смене состояния площадки
-            # Сразу дообогащаем свежий Авито — до vision-прохода и постинга.
-            await enrich_job()
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка сбора")
             await _alert_admin(
@@ -527,8 +526,6 @@ async def _serve(settings: Settings) -> None:
                 key="job:collect",
                 cooldown_h=1,
             )
-        if total and notify_delivery is None:
-            immediate_delivery.set()
 
     async def public_job() -> None:
         if public_paused["on"]:
@@ -921,7 +918,15 @@ async def _serve(settings: Settings) -> None:
             immediate_delivery.clear()
             await personal_job(immediate=True)
 
+    async def enrichment_worker() -> None:
+        while True:
+            await enrichment_requested.wait()
+            enrichment_requested.clear()
+            await enrich_job()
+
     delivery_task = asyncio.create_task(immediate_worker())
+    enrichment_task = asyncio.create_task(enrichment_worker())
+    startup_task = None
 
     async def startup_jobs() -> None:
         # На старте — сбор + первый vision-проход (чтобы БД и личка сразу со свежими
@@ -1177,9 +1182,9 @@ async def _serve(settings: Settings) -> None:
 
                 asyncio.create_task(_bg())  # не блокируем поллинг на минуты
 
-            asyncio.create_task(startup_jobs())  # параллельно с поллингом
+            startup_task = asyncio.create_task(startup_jobs())  # параллельно с поллингом
             log.info("Бот на связи: /start /new /myfilters /status /buy · админ: /admin")
-            await dp.start_polling(bot)
+            await dp.start_polling(bot, polling_timeout=POLL_TIMEOUT)
         else:
             await startup_jobs()
             await asyncio.Event().wait()  # dry-run/без токена: только публичный канал
@@ -1187,8 +1192,10 @@ async def _serve(settings: Settings) -> None:
         log.info("Остановка serve по сигналу")
     finally:
         scheduler.shutdown(wait=False)
-        delivery_task.cancel()
-        await asyncio.gather(delivery_task, return_exceptions=True)
+        tasks = [task for task in (delivery_task, enrichment_task, startup_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if bot is not None:
             await bot.session.close()
         await storage.dispose()

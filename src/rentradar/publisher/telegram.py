@@ -33,7 +33,7 @@ from ..config import Settings, load_emoji
 from ..interfaces import Publisher
 from ..models import Listing, ScoreBreakdown, ScoredListing, Source, _normalize_text
 from ..personal.metro_data import ALIASES, ROUTES
-from ..photos import telegram_photo
+from ..photos import telegram_photo, telegram_preview
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,12 @@ if TYPE_CHECKING:
 
 # Лимит подписи к фото в Telegram — 1024 символа.
 _CAPTION_LIMIT = 1024
+_PHOTO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    )
+}
 
 
 class TelegramPublisher(Publisher):
@@ -240,6 +246,7 @@ class TelegramPublisher(Publisher):
             and self._bot is not None
             and scored.listing.source == Source.AVITO
             and scored.listing.enriched_at is None
+            and (not use_custom_emoji or self._storage is None)
         ):
             detail = await fetch_detail(
                 scored.listing.url, price=scored.listing.price,
@@ -283,6 +290,11 @@ class TelegramPublisher(Publisher):
                     )
             else:
                 rental_terms_unavailable = True
+        elif (
+            not self._dry_run and self._bot is not None
+            and scored.listing.source == Source.AVITO and scored.listing.enriched_at is None
+        ):
+            rental_terms_unavailable = True
 
         text = self.render(scored, use_custom_emoji=use_custom_emoji,
                            rental_terms_unavailable=rental_terms_unavailable)
@@ -292,20 +304,10 @@ class TelegramPublisher(Publisher):
 
         photos: list = avito_full or _select_photos(scored.listing, cap)
         protect = self._protect_bot if use_custom_emoji else self._protect_public
-        if photos and scored.listing.source == Source.AVITO and self._via_relay:
-            # Через relay загрузка байтами (multipart) виснет по 60 с на попытку и
-            # стопорит всю очередь рассылки. Telegram сам не тянет CDN Авито, но
-            # берёт те же фото через wsrv.nl (как у Циана).
-            jpeg_urls = [_wsrv_jpeg(url) for url in photos if _is_avito_cdn(url)][:cap]
-            if jpeg_urls and await self._try_send(
-                channel, text, jpeg_urls, protect=protect, photo_timeout=12
-            ):
-                return True
-            if len(jpeg_urls) > 1 and await self._try_send(
-                channel, text, jpeg_urls[:1], protect=protect, photo_timeout=8
-            ):
-                return True
-            return await self._try_send(channel, text, [], protect=protect)
+        if photos and self._via_relay and _telegram_length(text) <= _CAPTION_LIMIT:
+            return await self._publish_relay_photo(
+                channel, text, photos, scored.listing.source, protect=protect,
+            )
         # Telegram не может стянуть фото Авито с CDN — скачиваем сами (наш IP
         # работает) и грузим байтами. Полноразмер уже получен выше.
         if photos and scored.listing.source == Source.AVITO:
@@ -327,19 +329,14 @@ class TelegramPublisher(Publisher):
                     channel, text, jpeg_urls[:1], protect=protect, photo_timeout=8
                 ):
                     return True
-            # Keep the personal queue moving if Telegram cannot fetch a CDN URL.
-            # The relay stalls on multipart uploads, so use text after URL attempts.
-            timeout = 8 if self._via_relay else None
             if await self._try_send(
-                channel, text, photos[:2], protect=protect, photo_timeout=timeout
+                channel, text, photos[:2], protect=protect
             ):
                 return True
             if len(photos) > 1 and await self._try_send(
-                channel, text, photos[:1], protect=protect, photo_timeout=timeout
+                channel, text, photos[:1], protect=protect
             ):
                 return True
-            if self._via_relay:
-                return await self._try_send(channel, text, [], protect=protect)
             photos = await self._download_photos(photos[:2], source=Source.CIAN)
         # Full album -> first photo -> text.
         for level in (photos, photos[:1], []):
@@ -348,19 +345,63 @@ class TelegramPublisher(Publisher):
         logger.error("Не удалось отправить пост в %s (все фолбэки исчерпаны)", channel)
         return False
 
+    async def _publish_relay_photo(
+        self, channel: str, text: str, photos: list[str], source: Source, *, protect: bool,
+    ) -> bool:
+        if source == Source.AVITO:
+            urls = [_wsrv_jpeg(url) for url in photos if _is_avito_cdn(url)]
+        elif source == Source.CIAN and self._cian_jpeg_proxy_enabled:
+            urls = [
+                _wsrv_jpeg(url) for url in photos[:3]
+                if url.startswith("https://images.cdn-cian.ru/")
+            ] or photos[:2]
+        else:
+            urls = photos[:2] if source == Source.CIAN else photos
+
+        if urls and await self._try_send(
+            channel, text, urls, protect=protect, photo_timeout=12 if len(urls) > 1 else 8,
+        ):
+            logger.info("Telegram media delivered: source=%s mode=url count=%d", source, len(urls))
+            return True
+        if len(urls) > 1 and await self._try_send(
+            channel, text, urls[:1], protect=protect, photo_timeout=8,
+        ):
+            logger.info("Telegram media delivered: source=%s mode=url count=1", source)
+            return True
+        preview = await self._download_relay_preview(photos[:2])
+        if preview and await self._try_send(
+            channel, text, [preview], protect=protect, photo_timeout=8,
+        ):
+            logger.info("Telegram media delivered: source=%s mode=uploaded-preview count=1", source)
+            return True
+        logger.warning("Telegram media unavailable: source=%s, sending text", source)
+        return await self._try_send(channel, text, [], protect=protect)
+
+    async def _download_relay_preview(self, urls: list[str]) -> BufferedInputFile | None:
+        async with httpx.AsyncClient(
+            timeout=3, headers=_PHOTO_HEADERS, follow_redirects=True,
+        ) as client:
+            async def preview(url: str) -> BufferedInputFile | None:
+                try:
+                    async with asyncio.timeout(4):
+                        response = await client.get(url)
+                        response.raise_for_status()
+                        data = await asyncio.to_thread(telegram_preview, response.content)
+                    return BufferedInputFile(data, filename="preview.jpg")
+                except (httpx.HTTPError, TimeoutError, OSError, ValueError):
+                    return None
+
+            return next((image for image in await asyncio.gather(
+                *(preview(url) for url in urls)
+            ) if image is not None), None)
+
     async def _download_photos(
         self, urls: list[str], *, source: Source = Source.AVITO,
     ) -> list[BufferedInputFile]:
         """Скачать фото и завернуть в байты для загрузки (обход блокировки CDN)."""
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-            )
-        }
         out: list[BufferedInputFile] = []
         async with httpx.AsyncClient(
-            timeout=20, headers=headers, follow_redirects=True,
+            timeout=20, headers=_PHOTO_HEADERS, follow_redirects=True,
             proxy=self._avito_proxy if source == Source.AVITO else None,
         ) as cl:
             for i, url in enumerate(urls):

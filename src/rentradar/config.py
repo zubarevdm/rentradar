@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     telegram_proxy: str = ""
     # Базовый URL relay вместо api.telegram.org (Cloudflare Worker), пусто = напрямую.
     telegram_api_base: str = ""
+    # Необязательный IPv4 relay, если один из адресов DNS недоступен с сервера.
+    telegram_relay_ipv4: str = ""
     public_channel: str = ""
     private_channel: str = ""
     # Годовой OAuth-токен Claude Code (claude setup-token) — для админ-команды /cc.

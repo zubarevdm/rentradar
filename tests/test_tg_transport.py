@@ -6,8 +6,8 @@ from rentradar.config import Settings
 from rentradar.tg import make_bot
 
 
-@pytest.mark.parametrize("relay", [True, False])
-async def test_relay_uses_fresh_connections_and_direct_reuses(relay):
+@pytest.mark.parametrize(("relay", "pin"), [(True, False), (False, False), (True, True)])
+async def test_relay_uses_fresh_connections_and_direct_reuses(relay, pin):
     transports = set()
 
     async def get_me(request):
@@ -24,10 +24,12 @@ async def test_relay_uses_fresh_connections_and_direct_reuses(relay):
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
-    base = f"http://127.0.0.1:{port}"
+    host = "relay.invalid" if pin else "127.0.0.1"
+    base = f"http://{host}:{port}"
     bot = make_bot(Settings(
         _env_file=None, bot_token="123456:TEST", telegram_proxy="",
         telegram_api_base=base if relay else "",
+        telegram_relay_ipv4="127.0.0.1" if pin else "",
     ))
     if not relay:
         bot.session.api = TelegramAPIServer.from_base(base)
