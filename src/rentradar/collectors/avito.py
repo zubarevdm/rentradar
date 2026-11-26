@@ -721,7 +721,7 @@ class AvitoCollector(HttpCollector):
         self._max_pages = max_pages
         # Авито дёргаем не чаще этого (рейт-лимит по IP), даже если общий сбор чаще.
         self._min_interval_sec = min_interval_sec
-        self._last_fetch_at = 0.0  # monotonic-время последней попытки
+        self._last_fetch_at = float("-inf")  # no request in this process yet
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         return [raw async for page in self.fetch_pages(profile, limit=limit) for raw in page]

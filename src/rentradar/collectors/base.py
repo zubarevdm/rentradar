@@ -45,7 +45,7 @@ class HttpCollector(BaseCollector):
         self._timeout = timeout
         # HTTP-прокси (в т.ч. web-unblocker, решающий антибот). None = напрямую.
         self._proxy = proxy or None
-        self._last_request_at = 0.0
+        self._last_request_at = float("-inf")
 
     async def _get_json(self, client: httpx.AsyncClient, url: str, **kwargs: object) -> dict:
         """GET с ретраями/бэкоффом, возвращает JSON."""
