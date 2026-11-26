@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     # Как часто РЕАЛЬНО дёргать Авито, минут (независимо от общего сбора). У Авито
     # жёсткий рейт-лимит по IP: собираем его реже Циан/Яндекса, чтобы не словить 429.
     avito_collect_interval_min: int = 12
+    avito_cooldown_min: int | None = None  # otherwise follows the collection interval
     # Сколько страниц выдачи Авито тянуть за проход (меньше = меньше нагрузка на IP).
     avito_max_pages: int = 2
 

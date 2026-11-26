@@ -35,7 +35,7 @@ from ..config import SearchProfile
 from ..errors import CollectionSkipped, CollectorBlockedError, DetailDeferred
 from ..models import DealType, Listing, PropertyType, RawListing, Source
 from ..photos import detail_photos, largest_srcset
-from ..runtime import mobile_request, route_path, run_child
+from ..runtime import collection_run_id, mobile_request, route_path, run_child
 from . import avito_access
 from .base import HttpCollector
 
@@ -79,7 +79,7 @@ _DETAIL_BYTES = 8 * 1024 * 1024
 
 
 def set_request_cooldown(seconds: float) -> None:
-    """Use the existing configured source interval for all Avito callers."""
+    """Set the base pause after an upstream refusal."""
     global _block_cooldown_seconds
     _block_cooldown_seconds = max(1.0, seconds)
 
@@ -134,7 +134,8 @@ def _pause_route(proxy: str | None, reason: str, retry_after: float = 0) -> None
             staged.replace(stored)
         except OSError:
             logger.exception("avito: cannot persist cooldown")
-    logger.warning("avito: %s, пауза запросов %.0f секунд", reason, delay)
+    logger.warning("avito: %s, пауза запросов %.0f секунд cooldown_until=%.3f",
+                   reason, delay, now + delay)
 
 
 def _pause_on_http(response, proxy: str | None) -> bool:
@@ -157,7 +158,17 @@ def _blocking_get(
         kwargs["cookies"] = cookies
     if headers:
         kwargs["headers"] = headers
-    return cffi_requests.get(url, **kwargs)
+    run_id = collection_run_id.get()
+    page = (params or {}).get("p", 0)
+    started = time.time()
+    code = 0
+    try:
+        response = cffi_requests.get(url, **kwargs)
+        code = response.status_code
+        return response
+    finally:
+        logger.info("avito_http run_id=%s page=%s started=%.3f status=%d",
+                    run_id, page, started, code)
 
 
 async def _get(*args):
@@ -189,10 +200,27 @@ async def _avito_fetch_html(
     # Serialise the check and request: parallel recipients must not retry a ban.
     key = proxy or "direct"
     lock = _request_locks.setdefault(key, asyncio.Lock())
-    async with lock, mobile_request(proxy, direct_owner="avito"):
-        if _in_cooldown(proxy):
-            return None
-        return await _fetch_with_profiles(url, params=params, proxy=proxy, timeout=timeout)
+    waiting = time.monotonic()
+    acquired = None
+    outcome = "error"
+    try:
+        async with lock, mobile_request(proxy, direct_owner="avito"):
+            acquired = time.monotonic()
+            if _in_cooldown(proxy):
+                outcome = "cooldown"
+                return None
+            result = await _fetch_with_profiles(url, params=params, proxy=proxy, timeout=timeout)
+            outcome = "ok" if result is not None else "unavailable"
+            return result
+    except CollectionSkipped:
+        outcome = "proxy_busy"
+        raise
+    finally:
+        end = time.monotonic()
+        logger.info("avito_route run_id=%s wait_ms=%d hold_ms=%d result=%s",
+                    collection_run_id.get(),
+                    round(((acquired if acquired is not None else end) - waiting) * 1000),
+                    round((end - acquired) * 1000) if acquired is not None else 0, outcome)
 
 
 async def _fetch_with_profiles(
@@ -721,7 +749,7 @@ class AvitoCollector(HttpCollector):
         self._max_pages = max_pages
         # Авито дёргаем не чаще этого (рейт-лимит по IP), даже если общий сбор чаще.
         self._min_interval_sec = min_interval_sec
-        self._last_fetch_at = float("-inf")  # no request in this process yet
+        self._next_fetch_at = float("-inf")  # no request in this process yet
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
         return [raw async for page in self.fetch_pages(profile, limit=limit) for raw in page]
@@ -729,17 +757,19 @@ class AvitoCollector(HttpCollector):
     async def fetch_pages(self, profile: SearchProfile, *, limit: int):
         # Гейт частоты: если с прошлой попытки прошло мало времени — пропускаем этот
         # цикл (возвращаем пусто, не блок), чтобы не долбить Авито и не ловить 429.
-        loop_now = asyncio.get_event_loop().time()
-        if self._min_interval_sec and (loop_now - self._last_fetch_at) < self._min_interval_sec:
-            raise CollectionSkipped("interval")
+        loop_now = asyncio.get_running_loop().time()
+        if loop_now < self._next_fetch_at:
+            raise CollectionSkipped("interval", retry_at=self._next_fetch_at)
         if _in_cooldown(self._proxy):
             raise CollectionSkipped("cooldown")
-        self._last_fetch_at = loop_now
+        self._next_fetch_at = loop_now + self._min_interval_sec
 
         region = REGION_PATH.get(profile.city.strip().lower(), "moskva")
         remaining = limit
         for page in range(1, self._max_pages + 1):
             await self._throttle()
+            logger.info("avito_search run_id=%s stage=fetch page=%d",
+                        collection_run_id.get(), page)
             url = f"{BASE}/{region}/{_CATEGORY_PATH}"
             html = await _avito_fetch_html(
                 url, params={"s": "104", "p": page}, proxy=self._proxy, timeout=self._timeout
@@ -748,6 +778,8 @@ class AvitoCollector(HttpCollector):
                 raise CollectorBlockedError(
                     f"Авито не отдал страницу или действует пауза после блокировки: {url}"
                 )
+            logger.info("avito_search run_id=%s stage=parse page=%d",
+                        collection_run_id.get(), page)
             cards = _parse_cards(html)
             if cards is None:
                 raise CollectorBlockedError(

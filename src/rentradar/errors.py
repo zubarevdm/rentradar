@@ -19,6 +19,10 @@ class CollectorBlockedError(CollectorError):
 class CollectionSkipped(CollectorError):
     """The source was intentionally not polled."""
 
+    def __init__(self, reason: str, *, retry_at: float | None = None) -> None:
+        super().__init__(reason)
+        self.retry_at = retry_at  # event-loop time, local to this process
+
 
 class DetailDeferred(CollectorError):
     """The card could not be enriched within its own resource budget."""

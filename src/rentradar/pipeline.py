@@ -29,8 +29,10 @@ class CollectionProgress:
     new: int = 0
     changed: int = 0
     pages: int = 0
+    pages_received: int = 0
     rejected: int = 0
     reason: str = "ok"
+    retry_at: float | None = None
 
 
 class Pipeline:
@@ -187,6 +189,8 @@ async def collect_source(
     saved = rejected = 0
     try:
         async for page in collector.fetch_pages(profile, limit=profile.collect_limit):
+            if progress is not None:
+                progress.pages_received += 1
             listings = []
             invalid_before = rejected
             for raw in page:
@@ -223,8 +227,11 @@ async def collect_source(
                 on_changes(changed)
     except CollectionSkipped as exc:
         if progress is not None:
-            progress.reason = {"interval": "interval", "cooldown": "cooldown",
-                               "shared proxy busy": "proxy_busy"}.get(str(exc), "skipped")
+            if str(exc) != "interval" or not progress.pages and progress.reason == "ok":
+                progress.reason = {"interval": "interval", "cooldown": "cooldown",
+                                   "shared proxy busy": "proxy_busy"}.get(str(exc), "skipped")
+            if exc.retry_at is not None:
+                progress.retry_at = max(progress.retry_at or exc.retry_at, exc.retry_at)
         return fresh, "partial" if saved else "skipped"
     except CollectorBlockedError as exc:
         if progress is not None:

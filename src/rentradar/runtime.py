@@ -12,12 +12,14 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .errors import CollectionSkipped
 
 log = logging.getLogger(__name__)
+collection_run_id = ContextVar("collection_run_id", default="-")
 _database: Path | None = None
 
 

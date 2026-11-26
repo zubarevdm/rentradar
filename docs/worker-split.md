@@ -41,7 +41,7 @@ Push the exact candidate to a GitHub branch first. On the VPS, download
 ```bash
 bash release.sh stage "$SHA" refs/heads/codex/worker-split
 # Publish the tested commit to main and create the corresponding tag on GitHub.
-bash release.sh deploy "$SHA" v0.4.0
+bash release.sh deploy "$SHA" v0.4.1
 bash release.sh verify "$SHA"
 ```
 
@@ -72,10 +72,11 @@ switch so the source of record and server agree.
 
 `/health` shows per-source state, heartbeat age, usable search, complete pass,
 new and changed counts, the detail backlog and the delivery queue's age. A
-source incident clears after a usable search result. The initial rollout runs
-Avito search every six minutes and attempts one detail per cycle. Override the
-unit environment to tune those separately after comparing freshness and
-source rejection rates.
+source incident clears after a usable search result. The cadence pilot runs
+Avito search every three minutes and still attempts one detail per six-minute
+cycle. A separate six-minute base cooldown applies after an Avito refusal.
+The VPS pilot keeps its one-page search depth. Compare freshness and source
+rejection rates before adjusting the cadence, depth or detail budget.
 `/collectnow` requests work from live owners and reports when a pass is already
 running. A hung async pass hits its configured deadline. A blocked event loop
 loses its systemd watchdog heartbeat. Both paths restart that collector only.
