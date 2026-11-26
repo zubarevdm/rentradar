@@ -1,9 +1,11 @@
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from rentradar import runtime
 from rentradar.collectors import avito, avito_access
+from rentradar.config import SearchProfile
 
 
 class FakeAccess(avito_access.AvitoAccess):
@@ -127,6 +129,24 @@ def test_recover_is_rate_limited(tmp_path):
     assert asyncio.run(access.recover(ip_banned=False))
     assert not asyncio.run(access.recover(ip_banned=False))
     assert calls == [1]
+
+
+def test_recovery_accepts_first_request_on_a_recently_booted_host(monkeypatch, tmp_path):
+    access, calls = _counting_access(tmp_path)
+    monkeypatch.setattr(avito_access, "time", SimpleNamespace(monotonic=lambda: 0.5))
+    assert asyncio.run(access.recover(ip_banned=False))
+    assert not asyncio.run(access.recover(ip_banned=False))
+    assert calls == ["warm"]
+
+
+async def test_collection_accepts_first_request_on_a_recently_booted_host(monkeypatch):
+    fetch = AsyncMock(return_value="<html></html>")
+    monkeypatch.setattr(avito, "_avito_fetch_html", fetch)
+    monkeypatch.setattr(avito, "_parse_cards", lambda html: [])
+    monkeypatch.setattr(asyncio.get_running_loop(), "time", lambda: 0.5)
+    collector = avito.AvitoCollector(min_interval_sec=360)
+    assert await collector.fetch(SearchProfile(name="fixture", city="Москва")) == []
+    fetch.assert_awaited_once()
 
 
 def test_phone_monitor_alerts_only_on_sustained_change():

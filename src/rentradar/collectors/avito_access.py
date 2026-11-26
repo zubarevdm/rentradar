@@ -77,8 +77,8 @@ class AvitoAccess:
         self._rotate_cmd = rotate_cmd
         self._rotate_wait = rotate_wait_sec
         self._warm_timeout = warm_timeout
-        self._last_recover = 0.0
-        self._last_warm_ok = 0.0
+        self._last_recover = float("-inf")
+        self._last_warm_ok = float("-inf")
         self.user_agent = ""
         self.cookies: dict[str, str] = {}
         self._load()
@@ -208,7 +208,7 @@ class AvitoAccess:
             return False
         self._last_recover = now
         held = now - self._last_warm_ok
-        rotate = ip_banned or retry or (self._last_warm_ok and held < _WARM_HOLD_SEC)
+        rotate = ip_banned or retry or held < _WARM_HOLD_SEC
         if rotate:
             if not ip_banned and not retry:
                 logger.info("avito: блок через %.0f с после прогрева — меняем IP", held)
