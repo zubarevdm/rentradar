@@ -9,6 +9,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -64,14 +65,13 @@ def owner(path: Path, role: str) -> Iterator[None]:
 
 
 @asynccontextmanager
-async def mobile_request(proxy: str | None) -> AsyncIterator[None]:
-    if not proxy or _database is None:
+async def mobile_request(
+    proxy: str | None, *, direct_owner: str | None = None,
+) -> AsyncIterator[None]:
+    path = route_path(proxy, direct_owner=direct_owner)
+    if path is None:
         yield
         return
-    endpoint = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
-    identity = f"{endpoint.hostname}:{endpoint.port}"
-    key = hashlib.sha256(identity.encode()).hexdigest()[:24]
-    path = _lock_path(_database, f"proxy-{key}")
     deadline = asyncio.get_running_loop().time() + 8
     while True:
         with _try_lock(path) as held:
@@ -81,6 +81,43 @@ async def mobile_request(proxy: str | None) -> AsyncIterator[None]:
         if asyncio.get_running_loop().time() >= deadline:
             raise CollectionSkipped("shared proxy busy")
         await asyncio.sleep(0.25)
+
+
+def route_path(proxy: str | None, *, direct_owner: str | None = None) -> Path | None:
+    if _database is None:
+        return None
+    if proxy:
+        endpoint = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        identity = f"{endpoint.hostname}:{endpoint.port}"
+        key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+        return _lock_path(_database, f"proxy-{key}")
+    return _lock_path(_database, f"{direct_owner}-direct") if direct_owner else None
+
+
+async def run_child(module: str, *args: str, data: bytes, seconds: float) -> bytes:
+    """Terminate the supervised job and its browser descendants on cancellation."""
+    posix = os.name == "posix"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", module, *args,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, start_new_session=posix,
+    )
+    try:
+        async with asyncio.timeout(seconds):
+            output, _ = await process.communicate(data)
+        if process.returncode:
+            raise RuntimeError(f"{module} exited with status {process.returncode}")
+        return output
+    except (TimeoutError, asyncio.CancelledError, RuntimeError):
+        try:
+            if posix:
+                os.killpg(process.pid, signal.SIGKILL)
+            elif process.returncode is None:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        await process.communicate()
+        raise
 
 
 def notify_systemd(message: str) -> None:

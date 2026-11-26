@@ -29,6 +29,7 @@ async def test_source_block_stops_other_recipients_until_cooldown(monkeypatch, s
     monkeypatch.setattr(avito, "_blocked_until", {})
     monkeypatch.setattr(avito, "_request_locks", {})
     monkeypatch.setattr(avito, "_block_cooldown_seconds", 720)
+    monkeypatch.setattr(avito, "uniform", lambda *args: 0.0)
     clock = [1000.0]
     monkeypatch.setattr(avito.time, "monotonic", lambda: clock[0])
     request = Mock(return_value=SimpleNamespace(

@@ -11,10 +11,10 @@ dependencies = [
     # curl_cffi имитирует TLS-фингерпринт браузера — так Авито пускает с VPS без
     # прокси (он режет Python-TLS httpx, а не сам IP дата-центра).
     "curl_cffi>=0.7",
-    "selectolax>=0.3.21",
+    "selectolax>=0.3.21,<1",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "sqlalchemy>=2.0",
+    "sqlalchemy[asyncio]>=2.0,<2.1",
     "aiosqlite>=0.20",
     "apscheduler>=3.10",
     "pyyaml>=6.0",

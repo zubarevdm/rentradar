@@ -20,6 +20,8 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+from ..runtime import run_child
+
 logger = logging.getLogger(__name__)
 
 WARM_URL = "https://www.avito.ru/moskva/kvartiry/sdam/na_dlitelnyy_srok-ASgBAgICAkSSA8gQ8AeQUg"
@@ -67,12 +69,14 @@ class AvitoAccess:
         profile_dir: Path | None = None,
         rotate_cmd: str = "",
         rotate_wait_sec: float = 15.0,
+        warm_timeout: float = 25.0,
     ) -> None:
         self.proxy = proxy
         self._path = cookies_path
         self._profile = profile_dir or cookies_path.with_name("avito_browser_profile")
         self._rotate_cmd = rotate_cmd
         self._rotate_wait = rotate_wait_sec
+        self._warm_timeout = warm_timeout
         self._last_recover = 0.0
         self._last_warm_ok = 0.0
         self.user_agent = ""
@@ -98,7 +102,30 @@ class AvitoAccess:
         return {"User-Agent": self.user_agent} if self.user_agent else {}
 
     async def warm(self) -> bool:
-        """Пройти «проверку браузера» постоянным профилем Camoufox и забрать куки."""
+        started = time.monotonic()
+        try:
+            output = await run_child(
+                "rentradar.collectors.avito_task", "warm",
+                data=json.dumps({"proxy": self.proxy, "cookies_path": str(self._path),
+                                 "profile_dir": str(self._profile)}).encode(),
+                seconds=self._warm_timeout,
+            )
+            data = json.loads(output)["result"]
+        except (OSError, TimeoutError, RuntimeError, ValueError, KeyError) as error:
+            logger.warning("avito browser stage=warm result=%s duration_seconds=%.2f",
+                           type(error).__name__, time.monotonic() - started)
+            return False
+        logger.info("avito browser stage=warm result=%s duration_seconds=%.2f",
+                    "ok" if data else "unavailable", time.monotonic() - started)
+        if not data:
+            return False
+        self.user_agent, self.cookies = data["ua"], data["cookies"]
+        self._save()
+        self._last_warm_ok = time.monotonic()
+        return True
+
+    async def _warm_in_child(self) -> bool:
+        """Open and close the existing browser session inside the supervised process."""
         try:
             from camoufox.async_api import AsyncCamoufox
         except ImportError:
@@ -136,9 +163,6 @@ class AvitoAccess:
         except Exception as exc:  # noqa: BLE001 — браузер/сеть: просто не прогрелись
             logger.warning("avito: прогрев упал: %s: %s", type(exc).__name__, exc)
             return False
-        self._save()
-        self._last_warm_ok = time.monotonic()
-        logger.info("avito: прогрев браузером ок, кук %d", len(self.cookies))
         return True
 
     async def rotate_ip(self) -> bool:
