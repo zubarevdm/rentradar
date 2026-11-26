@@ -28,6 +28,9 @@ class CollectionProgress:
     seen: int = 0
     new: int = 0
     changed: int = 0
+    pages: int = 0
+    rejected: int = 0
+    reason: str = "ok"
 
 
 class Pipeline:
@@ -185,6 +188,7 @@ async def collect_source(
     try:
         async for page in collector.fetch_pages(profile, limit=profile.collect_limit):
             listings = []
+            invalid_before = rejected
             for raw in page:
                 try:
                     listing = collector.normalize(raw)
@@ -210,14 +214,23 @@ async def collect_source(
             fresh.extend(new)
             saved += len(listings)
             if progress is not None:
+                progress.pages += 1
+                progress.rejected += rejected - invalid_before
                 progress.seen += len(listings)
                 progress.new += len(new)
                 progress.changed += len(changed) - len(new)
             if changed and on_changes:
                 on_changes(changed)
-    except CollectionSkipped:
+    except CollectionSkipped as exc:
+        if progress is not None:
+            progress.reason = {"interval": "interval", "cooldown": "cooldown",
+                               "shared proxy busy": "proxy_busy"}.get(str(exc), "skipped")
         return fresh, "partial" if saved else "skipped"
     except CollectorBlockedError as exc:
+        if progress is not None:
+            cause = str(exc)
+            progress.reason = ("challenge" if "SmartCaptcha" in cause else
+                               "schema" if "INITIAL_STATE" in cause else "source_blocked")
         logger.warning(
             "collect %s [%s]: блок (%s), saved=%d",
             profile.name,
@@ -227,8 +240,12 @@ async def collect_source(
         )
         return fresh, "partial" if saved else "blocked"
     except Exception:
+        if progress is not None:
+            progress.reason = "collection_error"
         logger.exception("Collection failed source=%s saved=%d", collector.source_name, saved)
         return fresh, "partial" if saved else "error"
     logger.info("collect source=%s saved=%d new=%d rejected=%d",
                 collector.source_name, saved, len(fresh), rejected)
+    if rejected and progress is not None:
+        progress.reason = "invalid_listing"
     return fresh, "partial" if rejected and saved else ("error" if rejected else "ok")

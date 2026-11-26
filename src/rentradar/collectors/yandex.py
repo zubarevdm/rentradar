@@ -100,6 +100,8 @@ class YandexCollector(HttpCollector):
                 url = f"{base_url}?{urlencode(params)}"
                 if page == 1:
                     offers, via_backup = await self._fetch_first_page(client, url)
+                    logger.info("yandex page=1 result=ok offers=%d route=%s",
+                                len(offers), "backup" if via_backup else "primary")
                 else:
                     try:
                         offers = await self._get_offers(client, url)
@@ -108,7 +110,7 @@ class YandexCollector(HttpCollector):
                         # свежую выдачу для всех профилей на этом маршруте.
                         self._pagination_paused_until = time.monotonic() + _PAGINATION_PAUSE_SEC
                         logger.warning(
-                            "Яндекс: основной маршрут, страница %d: %s", page, exc,
+                            "yandex page=%d result=pagination_paused reason=%s", page, exc,
                         )
                         raise
                 if not offers:
@@ -116,6 +118,8 @@ class YandexCollector(HttpCollector):
                 batch = [raw for offer in offers if isinstance(offer, dict)
                          and (raw := _wrap_offer(offer)) is not None]
                 if batch:
+                    if page > 1:
+                        logger.info("yandex page=%d result=ok offers=%d", page, len(batch))
                     yield batch[:remaining]
                     remaining -= len(batch)
                 if remaining <= 0:

@@ -11,6 +11,8 @@ from PIL import Image, ImageOps
 def telegram_preview(data: bytes) -> bytes:
     """Fit a single JPEG preview into the relay's small-request path."""
     with Image.open(BytesIO(data)) as original:
+        if original.width * original.height > 24_000_000:
+            raise ValueError("photo_pixel_limit")
         photo = ImageOps.exif_transpose(original).convert("RGB")
         for edge in (480, 384, 320, 256, 192, 128):
             preview = photo.copy()
@@ -30,6 +32,8 @@ def telegram_photo(data: bytes) -> tuple[bytes, str]:
     or accept that payload as a photo. Preserve original JPEG/PNG bytes.
     """
     with Image.open(BytesIO(data)) as original:
+        if original.width * original.height > 24_000_000:
+            raise ValueError("photo_pixel_limit")
         original.load()
         if original.format in ("JPEG", "PNG"):
             return data, "jpg" if original.format == "JPEG" else "png"

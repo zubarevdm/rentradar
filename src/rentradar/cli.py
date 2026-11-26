@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from . import ccagent
+from .avito_enrichment import run_avito_enrichment
+from .collectors.avito import next_route_attempt
 from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .models import Listing, ScoredListing, source_rank
 from .personal import PersonalStore
@@ -34,10 +36,12 @@ from .storage import SqlMarketStatsProvider, SqlStorage
 from .storage.orm import SubscriberRow
 from .vision import VisionQuotaError, build_analyzer
 from .worker import (
+    DETAIL_ROLE,
     SOURCES,
     STALE_AFTER,
     WorkerState,
     build_collector,
+    interval_seconds,
     run_worker,
     source_enabled,
 )
@@ -465,9 +469,7 @@ async def _serve(settings: Settings) -> None:
     # Троттл алертов ПО КЛЮЧУ: разные категории (vision/сбор/площадка/джоб) не
     # глушат друг друга. Значение — время последней отправки этого ключа.
     alert_state: dict[str, datetime] = {}
-    # Состояние площадок для health-мониторинга: source → 'ok'|'down'. Алертим на
-    # переходе (не каждый цикл): 🔴 при падении, 🟢 при восстановлении.
-    source_health: dict[str, str] = {}
+    source_incidents: dict[str, datetime] = {}
     # Пауза публичного постинга (админ-команда) — не мешает сбору и личке.
     public_paused = {"on": False}
     # Живые метрики для команды /health.
@@ -500,15 +502,22 @@ async def _serve(settings: Settings) -> None:
         for source, row in (await worker_state.read()).items():
             if not source_enabled(settings, source):
                 continue
+            last = row.last_usable or row.last_success
+            grace = timedelta(seconds=max(600, 3 * interval_seconds(settings, source)))
             down = (row.heartbeat < now - STALE_AFTER or row.state == "stopped"
-                    or row.failures >= SOURCE_DOWN_AFTER)
-            state = "down" if down else "up"
-            previous = source_health.get(source)
-            source_health[source] = state
-            if previous != state and (down or previous == "down"):
-                text = "недоступен" if down else "снова работает"
+                    or row.failures >= SOURCE_DOWN_AFTER
+                    or (last is not None and now - last > grace))
+            incident = source_incidents.get(source)
+            if down and incident is None:
+                source_incidents[source] = now
                 await _alert_admin(
-                    f"Сборщик <b>{source}</b> {text}. /health — детали.",
+                    f"Сборщик <b>{source}</b> недоступен. /health — детали.",
+                    key=f"src:{source}", cooldown_h=0,
+                )
+            elif incident is not None and not down and last is not None and last >= incident:
+                del source_incidents[source]
+                await _alert_admin(
+                    f"Сборщик <b>{source}</b> снова получил выдачу. /health — детали.",
                     key=f"src:{source}", cooldown_h=0,
                 )
             if source == "avito":
@@ -802,7 +811,7 @@ async def _serve(settings: Settings) -> None:
                 if not _is_admin(message):
                     return
                 now = _utcnow()
-                worker_rows = await worker_state.read()
+                worker_rows = await worker_state.read(include_details=True)
                 lines = []
                 for source in SOURCES:
                     row = worker_rows.get(source)
@@ -816,10 +825,26 @@ async def _serve(settings: Settings) -> None:
                     state = "offline" if age > STALE_AFTER.total_seconds() else row.state
                     started = moscow_when(row.started_at, now) if row.started_at else "—"
                     last = moscow_when(row.last_success, now) if row.last_success else "—"
+                    usable = moscow_when(row.last_usable, now) if row.last_usable else last
                     lines.append(
                         f"{source}: {state}, сигнал {age} с, старт {started}, "
-                        f"успех {last}, +{row.new_count}, Δ{row.changed_count}"
+                        f"выдача {usable}, полный проход {last}, "
+                        f"+{row.new_count}, Δ{row.changed_count}"
+                        + (f", причина {row.reason}" if row.reason not in (None, "ok") else "")
                     )
+                    if source == "avito" and (retry_at := next_route_attempt(settings.avito_proxy)):
+                        lines.append(f"Авито на паузе до {moscow_when(retry_at, now)}")
+                detail_row = worker_rows.get(DETAIL_ROLE)
+                if detail_row is not None:
+                    detail_age = int((now - detail_row.heartbeat).total_seconds())
+                    detail_state = ("offline" if detail_age > STALE_AFTER.total_seconds()
+                                    else detail_row.state)
+                    detail_count, detail_oldest = await storage.detail_backlog(now)
+                    detail_last = (moscow_when(detail_row.last_success, now)
+                                   if detail_row.last_success else "—")
+                    lines.append(f"Детали Авито: {detail_state}, сигнал {detail_age} с, "
+                                 f"последний успех {detail_last}, очередь {detail_count}, "
+                                 f"возраст {detail_oldest // 60} мин")
                 src = "\n".join(lines)
                 oldest, retries, uncertain = await personal.outbox.metrics(now)
                 total = await storage.count_listings()
@@ -1103,9 +1128,18 @@ async def _worker(settings: Settings, source: str) -> None:
         await storage.dispose()
 
 
+async def _enrich_avito(settings: Settings) -> None:
+    storage = SqlStorage(settings.db_url, db_path=settings.db_path)
+    try:
+        await storage.require_worker_schema()
+        await run_until_signal(run_avito_enrichment(settings, storage))
+    finally:
+        await storage.dispose()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="rentradar")
-    parser.add_argument("command", choices=[*_COMMANDS, "worker"], help="команда")
+    parser.add_argument("command", choices=[*_COMMANDS, "worker", "enrich-avito"], help="команда")
     parser.add_argument("--source", choices=SOURCES)
     args = parser.parse_args()
     if (args.command == "worker") != (args.source is not None):
@@ -1120,6 +1154,11 @@ def main() -> None:
             locks.enter_context(owner(settings.db_path, args.source))
             log_start("collector", args.source)
             asyncio.run(_worker(settings, args.source))
+            return
+        if args.command == "enrich-avito":
+            locks.enter_context(owner(settings.db_path, DETAIL_ROLE))
+            log_start("enrichment", "avito")
+            asyncio.run(_enrich_avito(settings))
             return
         if args.command in ("collect", "run"):
             for source in SOURCES:

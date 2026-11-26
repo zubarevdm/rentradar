@@ -1,0 +1,25 @@
+[Unit]
+Description=RentRadar Avito detail enrichment
+After=network-online.target rentradar-collector@avito.service
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/opt/rentradar
+Environment=RENTRADAR_DB_PATH=/opt/rentradar/data/rentradar.db
+Environment=RENTRADAR_AVITO_COLLECT_INTERVAL_MIN=6
+Environment=RENTRADAR_AVITO_DETAIL_MAX_PER_RUN=1
+ExecStart=/bin/bash /opt/rentradar-releases/current/scripts/run-role.sh enrich-avito
+CPUWeight=30
+Restart=on-failure
+RestartSec=10
+WatchdogSec=35
+TimeoutStartSec=30
+TimeoutStopSec=25
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

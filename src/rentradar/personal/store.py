@@ -534,15 +534,19 @@ class PersonalStore:
         *,
         delivered: bool = False,
         now: datetime | None = None,
+        message_ids: tuple[int, ...] = (),
     ) -> None:
         # Repeated writes must be safe, including concurrent cycles and backlog.
         values = dict(user_id=user_id, content_key=content_key, delivered=delivered,
-                      sent_at=now or utcnow())
+                      sent_at=now or utcnow(), message_ids=list(message_ids) or None)
         statement = insert(UserSentRow).values(**values)
         statement = statement.on_conflict_do_update(
             index_elements=[UserSentRow.user_id, UserSentRow.content_key],
             set_={
                 "delivered": UserSentRow.delivered | statement.excluded.delivered,
+                "message_ids": func.coalesce(
+                    UserSentRow.message_ids, statement.excluded.message_ids,
+                ),
                 "sent_at": case(
                     ((~UserSentRow.delivered) & statement.excluded.delivered,
                      statement.excluded.sent_at),

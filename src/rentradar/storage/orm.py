@@ -100,6 +100,18 @@ class MarketStatRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class AvitoDetailTaskRow(Base):
+    __tablename__ = "avito_detail_tasks"
+    __table_args__ = (Index("ix_avito_detail_ready", "ready_at"),)
+
+    external_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision: Mapped[str] = mapped_column(String(32))
+    ready_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    attempts: Mapped[int] = mapped_column(default=0)
+    reason: Mapped[str] = mapped_column(String(48), default="new")
+
+
 class ListingEventRow(Base):
     __tablename__ = "listing_events"
     __table_args__ = ({"sqlite_autoincrement": True},)
@@ -129,6 +141,9 @@ class CollectorStateRow(Base):
     heartbeat: Mapped[datetime] = mapped_column(DateTime)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_success: Mapped[datetime | None] = mapped_column(DateTime)
+    last_usable: Mapped[datetime | None] = mapped_column(DateTime)
+    reason: Mapped[str | None] = mapped_column(String(48))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
     requested: Mapped[bool] = mapped_column(default=False)
     state: Mapped[str] = mapped_column(String(24))
     new_count: Mapped[int] = mapped_column(default=0)
@@ -233,6 +248,7 @@ class UserSentRow(Base):
     # Реально доставлено (а не отсеяно скорингом/помечено пропущенным бэклогом).
     # NULL у строк до миграции — «неизвестно», в счётчики доставок не входят.
     delivered: Mapped[bool | None] = mapped_column(Boolean, default=False, nullable=True)
+    message_ids: Mapped[list[int] | None] = mapped_column(JSON(none_as_null=True))
 
 
 class DeliveryAttemptRow(Base):

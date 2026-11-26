@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
@@ -101,6 +102,11 @@ def _in_cooldown(proxy: str | None) -> bool:
             or time.time() < _cooldown_record(proxy)[0])
 
 
+def next_route_attempt(proxy: str | None) -> datetime | None:
+    until, _ = _cooldown_record(proxy)
+    return datetime.fromtimestamp(until, UTC).replace(tzinfo=None) if until > time.time() else None
+
+
 def _retry_after(response) -> float:
     value = str((getattr(response, "headers", None) or {}).get("Retry-After", "")).strip()
     try:
@@ -154,6 +160,17 @@ def _blocking_get(
     return cffi_requests.get(url, **kwargs)
 
 
+async def _get(*args):
+    # Keep the cross-process route lock until a cancelled transfer actually ends.
+    work = asyncio.create_task(asyncio.to_thread(_blocking_get, *args))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await work
+        raise
+
+
 async def _avito_fetch_html(
     url: str,
     *,
@@ -186,7 +203,7 @@ async def _fetch_with_profiles(
         return await _fetch_with_access(access, url, params=params, timeout=timeout)
     for imp in _rotator.order():
         try:
-            resp = await asyncio.to_thread(_blocking_get, url, imp, params, proxy, timeout)
+            resp = await _get(url, imp, params, proxy, timeout)
         except Exception as exc:  # noqa: BLE001 — сетевые/curl-ошибки: пробуем следующий
             logger.warning("avito curl_cffi[%s]: %s: %s", imp, type(exc).__name__, exc)
             continue
@@ -225,10 +242,11 @@ async def _fetch_with_access(
     """Мобильный прокси: curl_cffi с куками и UA профиля браузера.
 
     При блоке — прогрев/смена IP и повтор."""
+    access.refresh()
     for attempt in range(3):
         try:
-            resp = await asyncio.to_thread(
-                _blocking_get, url, avito_access.IMPERSONATE, params, access.proxy, timeout,
+            resp = await _get(
+                url, avito_access.IMPERSONATE, params, access.proxy, timeout,
                 access.cookies, access.headers,
             )
         except Exception as exc:  # noqa: BLE001 — сеть/прокси (телефон переподключается)
@@ -252,8 +270,12 @@ _FULL_PHOTO_RE = re.compile(r'\\"1280x960\\":\\"(https://[^\\"]+?)\\"')
 _AMOUNT = r"\d+(?: \d{3})*(?:[.,]\d+)?"
 _CURRENCY = r"(?:₽|руб\w*\.?|р\.|rub\b)"
 _PAYMENT_LABEL = r"(?:залог|(?:страховой )?депозит|комисси\w*)"
-_JSON_START = re.compile(r"[\{\[]")
-_GROUP_CHARS = re.compile(r"""[\\"'\[\]{}]""")
+_JSON_TOKEN = re.compile(r'''"(?:[^"\\]|\\[\s\S])*+"|'(?:[^'\\]|\\[\s\S])*+'|[\[\]{}]''')
+_DETAIL_FIELDS = re.compile(
+    r"залог|депозит|комисси|deposit|commission|жку|сч[её]тчик|коммунал|плат[её]ж|страхов|сбор|уборк",
+    re.I,
+)
+_OTHER_LISTINGS = re.compile(r"recommend|similar|related|suggest|otheritems|catalog", re.I)
 
 
 def _terms_text(raw: str) -> str:
@@ -327,104 +349,92 @@ def _rental_amounts(text: str, price: int | None) -> tuple[int | None, int | Non
     return deposit, 0 if fixed == 0 else pct, None if fixed == 0 else fixed
 
 
-def _structured_terms(document: str) -> list[str]:
-    """Read nested JSON state without evaluating JavaScript or sibling adverts."""
+def _script_objects(script: str):
+    """Yield disjoint JSON candidates from an inline script in one forward scan."""
+    depth = start = 0
+    for match in _JSON_TOKEN.finditer(script):
+        token = match.group()
+        if token[0] in ('"', "'"):
+            if depth == 0 and _DETAIL_FIELDS.search(token):
+                yield token
+        elif token in ("{", "["):
+            if depth == 0:
+                start = match.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                candidate = script[start:match.end()]
+                if _DETAIL_FIELDS.search(candidate):
+                    yield candidate
+
+
+def _structured_terms(document: str, tree: HTMLParser | None = None) -> list[str]:
+    """Read bounded JSON fragments without evaluating JavaScript or sibling adverts."""
     texts: list[str] = []
-    pairs = {"{": "}", "[": "]"}
+    fields = {"depositRub": ("Залог", "₽"), "deposit": ("Залог", ""),
+              "commissionRub": ("Комиссия", "₽"), "commissionPercent": ("Комиссия", "%"),
+              "commissionPct": ("Комиссия", "%")}
 
-    def group_ends(source: str, start: int, cache: dict[int, int | None]) -> int | None:
-        """Конец JS-группы, открытой в start (None — не закрылась до конца текста).
-
-        Скан с открывающей скобки заодно определяет концы всех вложенных групп,
-        встреченных вне кавычек: дальше они идут так же, как шёл бы скан с них
-        самих. Кэш делает разбор многомегабайтной страницы линейным, а не
-        квадратичным (раньше одна карточка разбиралась минутами и вешала бота).
-        """
-        if start in cache:
-            return cache[start]
-        stack: list[tuple[str, int]] = []
-        quote: str | None = None
-        skip = -1
-        for match in _GROUP_CHARS.finditer(source, start):
-            offset = match.start()
-            if offset == skip:  # символ после \ внутри строки
-                continue
-            char = match.group()
-            if quote:
-                if char == "\\":
-                    skip = offset + 1
-                elif char == quote:
-                    quote = None
-            elif char in ('"', "'"):
-                quote = char
-            elif char in pairs:
-                stack.append((pairs[char], offset))
-            elif stack and char == stack[-1][0]:
-                cache[stack.pop()[1]] = offset + 1
-                if not stack:
-                    return offset + 1
-        for _, opened in stack:
-            cache[opened] = None
-        return None
-
-    def scalar(value: object) -> str:
+    def scalar(value: object, depth: int = 0) -> str:
+        if depth >= 16:
+            return ""
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-            return str(value)
+            return str(value)[:4000]
         if isinstance(value, list):
-            return " ".join(scalar(v) for v in value)
+            return " ".join(scalar(v, depth + 1) for v in value[:24])[:4000]
         if isinstance(value, dict):
             content = next((value[k] for k in ("text", "value", "title", "label")
                             if k in value), "")
-            return scalar(content) + " " + scalar(value.get("unit", ""))
+            return scalar(content, depth + 1) + " " + scalar(value.get("unit", ""), depth + 1)
         return ""
 
-    def walk(value: object) -> None:
+    def walk(value: object, depth: int = 0, embedded: bool = True) -> None:
+        if depth > 48 or len(texts) >= 1024:
+            return
         if isinstance(value, list):
             for item in value:
-                walk(item)
+                walk(item, depth + 1, embedded)
         elif isinstance(value, dict):
             label = next((value[k] for k in ("label", "title", "name") if k in value), "")
             content = next((value[k] for k in ("value", "values", "text") if k in value), None)
-            if isinstance(label, str) and content is not None:
+            if isinstance(label, str) and content is not None and _DETAIL_FIELDS.search(label):
                 texts.append(f"{label}: {scalar(content)} {scalar(value.get('unit', ''))}")
-            fields = {"depositRub": ("Залог", "₽"), "deposit": ("Залог", ""),
-                      "commissionRub": ("Комиссия", "₽"),
-                      "commissionPercent": ("Комиссия", "%"),
-                      "commissionPct": ("Комиссия", "%")}
             for key, item in value.items():
                 if key == "depositCommission" and isinstance(item, str):
-                    texts.append(item)
+                    texts.append(item[:4000])
                 elif key in fields:
                     title, unit = fields[key]
-                    rendered = scalar(item).strip()
-                    texts.append(f"{title}: {rendered} {unit}")
-                elif not re.search(
-                    r"recommend|similar|related|suggest|otheritems|catalog", key, re.I
-                ):
-                    walk(item)
+                    texts.append(f"{title}: {scalar(item).strip()} {unit}")
+                elif not _OTHER_LISTINGS.search(key):
+                    walk(item, depth + 1, embedded)
+        elif (embedded and isinstance(value, str) and value.lstrip().startswith(("{", "["))
+              and _DETAIL_FIELDS.search(value)):
+            decode(value, embedded=False)
 
-    decoder = json.JSONDecoder()
-    # Two layers cover JSON in script strings as well as direct application/json.
-    decoded = html_lib.unescape(document)
-    for _ in range(2):
-        position = 0
-        cache: dict[int, int | None] = {}
-        while match := _JSON_START.search(decoded, position):
-            start = match.start()
-            end = group_ends(decoded, start, cache)
-            if end is None:  # незакрытая группа не может быть валидным JSON
-                position = start + 1
+    def decode(candidate: str, *, embedded: bool = True) -> None:
+        try:
+            value = json.loads(candidate)
+        except (ValueError, RecursionError):
+            return
+        walk(value, embedded=embedded)
+
+    tree = tree if tree is not None else HTMLParser(document)
+    for node in tree.css("script")[:128]:
+        script = html_lib.unescape(node.text()).strip()
+        if not _DETAIL_FIELDS.search(script):
+            continue
+        before = len(texts)
+        if script.startswith(("{", "[", '"')) and script.endswith(("}", "]", '"')):
+            decode(script)
+            if len(texts) > before:
                 continue
-            # Декодируем только саму группу: ошибка raw_decode на полном документе
-            # считает номер строки от его начала — O(n) на каждую ложную «{».
-            try:
-                value, size = decoder.raw_decode(decoded[start:end])
-            except ValueError:
-                position = end  # невалидный JS-объект пропускаем целиком с вложенными
-                continue
-            walk(value)
-            position = start + size
-        decoded = decoded.replace(r'\"', '"').replace(r"\\", "\\")
+        for block in _script_objects(script):
+            decode(block)
+        if len(texts) == before and r'\"' in script:
+            # Legacy fragments with escaped quotes but no surrounding JSON string.
+            for block in _script_objects(script.replace(r'\"', '"').replace(r"\\", "\\")):
+                decode(block, embedded=False)
     return texts
 
 
@@ -501,34 +511,43 @@ def _detail_from_html(
     blocked = any(marker in title for marker in (
         "доступ ограничен", "проверка безопасности", "капча", "captcha",
     ))
+    if blocked:
+        logger.warning("avito detail: получена страница без данных объявления %s", url)
+        return None
+    structured = _structured_terms(html, tree)
     detail_markers = bool(re.search(r"item-view|условия\s+аренды", html, re.I))
     if not detail_markers:
         # Some page variants expose rental terms only in application state.
         # The structured reader excludes recommendation subtrees.
         detail_markers = any(re.search(
             r"\b(?:залог\w*|депозит\w*|комисси\w*)\b", _terms_text(item)
-        ) for item in _structured_terms(html))
-    if blocked or not detail_markers:
+        ) for item in structured)
+    if not detail_markers:
         logger.warning("avito detail: получена страница без данных объявления %s", url)
         return None
-    return parse_detail(html, price=price, limit=limit)
+    return _parse_detail(html, tree, structured, price, limit)
 
 
 def parse_detail(html: str, *, price: int | None = None, limit: int = 10) -> AvitoDetail:
     """Разобрать HTML детальной страницы (отделено от сети — тестируется на фикстурах)."""
+    tree = HTMLParser(html)
+    return _parse_detail(html, tree, _structured_terms(html, tree), price, limit)
+
+
+def _parse_detail(
+    html: str, tree: HTMLParser, structured: list[str], price: int | None, limit: int,
+) -> AvitoDetail:
     photos = detail_photos(html, limit)
     if not photos:  # preserve support for escaped fragments without an enclosing object
         for raw in _FULL_PHOTO_RE.findall(html):
             url = raw.replace("\\u002F", "/").replace("\\/", "/")
             if url not in photos:
                 photos.append(url)
-    tree = HTMLParser(html)
     desc_el = tree.css_first("[data-marker='item-view/item-description']")
     description = desc_el.text(separator="\n", strip=True) if desc_el else None
     # Use the rental section first, including CSS-hidden/closed HTML blocks.
     # Remove scripts from the text view: recommendation JSON is not this advert.
     texts = []
-    structured = _structured_terms(html)
     for node in tree.css("script, style, [data-marker*='recommend'], [data-marker*='similar']"):
         node.decompose()
     body = tree.body.text(separator=" ", strip=True) if tree.body else ""
