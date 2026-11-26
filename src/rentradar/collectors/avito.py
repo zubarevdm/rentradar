@@ -32,6 +32,7 @@ from ..config import SearchProfile
 from ..errors import CollectionSkipped, CollectorBlockedError
 from ..models import DealType, Listing, PropertyType, RawListing, Source
 from ..photos import detail_photos, largest_srcset
+from ..runtime import mobile_request
 from . import avito_access
 from .base import HttpCollector
 
@@ -116,7 +117,8 @@ async def _avito_fetch_html(
     async with lock:
         if time.monotonic() < _blocked_until.get(key, 0):
             return None
-        return await _fetch_with_profiles(url, params=params, proxy=proxy, timeout=timeout)
+        async with mobile_request(proxy):
+            return await _fetch_with_profiles(url, params=params, proxy=proxy, timeout=timeout)
 
 
 async def _fetch_with_profiles(
@@ -632,15 +634,20 @@ class AvitoCollector(HttpCollector):
         self._last_fetch_at = 0.0  # monotonic-время последней попытки
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
+        return [raw async for page in self.fetch_pages(profile, limit=limit) for raw in page]
+
+    async def fetch_pages(self, profile: SearchProfile, *, limit: int):
         # Гейт частоты: если с прошлой попытки прошло мало времени — пропускаем этот
         # цикл (возвращаем пусто, не блок), чтобы не долбить Авито и не ловить 429.
         loop_now = asyncio.get_event_loop().time()
         if self._min_interval_sec and (loop_now - self._last_fetch_at) < self._min_interval_sec:
             raise CollectionSkipped("interval")
+        if time.monotonic() < _blocked_until.get(self._proxy or "direct", 0):
+            raise CollectionSkipped("cooldown")
         self._last_fetch_at = loop_now
 
         region = REGION_PATH.get(profile.city.strip().lower(), "moskva")
-        results: list[RawListing] = []
+        remaining = limit
         for page in range(1, self._max_pages + 1):
             await self._throttle()
             url = f"{BASE}/{region}/{_CATEGORY_PATH}"
@@ -658,13 +665,12 @@ class AvitoCollector(HttpCollector):
                 )
             if not cards:
                 break
-            for card in cards:
-                raw = _wrap_card(card)
-                if raw is not None:
-                    results.append(raw)
-                if len(results) >= limit:
-                    return results
-        return results
+            batch = [raw for card in cards if (raw := _wrap_card(card)) is not None]
+            if batch:
+                yield batch[:remaining]
+                remaining -= len(batch)
+            if remaining <= 0:
+                break
 
     def normalize(self, raw: RawListing) -> Listing | None:
         c = raw.payload

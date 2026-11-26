@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     # Дробные минуты допустимы: 2.5 = 150 секунд. У Авито свой интервал сбора.
     collect_interval_min: float = 2.5
     yandex_collect_interval_min: float = 0  # zero follows the shared collection interval
+    worker_pass_timeout_sec: float = Field(default=240, ge=1)
     # Окно для расчёта рыночных медиан, дней (старые цены не тянут медиану).
     # Сами лоты НЕ удаляются — окно влияет только на расчёт, история хранится.
     market_window_days: int = 90

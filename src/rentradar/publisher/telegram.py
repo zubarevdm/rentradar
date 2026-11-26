@@ -16,7 +16,6 @@ import html
 import logging
 import re
 from collections import OrderedDict
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
 
@@ -35,7 +34,6 @@ from aiogram.types import (
     InputMediaPhoto,
 )
 
-from ..collectors.avito import fetch_detail
 from ..config import Settings, load_emoji
 from ..errors import DeliveryDeferred, DeliveryUncertain
 from ..interfaces import Publisher
@@ -243,74 +241,21 @@ class TelegramPublisher(Publisher):
         """
         # В личке больше фото (5-7), в канале меньше (3-5).
         cap = self._max_personal if use_custom_emoji else self._max_public
-        # Avito: если лот ещё не дообогащён (enrich-джоб не успел), тянем детальную
-        # страницу здесь — оттуда полноразмер-фото (1280x960) и залог/комиссия.
-        # Патчим лот ДО render(), чтобы в посте появилась строка «Заехать».
-        # Обогащённый лот уже несёт всё это в БД. В dry-run сеть не трогаем.
-        avito_full: list[str] | None = None
-        rental_terms_unavailable = False
-        if (not self._dry_run and self._bot is not None and self._storage is not None
-                and scored.listing.source == Source.AVITO and not use_custom_emoji):
-            cached = await self._storage.get_listing(
-                Source.AVITO.value, scored.listing.external_id,
-            )
+        if self._storage is not None and scored.listing.source == Source.AVITO:
+            cached = await self._storage.get_listing(Source.AVITO.value, scored.listing.external_id)
             if cached is not None:
-                scored = scored.model_copy(update={"listing": cached})
-        if (
-            not self._dry_run
-            and self._bot is not None
-            and scored.listing.source == Source.AVITO
-            and scored.listing.enriched_at is None
-            and (not use_custom_emoji or self._storage is None)
-        ):
-            detail = await fetch_detail(
-                scored.listing.url, price=scored.listing.price,
-                proxy=self._avito_proxy, limit=cap,
-            )
-            if detail is not None:
-                if self._storage is not None:
-                    await self._storage.save_enrichment(
-                        Source.AVITO.value, scored.listing.external_id,
-                        enriched_at=datetime.now(UTC).replace(tzinfo=None),
-                        expected_price=scored.listing.price, **detail._asdict(),
-                    )
-                avito_full = detail.photos
-                patch: dict = {}
-                for field in (
-                    "deposit_rub", "commission_pct", "commission_rub", "deposit_due_rub",
-                    "deposit_installments",
-                ):
-                    patch[field] = getattr(detail, field)
-                # Missing markup is not evidence that a known search-card
-                # payment disappeared. Explicit 'уточняется' is still unknown.
-                if not detail.commission_present:
-                    patch.pop("commission_pct")
-                    patch.pop("commission_rub")
-                if not detail.deposit_present:
-                    for field in ("deposit_rub", "deposit_due_rub", "deposit_installments"):
-                        patch.pop(field)
-                patch["upfront_payments"] = detail.upfront_payments or {}
-                for field in (
-                    "utilities_rub", "meters_included", "utilities_included",
-                ):
-                    value = getattr(detail, field)
-                    if value is not None:
-                        patch[field] = value
-                if detail.commission_rub is not None:
-                    patch["commission_pct"] = None
-                elif detail.commission_pct is not None:
-                    patch["commission_rub"] = None
-                if patch:
-                    scored = scored.model_copy(
-                        update={"listing": scored.listing.model_copy(update=patch)}
-                    )
-            else:
-                rental_terms_unavailable = True
-        elif (
-            not self._dry_run and self._bot is not None
-            and scored.listing.source == Source.AVITO and scored.listing.enriched_at is None
-        ):
-            rental_terms_unavailable = True
+                if cached.flagged or cached.price != scored.listing.price:
+                    return False
+                if use_custom_emoji and cached.collected_at != scored.listing.collected_at:
+                    return False  # Recheck the filter against the latest revision on retry.
+                if not use_custom_emoji:
+                    scored = scored.model_copy(update={"listing": cached})
+        rental_terms_unavailable = (
+            scored.listing.source == Source.AVITO and scored.listing.enriched_at is None
+        )
+        if (not self.simulated and not use_custom_emoji
+                and scored.listing.source == Source.AVITO and not scored.listing.photos):
+            return None  # The worker can provide a usable snapshot on a later pass.
 
         text = self.render(scored, use_custom_emoji=use_custom_emoji,
                            rental_terms_unavailable=rental_terms_unavailable)
@@ -318,7 +263,7 @@ class TelegramPublisher(Publisher):
             logger.info("[DRY-RUN] → %s\n%s", channel, text)
             return None
 
-        photos: list = avito_full or _select_photos(scored.listing, cap)
+        photos: list = _select_photos(scored.listing, cap)
         require_photo = use_custom_emoji and bool(photos)
         if photos and _telegram_length(text) > _CAPTION_LIMIT:
             url = html.escape(scored.listing.url, quote=True)
@@ -333,9 +278,9 @@ class TelegramPublisher(Publisher):
                 require_photo=require_photo,
             )
         # Telegram не может стянуть фото Авито с CDN — скачиваем сами (наш IP
-        # работает) и грузим байтами. Полноразмер уже получен выше.
+        # работает) и грузим байтами по ссылкам из сохранённой карточки.
         if photos and scored.listing.source == Source.AVITO:
-            photos = await self._download_photos(avito_full or photos)
+            photos = await self._download_photos(photos)
         # Защита от кражи контента (protect выше): в личке (платное) — по protect_bot,
         # в канале — по protect_public (use_custom_emoji=True только в личных чатах).
         if photos and scored.listing.source == Source.CIAN:

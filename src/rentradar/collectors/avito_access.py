@@ -14,7 +14,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import signal
 import time
+from contextlib import suppress
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -145,13 +148,17 @@ class AvitoAccess:
             self._rotate_cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name != "nt",
         )
         try:
             _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
         except TimeoutError:
-            proc.kill()
+            await _stop_process(proc)
             logger.warning("avito: смена IP — команда зависла")
             return False
+        except asyncio.CancelledError:
+            await _stop_process(proc)
+            raise
         if proc.returncode != 0:
             logger.warning("avito: смена IP — код %s: %s", proc.returncode,
                            err.decode(errors="replace")[:200])
@@ -182,13 +189,26 @@ class AvitoAccess:
 
 async def _run_ok(cmd: str, timeout: float = 30.0) -> bool:
     proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=os.name != "nt",
     )
     try:
         return await asyncio.wait_for(proc.wait(), timeout=timeout) == 0
     except TimeoutError:
-        proc.kill()
+        await _stop_process(proc)
         return False
+    except asyncio.CancelledError:
+        await _stop_process(proc)
+        raise
+
+
+async def _stop_process(proc: asyncio.subprocess.Process) -> None:
+    with suppress(ProcessLookupError):
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    await proc.wait()
 
 
 async def _proxy_ok(proxy: str) -> bool:

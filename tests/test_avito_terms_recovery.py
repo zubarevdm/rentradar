@@ -1,6 +1,6 @@
 """Recover terms after temporary source failures and reuse them across recipients."""
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -8,9 +8,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from rentradar.collectors import avito
+from rentradar.config import Settings
 from rentradar.models import ScoreBreakdown, ScoredListing, Source
 from rentradar.publisher import TelegramPublisher
 from rentradar.storage import SqlStorage
+from rentradar.worker import enrich_avito
 from tests.test_publisher_send import FakeBot
 
 
@@ -47,7 +49,7 @@ async def test_source_block_stops_other_recipients_until_cooldown(monkeypatch, s
     assert request.call_count == 2
 
 
-async def test_successful_send_enrichment_is_persisted_and_reused(
+async def test_worker_enrichment_is_persisted_and_reused(
     storage, sample_listing, monkeypatch,
 ):
     html = (Path(__file__).parent / "fixtures/avito-8517144096-terms.html").read_text("utf-8")
@@ -55,11 +57,14 @@ async def test_successful_send_enrichment_is_persisted_and_reused(
     listing = sample_listing.model_copy(update={
         "source": Source.AVITO, "external_id": "8517144096", "price": 45000,
         "deposit_rub": None, "commission_pct": None, "commission_rub": None,
-        "enriched_at": None, "photos": [],
+        "enriched_at": None, "photos": ["https://example.test/photo.jpg"],
+        "collected_at": datetime.now(UTC).replace(tzinfo=None),
     })
     await storage.upsert_listings([listing])
     fetch = AsyncMock(return_value=detail)
-    monkeypatch.setattr("rentradar.publisher.telegram.fetch_detail", fetch)
+    monkeypatch.setattr("rentradar.worker.fetch_detail", fetch)
+    await enrich_avito(Settings(), storage)
+    monkeypatch.setattr(TelegramPublisher, "_download_photos", AsyncMock(return_value=[]))
     bot = FakeBot()
     publisher = TelegramPublisher(dry_run=False, bot=bot, storage=storage)
     stale_candidate = ScoredListing(listing=listing, score=ScoreBreakdown(total=70))
@@ -75,15 +80,15 @@ async def test_successful_send_enrichment_is_persisted_and_reused(
     assert all("При заезде: 108 000 ₽" in call["text"] for call in bot.message_calls)
 
 
-async def test_failed_fetch_is_not_claimed_to_be_missing_in_ad(sample_listing, monkeypatch):
+async def test_missing_cached_terms_are_not_claimed_to_be_missing_in_ad(sample_listing):
     listing = sample_listing.model_copy(update={
         "source": Source.AVITO, "price": 45000, "deposit_rub": None,
         "commission_pct": None, "commission_rub": None, "photos": [], "enriched_at": None,
     })
-    monkeypatch.setattr("rentradar.publisher.telegram.fetch_detail", AsyncMock(return_value=None))
     bot = FakeBot()
     await TelegramPublisher(dry_run=False, bot=bot).publish(
-        ScoredListing(listing=listing, score=ScoreBreakdown(total=70)), channel="test",
+        ScoredListing(listing=listing, score=ScoreBreakdown(total=70)),
+        channel="test", use_custom_emoji=True,
     )
     caption = bot.message_calls[0]["text"]
     # Not «не указаны»: the author may have stated them, we just could not read them.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 
 from .config import SearchProfile, Settings
@@ -20,6 +21,13 @@ from .interfaces import BaseCollector, Publisher, ScoringEngine, Storage
 from .models import Listing, ScoredListing
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CollectionProgress:
+    seen: int = 0
+    new: int = 0
+    changed: int = 0
 
 
 class Pipeline:
@@ -144,54 +152,7 @@ class Pipeline:
         self, collector: BaseCollector, profile: SearchProfile,
         on_changes: Callable[[list[Listing]], None] | None = None,
     ) -> tuple[list[Listing], str]:
-        fresh: list[Listing] = []
-        saved = rejected = 0
-        try:
-            async for page in collector.fetch_pages(profile, limit=profile.collect_limit):
-                listings = []
-                for raw in page:
-                    try:
-                        listing = collector.normalize(raw)
-                    except (
-                        ValueError,
-                        TypeError,
-                        AttributeError,
-                        KeyError,
-                        IndexError,
-                        OverflowError,
-                    ):
-                        logger.warning(
-                            "Invalid listing source=%s id=%s",
-                            collector.source_name,
-                            raw.external_id,
-                        )
-                        listing = None
-                    if listing is None:
-                        rejected += 1
-                    else:
-                        listings.append(listing)
-                new, changed = await self._storage.upsert_changes(listings)
-                fresh.extend(new)
-                saved += len(listings)
-                if changed and on_changes:
-                    on_changes(changed)
-        except CollectionSkipped:
-            return fresh, "skipped"
-        except CollectorBlockedError as exc:
-            logger.warning(
-                "collect %s [%s]: блок (%s), saved=%d",
-                profile.name,
-                collector.source_name,
-                exc,
-                saved,
-            )
-            return fresh, "partial" if saved else "blocked"
-        except Exception:
-            logger.exception("Collection failed source=%s saved=%d", collector.source_name, saved)
-            return fresh, "partial" if saved else "error"
-        logger.info("collect source=%s saved=%d new=%d rejected=%d",
-                    collector.source_name, saved, len(fresh), rejected)
-        return fresh, "partial" if rejected and saved else ("error" if rejected else "ok")
+        return await collect_source(self._storage, collector, profile, on_changes)
 
     async def score_recent(
         self, profile: SearchProfile, since: datetime, *, min_score: float | None = None,
@@ -212,3 +173,62 @@ class Pipeline:
             if score.is_publishable and score.total >= threshold:
                 out.append(ScoredListing(listing=listing, score=score))
         return out
+
+
+async def collect_source(
+    storage: Storage, collector: BaseCollector, profile: SearchProfile,
+    on_changes: Callable[[list[Listing]], None] | None = None,
+    *, progress: CollectionProgress | None = None,
+) -> tuple[list[Listing], str]:
+    fresh: list[Listing] = []
+    saved = rejected = 0
+    try:
+        async for page in collector.fetch_pages(profile, limit=profile.collect_limit):
+            listings = []
+            for raw in page:
+                try:
+                    listing = collector.normalize(raw)
+                except (
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    KeyError,
+                    IndexError,
+                    OverflowError,
+                ):
+                    logger.warning(
+                        "Invalid listing source=%s id=%s",
+                        collector.source_name,
+                        raw.external_id,
+                    )
+                    listing = None
+                if listing is None:
+                    rejected += 1
+                else:
+                    listings.append(listing)
+            new, changed = await storage.upsert_changes(listings)
+            fresh.extend(new)
+            saved += len(listings)
+            if progress is not None:
+                progress.seen += len(listings)
+                progress.new += len(new)
+                progress.changed += len(changed) - len(new)
+            if changed and on_changes:
+                on_changes(changed)
+    except CollectionSkipped:
+        return fresh, "partial" if saved else "skipped"
+    except CollectorBlockedError as exc:
+        logger.warning(
+            "collect %s [%s]: блок (%s), saved=%d",
+            profile.name,
+            collector.source_name,
+            exc,
+            saved,
+        )
+        return fresh, "partial" if saved else "blocked"
+    except Exception:
+        logger.exception("Collection failed source=%s saved=%d", collector.source_name, saved)
+        return fresh, "partial" if saved else "error"
+    logger.info("collect source=%s saved=%d new=%d rejected=%d",
+                collector.source_name, saved, len(fresh), rejected)
+    return fresh, "partial" if rejected and saved else ("error" if rejected else "ok")

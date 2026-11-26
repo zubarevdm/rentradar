@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from itertools import batched
 
-from sqlalchemy import case, delete, func, or_, select, text, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +29,8 @@ from ..storage.orm import (
 from ..storage.repository import _row_to_listing
 from .access import TARIFFS, TRIAL, Access, access_of, add_hours, normalize_pause, utcnow
 from .filters import UserFilter, matches
+
+MAX_DELIVERY_ATTEMPTS = 8
 
 
 class PersonalStore:
@@ -100,7 +102,8 @@ class PersonalStore:
                 index_elements=["user_id", "content_key"],
                 set_={"state": "sending", "retry_at": lease,
                       "attempts": DeliveryAttemptRow.attempts + 1},
-                where=DeliveryAttemptRow.retry_at <= now,
+                where=and_(DeliveryAttemptRow.retry_at <= now,
+                           DeliveryAttemptRow.attempts < MAX_DELIVERY_ATTEMPTS),
             ))
             return result.rowcount == 1
 

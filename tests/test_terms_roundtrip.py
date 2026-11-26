@@ -1,12 +1,11 @@
 """Rental payments survive persistence and remain honest in Telegram captions."""
 
 from datetime import datetime
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
 
-from rentradar.collectors.avito import AvitoDetail, parse_detail
+from rentradar.collectors.avito import parse_detail
 from rentradar.models import ScoreBreakdown, ScoredListing, Source
 from rentradar.personal import PersonalStore, UserFilter
 from rentradar.publisher import TelegramPublisher
@@ -24,7 +23,7 @@ SINCE = datetime(2020, 1, 1)
     ("<p>Залог: 340000 ₽. Комиссия: 50%</p>", 850000),
 ])
 async def test_zero_commission_survives_partial_detail_in_storage_and_send(
-    terms_storage, sample_listing, monkeypatch, markup, expected,
+    terms_storage, sample_listing, markup, expected,
 ):
     listing = sample_listing.model_copy(update={
         "source": Source.AVITO, "price": 340000, "deposit_rub": 340000,
@@ -32,22 +31,22 @@ async def test_zero_commission_survives_partial_detail_in_storage_and_send(
     })
     detail = parse_detail(f'<div data-marker="item-view/item-params">{markup}</div>',
                           price=340000)
-    monkeypatch.setattr("rentradar.publisher.telegram.fetch_detail", AsyncMock(return_value=detail))
+    await terms_storage.upsert_listings([listing])
+    await terms_storage.save_enrichment(
+        "avito", listing.external_id, enriched_at=NOW, **detail._asdict()
+    )
+    saved = (await terms_storage.recent_listings("Москва", SINCE))[0]
     bot = FakeBot()
-    publisher = TelegramPublisher(bot=bot, dry_run=False)
+    publisher = TelegramPublisher(bot=bot, dry_run=False, storage=terms_storage)
     await publisher.publish(
-        ScoredListing(listing=listing, score=ScoreBreakdown(total=70)), channel="test"
+        ScoredListing(listing=saved, score=ScoreBreakdown(total=70)),
+        channel="test", use_custom_emoji=True,
     )
     caption = bot.message_calls[0]["text"]
     if expected is None:
         assert "При заезде: от " in caption and "<b>При заезде:" not in caption
     else:
         assert f"При заезде: {expected:,} ₽".replace(",", " ") in caption
-    await terms_storage.upsert_listings([listing])
-    await terms_storage.save_enrichment(
-        "avito", listing.external_id, enriched_at=NOW, **detail._asdict()
-    )
-    saved = (await terms_storage.recent_listings("Москва", SINCE))[0]
     assert saved.move_in_total == expected
     if expected == 680000:
         assert saved.commission_amount == 0 and "без комиссии" in caption
@@ -247,16 +246,11 @@ async def test_new_collection_replaces_stale_metro_time(terms_storage, sample_li
     assert saved.metro == "Новая станция" and saved.metro_distance_min is None
 
 
-async def test_publish_enriches_terms_even_without_photos(sample_listing, monkeypatch):
+async def test_public_avito_without_photos_waits_for_a_snapshot(sample_listing):
     bot = FakeBot()
-    fetch = AsyncMock(return_value=AvitoDetail([], 50000, 50, None, None))
-    monkeypatch.setattr("rentradar.publisher.telegram.fetch_detail", fetch)
-    listing = sample_listing.model_copy(update={
-        "source": Source.AVITO, "price": 50000, "photos": [], "commission_rub": 1,
-    })
+    listing = sample_listing.model_copy(update={"source": Source.AVITO, "photos": []})
     publisher = TelegramPublisher(bot=bot, dry_run=False)
     assert await publisher.publish(
         ScoredListing(listing=listing, score=ScoreBreakdown(total=70)), channel="test"
-    )
-    fetch.assert_awaited_once()
-    assert "При заезде: 125 000 ₽" in bot.message_calls[0]["text"]
+    ) is None
+    assert not bot.message_calls and not bot.photo_calls

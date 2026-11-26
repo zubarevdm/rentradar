@@ -1,0 +1,16 @@
+[Unit]
+Description=RentRadar Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/rentradar
+Environment=RENTRADAR_DB_PATH=/opt/rentradar/data/rentradar.db
+ExecStart=/bin/bash /opt/rentradar-releases/current/scripts/run-role.sh serve
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=25
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

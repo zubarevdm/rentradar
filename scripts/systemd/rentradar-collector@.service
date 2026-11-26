@@ -1,0 +1,22 @@
+[Unit]
+Description=RentRadar collector for %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/opt/rentradar
+Environment=RENTRADAR_DB_PATH=/opt/rentradar/data/rentradar.db
+ExecStart=/bin/bash /opt/rentradar-releases/current/scripts/run-role.sh worker --source %i
+Restart=on-failure
+RestartSec=10
+WatchdogSec=35
+TimeoutStartSec=30
+TimeoutStopSec=25
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

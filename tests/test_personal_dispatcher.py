@@ -420,9 +420,11 @@ async def test_second_batch_reaches_fast_chat_while_first_chat_is_waiting(env):
     dispatcher = _dispatcher(st, ps, Publisher())
     try:
         for name, observed in (("one", first), ("two", second)):
-            batch = await st.upsert_listings([_listing(name, collected=now)])
-            await dispatcher.queue_changes(batch)
-            await asyncio.wait_for(observed.wait(), timeout=5)
+            await st.upsert_listings([_listing(name, collected=now)])
+            async with asyncio.timeout(5):
+                while not observed.is_set():
+                    await dispatcher.poll_outbox(datetime.now(UTC).replace(tzinfo=None))
+                    await asyncio.sleep(0.03)
     finally:
         unblock.set()
         await dispatcher.close()

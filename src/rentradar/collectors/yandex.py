@@ -32,6 +32,7 @@ from ..models import (
     RawListing,
     Source,
 )
+from ..runtime import mobile_request
 from .base import HttpCollector
 
 logger = logging.getLogger(__name__)
@@ -81,8 +82,18 @@ class YandexCollector(HttpCollector):
         self._pagination_paused_until = 0.0
 
     async def fetch(self, profile: SearchProfile, *, limit: int = 50) -> list[RawListing]:
-        region = REGION_SLUG.get(profile.city.strip().lower(), "moskva")
         results: list[RawListing] = []
+        try:
+            async for page in self.fetch_pages(profile, limit=limit):
+                results.extend(page)
+        except CollectorBlockedError:
+            if not results:
+                raise
+        return results
+
+    async def fetch_pages(self, profile: SearchProfile, *, limit: int):
+        region = REGION_SLUG.get(profile.city.strip().lower(), "moskva")
+        remaining = limit
         async with self._search_session(self._proxy) as client:
             for page in range(1, self._max_pages + 1):
                 base_url, params = self.build_query(profile, region=region, page=page)
@@ -96,25 +107,22 @@ class YandexCollector(HttpCollector):
                         # Если страница 1 доступна, временно оставляем только
                         # свежую выдачу для всех профилей на этом маршруте.
                         self._pagination_paused_until = time.monotonic() + _PAGINATION_PAUSE_SEC
-                        if not results:
-                            raise
                         logger.warning(
-                            "Яндекс: основной маршрут, страница %d: %s. Сохраняем %d офферов",
-                            page, exc, len(results),
+                            "Яндекс: основной маршрут, страница %d: %s", page, exc,
                         )
-                        break
+                        raise
                 if not offers:
                     break
-                for offer in offers:
-                    raw = _wrap_offer(offer)
-                    if raw is not None:
-                        results.append(raw)
-                    if len(results) >= limit:
-                        return results
+                batch = [raw for offer in offers if isinstance(offer, dict)
+                         and (raw := _wrap_offer(offer)) is not None]
+                if batch:
+                    yield batch[:remaining]
+                    remaining -= len(batch)
+                if remaining <= 0:
+                    break
                 # Мобильный прокси делит трафик с Авито. Свежие офферы идут первыми.
                 if via_backup or time.monotonic() < self._pagination_paused_until:
                     break
-        return results
 
     def _on_fallback(self) -> bool:
         return self._fallback_proxy is not None and time.monotonic() < self._fallback_until
@@ -166,7 +174,7 @@ class YandexCollector(HttpCollector):
                     backup_session = self._search_session(
                         self._fallback_proxy, max(self._timeout, _BACKUP_TIMEOUT_SEC)
                     )
-                    async with backup_session as backup:
+                    async with mobile_request(self._fallback_proxy), backup_session as backup:
                         offers = await self._get_offers(backup, url)
                 else:
                     offers = await self._get_offers(client, url)

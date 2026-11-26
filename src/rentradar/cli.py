@@ -5,7 +5,8 @@
   rentradar collect          — собрать объявления по профилям в БД (без скоринга/постинга).
   rentradar recompute-stats  — пересчитать рыночные медианы (market_stats).
   rentradar run              — один полный прогон конвейера (collect → score → publish).
-  rentradar serve            — автономный режим: автопостинг по расписанию (раз в N минут).
+  rentradar serve            — Telegram, рассылка и общие фоновые задачи.
+  rentradar worker --source  — отдельный сборщик одной площадки.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import argparse
 import asyncio
 import html
 import logging
-import subprocess
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,10 +27,8 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import ccagent
-from .collectors import AvitoCollector, CianCollector, YandexCollector, avito_access
-from .collectors.avito import fetch_detail, set_request_cooldown
 from .config import SearchProfile, Settings, load_emoji, load_profiles
-from .models import Listing, ScoredListing, Source, source_rank
+from .models import Listing, ScoredListing, source_rank
 from .personal import PersonalStore
 from .personal.access import TARIFFS, TRIAL, access_of, moscow_when, plural
 from .personal.bot import build_router
@@ -38,11 +37,20 @@ from .personal.filters import matches
 from .personal.navigation import nudge_keyboard
 from .pipeline import Pipeline
 from .publisher import TelegramPublisher
+from .runtime import configure_database, log_start, owner, run_until_signal
 from .scoring import TastyScoringEngine
 from .storage import SqlMarketStatsProvider, SqlStorage
 from .storage.orm import SubscriberRow
 from .tg import POLL_TIMEOUT, make_bot
 from .vision import VisionQuotaError, build_analyzer
+from .worker import (
+    SOURCES,
+    STALE_AFTER,
+    WorkerState,
+    build_collector,
+    run_worker,
+    source_enabled,
+)
 
 log = logging.getLogger("rentradar")
 
@@ -239,30 +247,7 @@ async def _recompute_stats(settings: Settings) -> None:
 
 
 def _build_collectors(settings: Settings) -> list:
-    """Все активные коллекторы площадок. Добавление площадки = строка здесь.
-    Авито — через прокси (если задан в .env), т.к. на VPS его банят напрямую."""
-    set_request_cooldown(settings.avito_collect_interval_min * 60)
-    if settings.avito_browser_warmup and settings.avito_proxy and avito_access.current() is None:
-        avito_access.configure(avito_access.AvitoAccess(
-            proxy=settings.avito_proxy,
-            cookies_path=settings.avito_cookies_path,
-            profile_dir=settings.avito_browser_profile,
-            rotate_cmd=settings.avito_rotate_cmd,
-            rotate_wait_sec=settings.avito_rotate_wait_sec,
-        ))
-    collectors: list = [
-        CianCollector(fallback_proxy=settings.cian_fallback_proxy or None),
-        YandexCollector(fallback_proxy=settings.yandex_fallback_proxy or None),
-    ]
-    if settings.avito_enabled:
-        collectors.append(
-            AvitoCollector(
-                proxy=settings.avito_proxy or None,
-                max_pages=settings.avito_max_pages,
-                min_interval_sec=settings.avito_collect_interval_min * 60,
-            )
-        )
-    return collectors
+    return [build_collector(settings, s) for s in SOURCES if source_enabled(settings, s)]
 
 
 def _build_pipeline(settings: Settings, storage: SqlStorage) -> tuple[Pipeline, TelegramPublisher]:
@@ -324,7 +309,8 @@ async def _serve(settings: Settings) -> None:
     if not profiles:
         return
     storage = SqlStorage(settings.db_url, db_path=settings.db_path)
-    await storage.init(pause_max_days=settings.pause_max_days)
+    await storage.require_worker_schema()
+    worker_state = WorkerState(storage)
 
     # Один общий Telegram-бот: и постинг в канал, и личные чаты подписчиков.
     bot: Bot | None = None
@@ -364,9 +350,8 @@ async def _serve(settings: Settings) -> None:
             protect_public=settings.protect_content_public,
         )
 
-    collectors = _build_collectors(settings)
     pipeline = Pipeline(
-        collectors=collectors,
+        collectors=[],
         storage=storage,
         scoring=TastyScoringEngine(SqlMarketStatsProvider(storage)),
         publisher=publisher,
@@ -401,139 +386,10 @@ async def _serve(settings: Settings) -> None:
         settings.dry_run,
     )
 
-    async def _wanted_by_subscribers(listings: list) -> list:
-        """Лоты, которые подходят под фильтр хотя бы одного подписчика с доступом.
-
-        Карточка Авито — лишний запрос через телефон-прокси, а каждый запрос
-        приближает 429. Тянем её только для лотов, которые реально уйдут в личку.
-        Данные карточки (комиссия, описание) могут лишь отсеять лот, но не добавить,
-        поэтому матчинг по данным из выдачи — надмножество итоговой рассылки.
-        Паблик-канал дотягивает карточку сам при отправке (fallback в паблишере).
-        """
-        if not listings:
-            return []
-        now = _utcnow()
-        active: dict[int, bool] = {}
-        filters = []
-        for flt in await personal_store.all_active_filters():
-            if flt.user_id not in active:
-                active[flt.user_id] = await personal_store.is_active(flt.user_id, now)
-            if active[flt.user_id]:
-                filters.append(flt)
-        # Details can confirm that a currently unknown fee is zero.
-        provisional = [f.model_copy(update={"no_commission": False}) for f in filters]
-        return [lst for lst in listings if any(
-            matches(lst, f) for f in (provisional if lst.commission_amount is None else filters)
-        )]
-
-    async def enrich_job() -> None:
-        """Дообогатить свежие Авито-лоты с детальных страниц: описание, залог,
-        комиссия, полноразмер-фото (в выдаче их нет — поэтому у Авито не работали
-        «Заехать», фильтр «без посредников» и текстовый скам-гейт). Вежливый темп;
-        при блоке антибота проход прерывается до следующего сбора."""
-        if not settings.avito_enabled or settings.avito_detail_max_per_run <= 0:
-            return
-        # Гейт частоты: детальные страницы Авито бьют по тому же IP, что и поиск.
-        # Не чаще avito_collect_interval_min, иначе не выйти из рейт-лимита 429.
-        last_enrich = runtime.get("last_enrich_at")
-        if last_enrich is not None and (
-            (_utcnow() - last_enrich).total_seconds() < settings.avito_collect_interval_min * 60
-        ):
-            return
-        runtime["last_enrich_at"] = _utcnow()
-        try:
-            since = _utcnow() - timedelta(hours=24)
-            cands = await storage.unenriched_listings(
-                Source.AVITO.value, since, settings.avito_detail_max_per_run * 15
-            )
-            cands = (await _wanted_by_subscribers(cands))[: settings.avito_detail_max_per_run]
-            done = 0
-            for listing in cands:
-                if done:  # пауза между запросами (не перед первым)
-                    await asyncio.sleep(settings.avito_detail_delay_sec)
-                detail = await fetch_detail(
-                    listing.url,
-                    price=listing.price,
-                    proxy=settings.avito_proxy or None,
-                )
-                if detail is None:
-                    log.warning(
-                        "Обогащение Авито: блок/ошибка после %d/%d — жду следующего сбора",
-                        done,
-                        len(cands),
-                    )
-                    break
-                changed = await storage.save_enrichment(
-                    listing.source.value,
-                    listing.external_id,
-                    enriched_at=_utcnow(), expected_price=listing.price,
-                    description=detail.description,
-                    deposit_rub=detail.deposit_rub,
-                    commission_pct=detail.commission_pct,
-                    commission_rub=detail.commission_rub,
-                    deposit_due_rub=detail.deposit_due_rub,
-                    deposit_installments=detail.deposit_installments,
-                    upfront_payments=detail.upfront_payments,
-                    utilities_rub=detail.utilities_rub,
-                    utilities_included=detail.utilities_included,
-                    meters_included=detail.meters_included,
-                    photos=detail.photos,
-                    deposit_present=detail.deposit_present,
-                    commission_present=detail.commission_present,
-                )
-                if changed is not None:
-                    notify_changes([changed])
-                done += 1
-            if done:
-                log.info("Обогащение Авито: %d лотов", done)
-        except Exception:  # noqa: BLE001
-            log.exception("Ошибка обогащения Авито")
-
-    immediate_delivery = asyncio.Event()
-    enrichment_requested = asyncio.Event()
-    changes: dict[tuple[str, str], Listing] = {}
-    source_locks = {collector.source_name: asyncio.Lock() for collector in collectors}
-    collection_slots = asyncio.Semaphore(2)
-    latest_counts: dict[str, int] = {}
-    source_checked: dict[str, datetime] = {}
-
-    def notify_changes(batch: list[Listing]) -> None:
-        changes.update(((lst.source.value, lst.external_id), lst) for lst in batch)
-        immediate_delivery.set()
-
-    async def collect_source_job(collector) -> int | None:
-        source = collector.source_name
-        lock = source_locks[source]
-        if lock.locked():
-            return None
-        total = 0
-        states = []
-        async with lock:
-            for profile in profiles:
-                async with collection_slots:
-                    fresh, status = await pipeline.collect_source(
-                        collector, profile, notify_changes
-                    )
-                total += len(fresh)
-                states.append(status)
-            if any(status != "skipped" for status in states):
-                latest_counts[source] = total
-                source_checked[source] = _utcnow()
-            runtime["last_collect_at"] = _utcnow()
-            runtime["last_collect_new"] = sum(latest_counts.values())
-            await _check_source_health({source: states})
-            if source == Source.AVITO.value:
-                enrichment_requested.set()
-            log.info("Сбор %s: новых лотов = %d, статусы=%s", source, total, states)
-        return total
-
-    async def collect_job() -> list[int | None]:
-        return await asyncio.gather(*(collect_source_job(c) for c in collectors))
-
     async def market_job() -> None:
-        await personal_store.prune_attempts(
-            _utcnow() - timedelta(hours=settings.personal_lookback_hours)
-        )
+        since = _utcnow() - timedelta(hours=settings.personal_lookback_hours)
+        await personal_store.prune_attempts(since)
+        await personal.outbox.prune(since)
         await storage.recompute_market_stats(window_days=settings.market_window_days)
 
     async def public_job() -> None:
@@ -605,14 +461,11 @@ async def _serve(settings: Settings) -> None:
     # Состояние площадок для health-мониторинга: source → 'ok'|'down'. Алертим на
     # переходе (не каждый цикл): 🔴 при падении, 🟢 при восстановлении.
     source_health: dict[str, str] = {}
-    source_fails: dict[str, int] = {}
     # Пауза публичного постинга (админ-команда) — не мешает сбору и личке.
     public_paused = {"on": False}
     # Живые метрики для команды /health.
     runtime: dict = {
         "started_at": _utcnow(),
-        "last_collect_at": None,
-        "last_collect_new": None,
         "last_public_at": None,
         "last_public_n": None,
     }
@@ -633,38 +486,33 @@ async def _serve(settings: Settings) -> None:
                 except Exception:  # noqa: BLE001
                     log.warning("Не смог уведомить админа %s (%s)", admin, key)
 
-    async def _check_source_health(agg: dict[str, list[str]]) -> None:
-        """По итогам сбора: source считается живым, если собрал хоть в одном профиле.
-        Алертим только на смене состояния (ok↔down) — без спама каждые 10 минут.
-        «Лежит» — только после SOURCE_DOWN_AFTER неудачных сборов подряд: разовый
-        сбой (капча, смена IP телефона) сам проходит на следующем сборе."""
-        for src, results in agg.items():
-            observed = [status for status in results if status != "skipped"]
-            if not observed:
+    phone_state: dict[str, bool] = {}
+
+    async def check_source_health() -> None:
+        now = _utcnow()
+        for source, row in (await worker_state.read()).items():
+            if not source_enabled(settings, source):
                 continue
-            if "ok" in observed or "partial" in observed:
-                source_fails[src] = 0
-                state = "ok" if all(s == "ok" for s in observed) else "partial"
-            else:
-                source_fails[src] = source_fails.get(src, 0) + 1
-                state = "down" if source_fails[src] >= SOURCE_DOWN_AFTER else "degraded"
-            previous = source_health.get(src)
-            source_health[src] = state
-            if previous == state or (state != "down" and previous != "down"):
-                continue
-            if state == "down":
+            down = (row.heartbeat < now - STALE_AFTER or row.state == "stopped"
+                    or row.failures >= SOURCE_DOWN_AFTER)
+            state = "down" if down else "up"
+            previous = source_health.get(source)
+            source_health[source] = state
+            if previous != state and (down or previous == "down"):
+                text = "недоступен" if down else "снова работает"
                 await _alert_admin(
-                    f"🔴 Площадка <b>{src}</b> перестала собираться "
-                    "(блокировка/ошибка). Остальные площадки работают.",
-                    key=f"src:{src}",
-                    cooldown_h=0,
+                    f"Сборщик <b>{source}</b> {text}. /health — детали.",
+                    key=f"src:{source}", cooldown_h=0,
                 )
-            else:
-                await _alert_admin(
-                    f"🟢 Площадка <b>{src}</b> снова собирается.",
-                    key=f"src:{src}",
-                    cooldown_h=0,
-                )
+            if source == "avito":
+                for part, ok in (row.phone or {}).items():
+                    if phone_state.get(part) == ok:
+                        continue
+                    phone_state[part] = ok
+                    if part in phone_texts:
+                        await _alert_admin(
+                            phone_texts[part][ok], key=f"phone:{part}", cooldown_h=0,
+                        )
 
     async def _analyze_and_save(listing: Listing) -> Listing:
         """Vision по фото лота → сохранить в БД; вернуть лот с результатом анализа."""
@@ -820,9 +668,7 @@ async def _serve(settings: Settings) -> None:
 
     async def personal_job() -> None:
         try:
-            n = await personal.run_due(_utcnow())
-            if n:
-                log.info("Личная рассылка: отправлено %d", n)
+            await personal.queue_due(_utcnow())
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка личной рассылки")
             await _alert_admin(
@@ -875,39 +721,12 @@ async def _serve(settings: Settings) -> None:
             )
 
     phone_texts = {
-        ("proxy", False): "📵 Телефон-прокси Авито <b>не отвечает</b>: нет связи, Wi-Fi включён "
-                          "или Tailscale выключен (открой Tailscale на телефоне). "
-                          "Авито не собирается, Яндекс без резерва. Напомню через 2 ч.",
-        ("proxy", True): "📶 Телефон-прокси Авито снова на связи.",
-        ("control", False): "⚠️ Нет управления телефоном (adb) — IP при бане не сменится. "
-                            "Скорее всего телефон перезагрузился: подключи к ПК и выполни "
-                            "<code>adb tcpip 5555</code>.",
-        ("control", True): "✅ Управление телефоном (adb) восстановлено.",
+        "proxy": {False: "Телефон-прокси Авито не отвечает.", True: "Телефон-прокси на связи."},
+        "control": {False: "Нет управления телефоном (adb).", True: "Управление восстановлено."},
     }
-    phone_monitor = (
-        avito_access.PhoneMonitor(
-            proxy=settings.avito_proxy, control_cmd=settings.avito_phone_check_cmd
-        )
-        if settings.avito_enabled and settings.avito_browser_warmup and settings.avito_proxy
-        else None
-    )
-
-    async def phone_job() -> None:
-        for part, ok in await phone_monitor.check():
-            await _alert_admin(phone_texts[(part, ok)], key=f"phone:{part}", cooldown_h=0)
-
     scheduler = AsyncIOScheduler()
-    intervals = {
-        Source.AVITO.value: settings.avito_collect_interval_min,
-        Source.YANDEX.value: settings.yandex_collect_interval_min,
-    }
-    for collector in collectors:
-        minutes = max(settings.collect_interval_min, intervals.get(collector.source_name, 0), 1)
-        scheduler.add_job(collect_source_job, "interval", args=[collector], minutes=minutes,
-                          id=f"collect-{collector.source_name}", coalesce=True)
     scheduler.add_job(market_job, "interval", minutes=30, next_run_time=datetime.now(UTC))
-    if phone_monitor is not None:
-        scheduler.add_job(phone_job, "interval", minutes=max(1, settings.avito_phone_check_min))
+    scheduler.add_job(check_source_health, "interval", seconds=30)
     # Публичный постинг: по часам-пикам (MSK), иначе — почасовой запасной режим.
     post_hours = settings.public_post_hours.strip()
     if post_hours:
@@ -941,31 +760,14 @@ async def _serve(settings: Settings) -> None:
 
     async def immediate_worker() -> None:
         while True:
-            await immediate_delivery.wait()
-            immediate_delivery.clear()
-            batch = list(changes.values())
-            changes.clear()
             try:
-                await personal.queue_changes(batch)
+                await personal.poll_outbox(_utcnow())
             except Exception:
-                log.exception("Immediate dispatch failed; scheduled scan will recover")
-
-    async def enrichment_worker() -> None:
-        while True:
-            await enrichment_requested.wait()
-            enrichment_requested.clear()
-            await enrich_job()
+                log.exception("Could not read the delivery outbox")
+            await asyncio.sleep(1)
 
     delivery_task = asyncio.create_task(immediate_worker())
-    enrichment_task = asyncio.create_task(enrichment_worker())
-    startup_task = None
-
-    async def startup_jobs() -> None:
-        # На старте — сбор + первый vision-проход (чтобы БД и личка сразу со свежими
-        # данными и анализом). Публичный постинг НЕ дёргаем: иначе каждый рестарт =
-        # пачка постов в канал. Он пойдёт по расписанию (раз в poll_interval_min).
-        await collect_job()
-        await vision_job()
+    startup_task = asyncio.create_task(vision_job())
 
     try:
         if bot is not None:
@@ -993,15 +795,26 @@ async def _serve(settings: Settings) -> None:
                 if not _is_admin(message):
                     return
                 now = _utcnow()
-                health_icons = {"ok": "🟢", "partial": "🟡", "down": "🔴", "degraded": "🟡"}
-                if source_health:
-                    src = "  ".join(
-                        f"{health_icons[s]} {n} (+{latest_counts.get(n, 0)}, "
-                        f"{int((now - source_checked[n]).total_seconds())} с назад)"
-                        for n, s in sorted(source_health.items())
+                worker_rows = await worker_state.read()
+                lines = []
+                for source in SOURCES:
+                    row = worker_rows.get(source)
+                    if not source_enabled(settings, source):
+                        lines.append(f"{source}: отключён")
+                        continue
+                    if row is None:
+                        lines.append(f"{source}: нет сигнала")
+                        continue
+                    age = int((now - row.heartbeat).total_seconds())
+                    state = "offline" if age > STALE_AFTER.total_seconds() else row.state
+                    started = moscow_when(row.started_at, now) if row.started_at else "—"
+                    last = moscow_when(row.last_success, now) if row.last_success else "—"
+                    lines.append(
+                        f"{source}: {state}, сигнал {age} с, старт {started}, "
+                        f"успех {last}, +{row.new_count}, Δ{row.changed_count}"
                     )
-                else:
-                    src = "ещё не собирал"
+                src = "\n".join(lines)
+                oldest, retries, uncertain = await personal.outbox.metrics(now)
                 total = await storage.count_listings()
                 since = now - timedelta(hours=24)
                 vqueue = (await storage.count_unanalyzed("Москва", since)
@@ -1027,9 +840,9 @@ async def _serve(settings: Settings) -> None:
                     pub += " ⏸ПАУЗА"
                 await message.answer(
                     "🩺 <b>Health</b>\n"
-                    f"Площадки: {src}\n"
-                    f"Сбор: {_ago(runtime['last_collect_at'])} "
-                    f"(+{runtime['last_collect_new'] or 0} новых)\n"
+                    f"{src}\n"
+                    f"Рассылка: ожидание {oldest} с, повторы {retries}, "
+                    f"неподтверждённые {uncertain}\n"
                     f"Паблик: {pub}\n"
                     f"Лотов в БД: {total} · очередь vision: {vqueue}\n"
                     f"Память: {mem_s} · аптайм: {up // 60}ч {up % 60}м"
@@ -1040,13 +853,18 @@ async def _serve(settings: Settings) -> None:
                 """Админ: форснуть сбор площадок прямо сейчас."""
                 if not _is_admin(message):
                     return
-                await message.answer("⏳ Запускаю сбор…")
-                counts = await collect_job()
-                running = sum(count is None for count in counts)
-                await message.answer(
-                    f"Новых объявлений: {sum(count or 0 for count in counts)}. "
-                    f"Уже выполнялось сборов: {running}. /health — детали."
-                )
+                labels = {
+                    "requested": "запрошен", "running": "уже выполняется",
+                    "queued": "уже запрошен", "offline": "нет связи", "disabled": "отключён",
+                }
+                now = _utcnow()
+                results = []
+                for source in SOURCES:
+                    state = "disabled"
+                    if source_enabled(settings, source):
+                        state = await worker_state.request(source, now)
+                    results.append(f"{source}: {labels[state]}")
+                await message.answer("\n".join(results) + "\n/health — результаты.")
 
             @dp.message(Command("pausepublic"))
             async def _pause_public(message: Message) -> None:
@@ -1109,7 +927,7 @@ async def _serve(settings: Settings) -> None:
                 """Админ: список админ-команд."""
                 if not _is_admin(message):
                     return
-                cc = "\n/cc &lt;задача&gt; · /cc apply — правки кодом через Claude"
+                cc = "\n/cc &lt;задача&gt; — подготовить правку через Claude"
                 await message.answer(
                     "🛠 <b>Админ-команды</b>\n"
                     "/health — состояние системы\n"
@@ -1153,7 +971,7 @@ async def _serve(settings: Settings) -> None:
                         f"<pre>{html.escape((res.get('pytest') or '')[:500])}</pre>"
                         f"💳 ≈${float(res.get('cost') or 0):.3f} (по подписке не списывается)"
                         f"{warn}\n\n"
-                        "Выкатить на прод: <code>/cc apply</code>"
+                        "Выпуск — через релизный скрипт на VPS."
                     )
                 else:
                     await message.answer(
@@ -1175,34 +993,16 @@ async def _serve(settings: Settings) -> None:
                 body = parts[1].strip() if len(parts) > 1 else ""
 
                 if body.lower() == "apply":
-                    await message.answer("⏳ Вливаю ветку в main…")
-                    res = await ccagent.apply()
-                    st = res.get("status")
-                    if st == "applied":
-                        await message.answer(
-                            f"✅ Ветка <code>{html.escape(res.get('branch', ''))}</code> "
-                            "влита в main. Перезапускаю сервис — вернусь через ~10 сек."
-                        )
-                        await asyncio.sleep(1)  # дать сообщению уйти до рестарта
-                        subprocess.Popen(["systemctl", "restart", "rentradar"])
-                    elif st == "nothing":
-                        await message.answer("Нечего применять — сначала /cc &lt;задача&gt;.")
-                    elif st == "conflict":
-                        cbr = html.escape(res.get("branch", ""))
-                        await message.answer(
-                            f"⚠️ Конфликт при вливании <code>{cbr}</code> "
-                            "— нужно разрулить вручную на сервере."
-                        )
-                    else:
-                        emsg = html.escape(str(res.get("msg") or res))[:400]
-                        await message.answer("❌ Не удалось применить: " + emsg)
+                    await message.answer(
+                        "Выпуск требует переключения всех служб. "
+                        "Используйте релизный скрипт на VPS."
+                    )
                     return
 
                 if not body:
                     await message.answer(
                         "Использование:\n<code>/cc задача текстом</code> — Claude сделает "
-                        "правку в ветке и покажет дифф\n"
-                        "<code>/cc apply</code> — выкатить последнюю на прод"
+                        "правку в ветке и покажет дифф"
                     )
                     return
 
@@ -1218,19 +1018,15 @@ async def _serve(settings: Settings) -> None:
 
                 asyncio.create_task(_bg())  # не блокируем поллинг на минуты
 
-            startup_task = asyncio.create_task(startup_jobs())  # параллельно с поллингом
             log.info("Бот на связи: /start /new /myfilters /status /buy · админ: /admin")
             await dp.start_polling(bot, polling_timeout=POLL_TIMEOUT)
         else:
-            await startup_jobs()
-            await asyncio.Event().wait()  # dry-run/без токена: только публичный канал
+            await run_until_signal(asyncio.Event().wait())
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Остановка serve по сигналу")
     finally:
         scheduler.shutdown(wait=False)
-        tasks = [
-            task for task in (delivery_task, enrichment_task, startup_task) if task is not None
-        ]
+        tasks = [delivery_task, startup_task]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1288,14 +1084,46 @@ _COMMANDS = {
 }
 
 
+async def _worker(settings: Settings, source: str) -> None:
+    profiles = _load_profiles_or_warn(settings)
+    if not profiles:
+        raise RuntimeError("No collection profiles configured")
+    storage = SqlStorage(settings.db_url, db_path=settings.db_path)
+    try:
+        await storage.require_worker_schema()
+        await run_until_signal(run_worker(settings, source, profiles, storage))
+    finally:
+        await storage.dispose()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="rentradar")
-    parser.add_argument("command", choices=list(_COMMANDS), help="команда")
+    parser.add_argument("command", choices=[*_COMMANDS, "worker"], help="команда")
+    parser.add_argument("--source", choices=SOURCES)
     args = parser.parse_args()
+    if (args.command == "worker") != (args.source is not None):
+        parser.error("--source is required for worker and only supported by worker")
 
     settings = Settings()
+    settings.db_path = settings.db_path.resolve()
     _setup_logging(settings.log_level)
-    asyncio.run(_COMMANDS[args.command](settings))
+    configure_database(settings.db_path)
+    with ExitStack() as locks:
+        if args.command == "worker":
+            locks.enter_context(owner(settings.db_path, args.source))
+            log_start("collector", args.source)
+            asyncio.run(_worker(settings, args.source))
+            return
+        if args.command in ("collect", "run"):
+            for source in SOURCES:
+                if source_enabled(settings, source):
+                    locks.enter_context(owner(settings.db_path, source))
+        if args.command == "serve":
+            locks.enter_context(owner(settings.db_path, "bot"))
+            log_start("bot")
+        if args.command in ("init-db", "collect", "run", "recompute-stats", "vision-test"):
+            locks.enter_context(owner(settings.db_path, "migration"))
+        asyncio.run(_COMMANDS[args.command](settings))
 
 
 if __name__ == "__main__":

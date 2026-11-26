@@ -30,6 +30,7 @@ from ..models import (
     RawListing,
     Source,
 )
+from ..runtime import mobile_request
 from .base import HttpCollector
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ class _CffiClient:
     """Минимальная обёртка curl_cffi AsyncSession под интерфейс httpx-клиента."""
 
     def __init__(self, *, follow_redirects: bool, proxy: str | None) -> None:
+        self._proxy = proxy
         self._follow = follow_redirects
         self._session = AsyncSession(
             impersonate=_IMPERSONATE, proxy=proxy, allow_redirects=follow_redirects
@@ -74,9 +76,10 @@ class _CffiClient:
     async def request(self, method: str, url: str, **kwargs: object) -> _CffiResponse:
         follow = kwargs.pop("follow_redirects", self._follow)
         try:
-            resp = await self._session.request(  # type: ignore[call-overload]
-                method, url, allow_redirects=follow, **kwargs
-            )
+            async with mobile_request(self._proxy):
+                resp = await self._session.request(  # type: ignore[call-overload]
+                    method, url, allow_redirects=follow, **kwargs
+                )
         except CurlError as exc:
             raise httpx.HTTPError(str(exc)) from exc
         return _CffiResponse(resp)

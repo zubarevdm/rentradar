@@ -16,6 +16,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -80,6 +81,7 @@ class ListingRow(Base):
     vision_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Дообогащение с детальной страницы площадки (Авито)
     enriched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    detail_photos: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     photos: Mapped[list] = mapped_column(JSON, default=list)
     contact_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
@@ -96,6 +98,43 @@ class MarketStatRow(Base):
     median_price_per_m2: Mapped[float | None] = mapped_column(Float, nullable=True)
     sample_size: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ListingEventRow(Base):
+    __tablename__ = "listing_events"
+    __table_args__ = ({"sqlite_autoincrement": True},)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(16))
+    external_id: Mapped[str] = mapped_column(String(64))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class RecipientTaskRow(Base):
+    __tablename__ = "recipient_tasks"
+    __table_args__ = (Index("ix_recipient_ready", "ready_at", "user_id"),)
+
+    user_id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(16))
+    external_id: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    ready_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class CollectorStateRow(Base):
+    __tablename__ = "collector_state"
+
+    source: Mapped[str] = mapped_column(String(16), primary_key=True)
+    heartbeat: Mapped[datetime] = mapped_column(DateTime)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_success: Mapped[datetime | None] = mapped_column(DateTime)
+    requested: Mapped[bool] = mapped_column(default=False)
+    state: Mapped[str] = mapped_column(String(24))
+    new_count: Mapped[int] = mapped_column(default=0)
+    changed_count: Mapped[int] = mapped_column(default=0)
+    failures: Mapped[int] = mapped_column(default=0)
+    phone: Mapped[dict[str, bool]] = mapped_column(JSON, default=dict)
 
 
 class PostedRow(Base):

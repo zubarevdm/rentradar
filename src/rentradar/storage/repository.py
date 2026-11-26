@@ -27,7 +27,9 @@ from ..models import (
     Source,
     build_segment_keys,
 )
-from .orm import Base, ListingRow, MarketStatRow, PostedRow
+from .orm import Base, DataVersionRow, ListingEventRow, ListingRow, MarketStatRow, PostedRow
+
+_WORKER_SCHEMA = "collector_outbox_v1"
 
 
 class SqlStorage(Storage):
@@ -53,6 +55,15 @@ class SqlStorage(Storage):
                 lambda connection: _migrate_access(connection, migration_now, pause_max_days)
             )
             await conn.run_sync(_backfill_flags)
+            # The old database has no outbox. Start with the next commit only.
+            await conn.execute(insert(DataVersionRow).values(
+                name=_WORKER_SCHEMA,
+            ).on_conflict_do_nothing())
+
+    async def require_worker_schema(self) -> None:
+        async with self._session() as session:
+            if await session.get(DataVersionRow, _WORKER_SCHEMA) is None:
+                raise RuntimeError("Run rentradar init-db before starting services")
 
     async def upsert_listings(self, listings: Sequence[Listing]) -> list[Listing]:
         """Сохранить НОВЫЕ лоты; вернуть их. Дубль определяется по (source,
@@ -88,7 +99,6 @@ class SqlStorage(Storage):
                     if row.price != listing.price:
                         row.price = listing.price
                         row.fingerprint = listing.fingerprint
-                        row.collected_at = listing.collected_at
                         if listing.source == Source.AVITO:
                             # An old deposit expressed in monthly rents was
                             # computed against the previous price. Re-read the
@@ -99,6 +109,8 @@ class SqlStorage(Storage):
                             row.deposit_due_rub = None
                             row.deposit_installments = False
                             row.upfront_payments = {}
+                            if row.enriched_at is not None and row.photos:
+                                row.detail_photos = True
                             row.enriched_at = None
                     if listing.source != Source.AVITO:
                         for field in (
@@ -114,7 +126,11 @@ class SqlStorage(Storage):
                     row.metro_distance_min = listing.metro_distance_min
                     row.metro_line = listing.metro_line
                     row.metro_line_color = listing.metro_line_color
-                    if listing.photos and listing.photos != row.photos:
+                    if listing.photos and listing.photos != row.photos and (
+                        listing.source != Source.AVITO
+                        or not row.photos
+                        or (not row.detail_photos and row.enriched_at is None)
+                    ):
                         _replace_photos(row, listing.photos)
                     if listing.source == Source.AVITO and row.enriched_at is None:
                         # A repeated search card can add terms even when its price
@@ -137,11 +153,12 @@ class SqlStorage(Storage):
                             row.commission_pct = listing.commission_pct
                             row.commission_rub = listing.commission_rub
                     if session.is_modified(row):
-                        row.collected_at = listing.collected_at
+                        row.collected_at = max(row.collected_at, listing.collected_at)
                         changed.append(_row_to_listing(row))
                     continue
                 session.add(_to_row(listing))
                 new_items.append(listing)
+            session.add_all(_listing_event(item) for item in (*new_items, *changed))
             await session.commit()
         return new_items, [*new_items, *changed]
 
@@ -281,12 +298,6 @@ class SqlStorage(Storage):
             )
             if row is None or (expected_price is not None and row.price != expected_price):
                 return None
-            previous_conditions = (
-                row.commission_rub,
-                row.commission_pct,
-                row.description,
-                bool(row.photos),
-            )
             if description is not None:
                 row.description = description[:4000]
             if deposit_present:
@@ -309,19 +320,23 @@ class SqlStorage(Storage):
             row.upfront_payments = upfront_payments or {}
             if meters_included is not None:
                 row.meters_included = meters_included
-            if photos and photos != row.photos:
-                _replace_photos(row, photos)
+            if photos:
+                row.detail_photos = True
+                if photos != row.photos:
+                    _replace_photos(row, photos)
             incomplete = (
                 (not deposit_present and row.deposit_rub is None)
                 or (not commission_present and row.commission_pct is None
                     and row.commission_rub is None)
             )
-            row.enriched_at = None if incomplete else enriched_at
-            conditions = (row.commission_rub, row.commission_pct, row.description, bool(row.photos))
-            if previous_conditions != conditions:
+            changed = session.is_modified(row) or (not incomplete and row.enriched_at is None)
+            row.enriched_at = None if incomplete else (row.enriched_at or enriched_at)
+            if changed:
                 row.collected_at = max(row.collected_at, enriched_at)
+                listing = _row_to_listing(row)
+                session.add(_listing_event(listing))
             await session.commit()
-            return _row_to_listing(row) if previous_conditions != conditions else None
+            return listing if changed else None
 
     async def defer_analysis(self, listing: Listing, until: datetime) -> None:
         async with self._session() as session:
@@ -402,6 +417,13 @@ class SqlStorage(Storage):
 
     async def dispose(self) -> None:
         await self._engine.dispose()
+
+
+def _listing_event(listing: Listing) -> ListingEventRow:
+    return ListingEventRow(
+        source=listing.source.value, external_id=listing.external_id,
+        occurred_at=datetime.now(UTC).replace(tzinfo=None),
+    )
 
 
 def _market_snapshot(rows) -> list[dict]:

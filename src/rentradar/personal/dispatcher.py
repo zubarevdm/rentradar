@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 from weakref import WeakValueDictionary
@@ -21,7 +22,8 @@ from ..interfaces import Publisher, ScoringEngine
 from ..models import Listing, ScoredListing, source_rank
 from ..storage import SqlStorage
 from .filters import MIN_INTERVAL_MIN, UserFilter, matches
-from .store import PersonalStore
+from .outbox import Outbox
+from .store import MAX_DELIVERY_ATTEMPTS, PersonalStore
 
 logger = logging.getLogger(__name__)
 
@@ -43,33 +45,54 @@ class PersonalDispatcher:
         self._settings = settings
         self._user_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._dispatch_slots = asyncio.Semaphore(4)
-        self._pending: dict[int, dict[tuple[str, str], Listing]] = {}
-        self._workers: dict[int, asyncio.Task] = {}
+        self.outbox = Outbox(store)
+        self._immediate_tasks: dict[int, asyncio.Task] = {}
+        self._due_tasks: dict[int, asyncio.Task] = {}
 
-    async def queue_changes(self, listings: list[Listing]) -> None:
-        """A slow chat holds only its own batch. The scheduled scan recovers after restart."""
+    async def poll_outbox(self, now: datetime) -> None:
         if getattr(self._publisher, "simulated", False):
             return
-        users = {flt.user_id for flt in await self._ps.all_active_filters()
-                 if flt.clamp_interval() == MIN_INTERVAL_MIN and flt.last_checked_at is not None}
-        for user_id in users:
-            batch = self._pending.setdefault(user_id, {})
-            batch.update(((lst.source.value, lst.external_id), lst) for lst in listings)
-            if user_id not in self._workers:
-                self._workers[user_id] = asyncio.create_task(self._drain_changes(user_id))
+        await self.outbox.expand(now, now - timedelta(hours=self._settings.personal_lookback_hours))
+        for user_id in await self.outbox.ready(now):
+            if user_id not in self._immediate_tasks:
+                self._start(self._immediate_tasks, user_id, self._dispatch_task(user_id))
 
-    async def _drain_changes(self, user_id: int) -> None:
-        try:
-            while batch := self._pending.pop(user_id, None):
-                await self._dispatch_users(
-                    {user_id: []}, datetime.now(UTC).replace(tzinfo=None),
-                    immediate=True, batch=list(batch.values()),
+    async def queue_due(self, now: datetime) -> None:
+        users: dict[int, list[int]] = defaultdict(list)
+        for filter_id, flt in await self._ps.due_filters(now):
+            users[flt.user_id].append(filter_id)
+        for user_id, ids in users.items():
+            if user_id not in self._due_tasks:
+                self._start(
+                    self._due_tasks, user_id,
+                    self._dispatch_users({user_id: ids}, now, immediate=False),
                 )
-        finally:
-            self._workers.pop(user_id, None)
+
+    def _start(self, tasks: dict[int, asyncio.Task], user_id: int, work: Coroutine) -> None:
+        task = asyncio.create_task(work)
+        tasks[user_id] = task
+
+        def done(finished: asyncio.Task) -> None:
+            tasks.pop(user_id, None)
+            if not finished.cancelled() and (error := finished.exception()) is not None:
+                logger.error("Delivery job failed", exc_info=error)
+
+        task.add_done_callback(done)
+
+    async def _dispatch_task(self, user_id: int) -> None:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        event_ids, listings = await self.outbox.batch(user_id, now)
+        incomplete: set[int] = set()
+        await self._dispatch_users(
+            {user_id: []}, now, immediate=True, batch=listings, incomplete=incomplete,
+        )
+        await self.outbox.finish(
+            user_id, event_ids, datetime.now(UTC).replace(tzinfo=None),
+            complete=user_id not in incomplete,
+        )
 
     async def close(self) -> None:
-        tasks = list(self._workers.values())
+        tasks = [*self._immediate_tasks.values(), *self._due_tasks.values()]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -93,6 +116,7 @@ class PersonalDispatcher:
     async def _dispatch_users(
         self, users: dict[int, list[int]], now: datetime, *, immediate: bool,
         batch: list[Listing] | None = None,
+        incomplete: set[int] | None = None,
     ) -> int:
         started = monotonic()
 
@@ -120,9 +144,13 @@ class PersonalDispatcher:
                             filter_id, flt, now, started=started, fresh_only=immediate, batch=batch,
                         )
                         total += sent
+                        if not complete and incomplete is not None:
+                            incomplete.add(user_id)
                         if complete and not immediate:
                             await self._ps.touch_filter(filter_id, now)
                 except Exception:
+                    if incomplete is not None:
+                        incomplete.add(user_id)
                     logger.exception("Ошибка рассылки для получателя %s", user_id)
                 return total
 
@@ -209,6 +237,8 @@ class PersonalDispatcher:
             if not fresh and backlog_attempts >= backlog_cap:
                 break
             attempt = attempts.get(content_key)
+            if attempt and attempt.attempts >= MAX_DELIVERY_ATTEMPTS:
+                continue
             if attempt and attempt.retry_at > now:
                 pending_fresh = True
                 continue
@@ -218,7 +248,12 @@ class PersonalDispatcher:
                 return sent, False
 
             current = await self._storage.get_listing(listing.source.value, listing.external_id)
-            if current is None or not matches(current, flt):
+            current_filter = await self._ps.get_filter(filter_id)
+            if current_filter is None or not current_filter[1].active:
+                return sent, True
+            if fresh_only and current_filter[1].clamp_interval() != MIN_INTERVAL_MIN:
+                return sent, True
+            if current is None or not current.photos or not matches(current, current_filter[1]):
                 continue
             listing = current
             score = await self._scoring.score(listing, profile)
@@ -231,6 +266,8 @@ class PersonalDispatcher:
             else:
                 backlog_attempts += 1
             sending_at = now + timedelta(seconds=monotonic() - started)
+            if not await self._ps.is_active(flt.user_id, sending_at):
+                return sent, False
             if not await self._ps.claim_delivery(flt.user_id, content_key, sending_at):
                 continue
             try:

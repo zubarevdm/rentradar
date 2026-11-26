@@ -2,7 +2,6 @@
 
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -69,7 +68,7 @@ def test_summary_deposit_with_schedule_in_description(description, due, total):
     assert card.deposit_due == due and card.move_in_total == total
 
 
-async def test_same_price_recollection_then_blocked_detail_keeps_total(tmp_path, monkeypatch):
+async def test_same_price_recollection_keeps_total_in_cached_card(tmp_path):
     storage = SqlStorage(f"sqlite+aiosqlite:///{(tmp_path / 'search.db').as_posix()}")
     await storage.init()
     try:
@@ -79,9 +78,6 @@ async def test_same_price_recollection_then_blocked_detail_keeps_total(tmp_path,
         assert await storage.upsert_listings([fresh]) == []  # No duplicate delivery.
         saved = (await storage.recent_listings("Москва", datetime(2020, 1, 1)))[0]
         assert saved.move_in_total == 320000
-        monkeypatch.setattr(
-            "rentradar.publisher.telegram.fetch_detail", AsyncMock(return_value=None)
-        )
         bot = FakeBot()
         pub = TelegramPublisher(dry_run=False, bot=bot)
         assert await pub.publish(ScoredListing(listing=saved, score=ScoreBreakdown(total=70)),
