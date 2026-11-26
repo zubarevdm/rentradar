@@ -107,6 +107,8 @@ class Services:
                     capture_output=True, text=True, check=False,
                 )
                 result[role] = log.stdout
+            else:
+                result[f"{role}_exit"] = process.poll()
         return result
 
 
@@ -168,11 +170,19 @@ async def test_source_stop_watchdog_and_recovery(shared):
     storage, services = shared
     await subscribe(storage, 1001)
     states = WorkerState(storage)
-    for role in ("bot", "avito", "cian", "yandex"):
+    services.start("bot")
+    await wait_sync(
+        services, lambda: any(row[0] == "bot" for row in services.records()), timeout=45,
+    )
+    for role in ("avito", "cian", "yandex"):
         services.start(role)
+
+        async def registered(source=role):
+            return source in (await states.read())
+
+        await wait_for(services, registered, timeout=45)
     avito_pid = services.pid("avito")
     bot_pid = services.pid("bot")
-    await wait_sync(services, lambda: any(row[0] == "bot" for row in services.records()))
     polling_pid = next(row[1] for row in services.records() if row[0] == "bot")
     services.stop("avito")
     for role in ("cian", "yandex"):

@@ -17,31 +17,21 @@ import html
 import logging
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
-
-from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramForbiddenError
-from aiogram.filters import Command
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import ccagent
 from .config import SearchProfile, Settings, load_emoji, load_profiles
 from .models import Listing, ScoredListing, source_rank
 from .personal import PersonalStore
 from .personal.access import TARIFFS, TRIAL, access_of, moscow_when, plural
-from .personal.bot import build_router
 from .personal.dispatcher import PersonalDispatcher
 from .personal.filters import matches
-from .personal.navigation import nudge_keyboard
 from .pipeline import Pipeline
-from .publisher import TelegramPublisher
 from .runtime import configure_database, log_start, owner, run_until_signal
 from .scoring import TastyScoringEngine
 from .storage import SqlMarketStatsProvider, SqlStorage
 from .storage.orm import SubscriberRow
-from .tg import POLL_TIMEOUT, make_bot
 from .vision import VisionQuotaError, build_analyzer
 from .worker import (
     SOURCES,
@@ -53,6 +43,9 @@ from .worker import (
 )
 
 log = logging.getLogger("rentradar")
+
+if TYPE_CHECKING:
+    from .publisher import TelegramPublisher
 
 # Сколько сборов подряд площадка должна не собраться, чтобы алертить 🔴.
 SOURCE_DOWN_AFTER = 3
@@ -251,6 +244,8 @@ def _build_collectors(settings: Settings) -> list:
 
 
 def _build_pipeline(settings: Settings, storage: SqlStorage) -> tuple[Pipeline, TelegramPublisher]:
+    from .publisher import TelegramPublisher
+
     publisher = TelegramPublisher.from_settings(settings, storage=storage)
     pipeline = Pipeline(
         collectors=_build_collectors(settings),
@@ -305,6 +300,18 @@ async def _serve(settings: Settings) -> None:
     Развязка частот: сбор площадок — часто (питает всё), публичный топ-5 — раз в
     час, личная рассылка — каждую минуту (по интервалу каждого пользователя).
     """
+    from aiogram import Bot, Dispatcher
+    from aiogram.exceptions import TelegramForbiddenError
+    from aiogram.filters import Command
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.types import Message
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from .personal.bot import build_router
+    from .personal.navigation import nudge_keyboard
+    from .publisher import TelegramPublisher
+    from .tg import POLL_TIMEOUT, make_bot
+
     profiles = _load_profiles_or_warn(settings)
     if not profiles:
         return

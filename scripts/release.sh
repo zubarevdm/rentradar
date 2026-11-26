@@ -110,7 +110,7 @@ restore() {
     systemctl is-active --quiet rentradar.service || return 1
     if [[ -n ${target:-} ]]; then
         local attempt
-        for attempt in {1..15}; do
+        for attempt in {1..45}; do
             if verify "$old"; then break; fi
             sleep 1
         done
@@ -208,7 +208,7 @@ case "${1:-}" in
         systemctl daemon-reload
         systemctl enable "${units[@]}"
         systemctl start "${units[@]}"
-        for attempt in {1..15}; do
+        for attempt in {1..45}; do
             if verify "$sha"; then break; fi
             sleep 1
         done

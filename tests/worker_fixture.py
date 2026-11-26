@@ -9,7 +9,6 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 from sqlalchemy import event
 from sqlalchemy.orm import Session
@@ -18,13 +17,9 @@ from rentradar.config import SearchProfile, Settings
 from rentradar.errors import CollectorBlockedError
 from rentradar.interfaces import BaseCollector
 from rentradar.models import DealType, Listing, PropertyType, RawListing, Source
-from rentradar.personal.bot import build_router
-from rentradar.personal.dispatcher import PersonalDispatcher
 from rentradar.personal.outbox import Outbox
 from rentradar.personal.store import PersonalStore
-from rentradar.publisher import TelegramPublisher
 from rentradar.runtime import notify_systemd, owner, run_until_signal
-from rentradar.scoring import PlaceholderScoringEngine
 from rentradar.storage import SqlStorage
 from rentradar.worker import run_worker, utcnow
 
@@ -94,6 +89,13 @@ class Telegram:
 
 
 async def telegram_role(folder: Path, settings: Settings, storage: SqlStorage) -> None:
+    from unittest.mock import AsyncMock
+
+    from rentradar.personal.bot import build_router
+    from rentradar.personal.dispatcher import PersonalDispatcher
+    from rentradar.publisher import TelegramPublisher
+    from rentradar.scoring import PlaceholderScoringEngine
+
     store = PersonalStore(storage)
     publisher = TelegramPublisher(dry_run=False, bot=Telegram(folder))
     publisher._download_photos = AsyncMock(side_effect=lambda urls, **_: urls)
