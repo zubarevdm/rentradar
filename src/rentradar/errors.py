@@ -20,6 +20,10 @@ class CollectionSkipped(CollectorError):
     """The source was intentionally not polled."""
 
 
+class DetailDeferred(CollectorError):
+    """The card could not be enriched within its own resource budget."""
+
+
 class DeliveryUncertain(Exception):
     """The request may have reached Telegram but no acknowledgement arrived."""
 

@@ -97,6 +97,9 @@ class Settings(BaseSettings):
     collect_interval_min: float = 2.5
     yandex_collect_interval_min: float = 0  # zero follows the shared collection interval
     worker_pass_timeout_sec: float = Field(default=240, ge=1)
+    avito_detail_parse_timeout_sec: float = Field(default=8, gt=0)
+    avito_detail_run_timeout_sec: float = Field(default=60, gt=0)
+    avito_browser_timeout_sec: float = Field(default=25, gt=0)
     # Окно для расчёта рыночных медиан, дней (старые цены не тянут медиану).
     # Сами лоты НЕ удаляются — окно влияет только на расчёт, история хранится.
     market_window_days: int = 90

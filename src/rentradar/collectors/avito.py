@@ -23,16 +23,18 @@ import re
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
+from random import uniform
 from typing import NamedTuple
 
 from curl_cffi import requests as cffi_requests
 from selectolax.parser import HTMLParser
 
 from ..config import SearchProfile
-from ..errors import CollectionSkipped, CollectorBlockedError
+from ..errors import CollectionSkipped, CollectorBlockedError, DetailDeferred
 from ..models import DealType, Listing, PropertyType, RawListing, Source
 from ..photos import detail_photos, largest_srcset
-from ..runtime import mobile_request
+from ..runtime import mobile_request, route_path, run_child
 from . import avito_access
 from .base import HttpCollector
 
@@ -72,12 +74,68 @@ _rotator = _FingerprintRotator(_IMPERSONATE_PROFILES)
 _blocked_until: dict[str, float] = {}
 _request_locks: dict[str, asyncio.Lock] = {}
 _block_cooldown_seconds = 12 * 60.0
+_DETAIL_BYTES = 8 * 1024 * 1024
 
 
 def set_request_cooldown(seconds: float) -> None:
     """Use the existing configured source interval for all Avito callers."""
     global _block_cooldown_seconds
     _block_cooldown_seconds = max(1.0, seconds)
+
+
+def _cooldown_record(proxy: str | None) -> tuple[float, int]:
+    path = route_path(proxy, direct_owner="avito")
+    if path is not None:
+        try:
+            until, count = json.loads(path.with_suffix(".avito-cooldown").read_text())
+            return float(until), int(count)
+        except FileNotFoundError:
+            pass
+        except (OSError, TypeError, ValueError):
+            logger.warning("avito: cannot read stored cooldown")
+    return 0.0, 0
+
+
+def _in_cooldown(proxy: str | None) -> bool:
+    return (time.monotonic() < _blocked_until.get(proxy or "direct", 0)
+            or time.time() < _cooldown_record(proxy)[0])
+
+
+def _retry_after(response) -> float:
+    value = str((getattr(response, "headers", None) or {}).get("Retry-After", "")).strip()
+    try:
+        if value.isdecimal():
+            return float(value)
+        when = parsedate_to_datetime(value)
+        return max(0.0, when.timestamp() - time.time()) if when.tzinfo else 0.0
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _pause_route(proxy: str | None, reason: str, retry_after: float = 0) -> None:
+    now = time.time()
+    prior_until, prior_count = _cooldown_record(proxy)
+    count = min(6, prior_count + 1) if now - prior_until < 3600 else 1
+    backoff = min(max(_block_cooldown_seconds, 1800), _block_cooldown_seconds * 2 ** (count - 1))
+    delay = max(retry_after, backoff, prior_until - now) + uniform(0, min(15, backoff * .05))
+    _blocked_until[proxy or "direct"] = time.monotonic() + delay
+    path = route_path(proxy, direct_owner="avito")
+    if path is not None:
+        stored = path.with_suffix(".avito-cooldown")
+        staged = path.with_suffix(".avito-cooldown.tmp")
+        try:
+            staged.write_text(json.dumps([now + delay, count]))
+            staged.replace(stored)
+        except OSError:
+            logger.exception("avito: cannot persist cooldown")
+    logger.warning("avito: %s, пауза запросов %.0f секунд", reason, delay)
+
+
+def _pause_on_http(response, proxy: str | None) -> bool:
+    if response.status_code in (403, 429):
+        _pause_route(proxy, f"HTTP {response.status_code}", _retry_after(response))
+        return True
+    return False
 
 
 def _blocking_get(
@@ -114,11 +172,10 @@ async def _avito_fetch_html(
     # Serialise the check and request: parallel recipients must not retry a ban.
     key = proxy or "direct"
     lock = _request_locks.setdefault(key, asyncio.Lock())
-    async with lock:
-        if time.monotonic() < _blocked_until.get(key, 0):
+    async with lock, mobile_request(proxy, direct_owner="avito"):
+        if _in_cooldown(proxy):
             return None
-        async with mobile_request(proxy):
-            return await _fetch_with_profiles(url, params=params, proxy=proxy, timeout=timeout)
+        return await _fetch_with_profiles(url, params=params, proxy=proxy, timeout=timeout)
 
 
 async def _fetch_with_profiles(
@@ -127,29 +184,26 @@ async def _fetch_with_profiles(
     access = avito_access.current()
     if access is not None and access.proxy == proxy:
         return await _fetch_with_access(access, url, params=params, timeout=timeout)
-    key = proxy or "direct"
     for imp in _rotator.order():
         try:
             resp = await asyncio.to_thread(_blocking_get, url, imp, params, proxy, timeout)
         except Exception as exc:  # noqa: BLE001 — сетевые/curl-ошибки: пробуем следующий
             logger.warning("avito curl_cffi[%s]: %s: %s", imp, type(exc).__name__, exc)
             continue
+        if _pause_on_http(resp, proxy):
+            return None
         prefix = resp.text[:4000].lower()
         challenge = any(text in prefix for text in (
             "доступ ограничен", "проверка безопасности", "подтвердите, что вы не робот",
         ))
-        if resp.status_code in (429, 439) or challenge:
-            retry = (getattr(resp, "headers", {}) or {}).get("Retry-After", "")
-            delay = max(_block_cooldown_seconds, float(retry) if str(retry).isdigit() else 0)
-            _blocked_until[key] = time.monotonic() + delay
-            logger.warning("avito: HTTP %s, пауза запросов %.0f секунд",
-                           resp.status_code, delay)
+        if resp.status_code == 439 or challenge:
+            _pause_route(proxy, f"challenge HTTP {resp.status_code}", _retry_after(resp))
             return None
         blocked = resp.status_code != 200
         if not blocked:
             _rotator.mark_good(imp)
             return resp.text
-    _blocked_until[key] = time.monotonic() + _block_cooldown_seconds
+    _pause_route(proxy, "network_or_http_error")
     return None
 
 
@@ -171,7 +225,6 @@ async def _fetch_with_access(
     """Мобильный прокси: curl_cffi с куками и UA профиля браузера.
 
     При блоке — прогрев/смена IP и повтор."""
-    key = access.proxy or "direct"
     for attempt in range(3):
         try:
             resp = await asyncio.to_thread(
@@ -181,6 +234,8 @@ async def _fetch_with_access(
         except Exception as exc:  # noqa: BLE001 — сеть/прокси (телефон переподключается)
             logger.warning("avito via proxy: %s: %s", type(exc).__name__, exc)
             break
+        if _pause_on_http(resp, access.proxy):
+            return None
         kind = _block_kind(resp)
         if kind is None:
             return resp.text
@@ -188,7 +243,7 @@ async def _fetch_with_access(
         # 1-й блок — прогрев (или смена IP, если IP); не помогло — сразу новый IP.
         if attempt == 2 or not await access.recover(ip_banned=kind == "ip", retry=attempt == 1):
             break
-    _blocked_until[key] = time.monotonic() + _block_cooldown_seconds
+    _pause_route(access.proxy, "access_unavailable")
     return None
 # Полноразмерные фото (1280x960) в JSON страницы объявления — экранированы: \"1280x960\":\"URL\".
 _FULL_PHOTO_RE = re.compile(r'\\"1280x960\\":\\"(https://[^\\"]+?)\\"')
@@ -406,6 +461,7 @@ async def fetch_detail(
     proxy: str | None = None,
     timeout: float = 25.0,
     limit: int = 10,
+    parse_timeout: float | None = None,
 ) -> AvitoDetail | None:
     """Со страницы объявления вытащить полноразмер-фото (1280x960), описание и
     условия въезда (залог/комиссия/счётчики).
@@ -417,7 +473,22 @@ async def fetch_detail(
     if html is None:
         logger.warning("avito detail: не открыл %s (отказ источника или пауза запросов)", url)
         return None
-    # Страница — мегабайты HTML/JSON: разбор в потоке, чтобы не стопорить бота.
+    if parse_timeout is not None:
+        if len(html.encode()) > _DETAIL_BYTES:
+            raise DetailDeferred("html_size_limit")
+        try:
+            output = await run_child(
+                "rentradar.collectors.avito_task", "parse",
+                data=json.dumps({"html": html, "price": price, "limit": limit},
+                                ensure_ascii=False).encode(),
+                seconds=parse_timeout,
+            )
+            payload = json.loads(output)
+            if "error" in payload:
+                raise DetailDeferred(payload["error"])
+            return AvitoDetail(**payload["result"]) if payload["result"] is not None else None
+        except (OSError, TimeoutError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            raise DetailDeferred(type(error).__name__) from error
     return await asyncio.to_thread(_detail_from_html, html, url, price, limit)
 
 
@@ -642,7 +713,7 @@ class AvitoCollector(HttpCollector):
         loop_now = asyncio.get_event_loop().time()
         if self._min_interval_sec and (loop_now - self._last_fetch_at) < self._min_interval_sec:
             raise CollectionSkipped("interval")
-        if time.monotonic() < _blocked_until.get(self._proxy or "direct", 0):
+        if _in_cooldown(self._proxy):
             raise CollectionSkipped("cooldown")
         self._last_fetch_at = loop_now
 

@@ -1,6 +1,8 @@
 import asyncio
+import time
 from types import SimpleNamespace
 
+from rentradar import runtime
 from rentradar.collectors import avito, avito_access
 
 
@@ -48,11 +50,21 @@ def test_challenge_warms_and_retries_with_cookies(monkeypatch, tmp_path):
     assert seen[-1] == {"ok": "1"}
 
 
-def test_ip_ban_requests_rotation(monkeypatch, tmp_path):
-    html, access, _ = _run(monkeypatch, tmp_path, [
-        _resp(403, "Доступ ограничен: проблема с IP"), _resp(200, "ok"),
-    ])
-    assert html == "ok" and access.recovered == [True]
+def test_http_forbidden_pauses_without_inline_recovery(monkeypatch, tmp_path):
+    html, access, seen = _run(monkeypatch, tmp_path, [_resp(403, "Доступ ограничен")])
+    assert html is None and not access.recovered and len(seen) == 1
+
+
+def test_mobile_rate_limit_persists_between_processes(monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime, "_database", tmp_path / "app.db")
+    monkeypatch.setattr(avito, "_blocked_until", {})
+    limited = _resp(429, "limited")
+    limited.headers["Retry-After"] = "1700"
+    html, access, seen = _run(monkeypatch, tmp_path, [limited])
+    assert html is None and not access.recovered and len(seen) == 1
+    avito._blocked_until.clear()
+    assert avito._in_cooldown(access.proxy)
+    assert avito._cooldown_record(access.proxy)[0] - time.time() >= 1699
 
 
 def test_second_block_retries_on_new_ip(monkeypatch, tmp_path):
