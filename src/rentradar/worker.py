@@ -5,18 +5,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert
 
 from .collectors import AvitoCollector, CianCollector, YandexCollector, avito_access
-from .collectors.avito import fetch_detail, set_request_cooldown
+from .collectors.avito import set_request_cooldown
 from .config import SearchProfile, Settings
-from .errors import CollectionSkipped, DetailDeferred
+from .errors import CollectionSkipped
 from .interfaces import BaseCollector
 from .models import Source
-from .personal.filters import matches
-from .personal.store import PersonalStore
 from .pipeline import CollectionProgress, collect_source
 from .runtime import mobile_request, notify_systemd
 from .storage import SqlStorage
@@ -24,6 +23,7 @@ from .storage.orm import CollectorStateRow
 
 log = logging.getLogger(__name__)
 SOURCES = tuple(s.value for s in (Source.AVITO, Source.CIAN, Source.YANDEX))
+DETAIL_ROLE = "avito_details"
 HEARTBEAT_SECONDS = 5
 STALE_AFTER = timedelta(seconds=20)
 
@@ -39,6 +39,14 @@ def build_collector(settings: Settings, source: str) -> BaseCollector:
         return YandexCollector(fallback_proxy=settings.yandex_fallback_proxy or None)
     if source != "avito":
         raise ValueError(f"Unknown source {source}")
+    configure_avito(settings)
+    return AvitoCollector(
+        proxy=settings.avito_proxy or None, max_pages=settings.avito_max_pages,
+        min_interval_sec=settings.avito_collect_interval_min * 60,
+    )
+
+
+def configure_avito(settings: Settings) -> None:
     set_request_cooldown(settings.avito_collect_interval_min * 60)
     if settings.avito_browser_warmup and settings.avito_proxy and avito_access.current() is None:
         avito_access.configure(avito_access.AvitoAccess(
@@ -49,10 +57,6 @@ def build_collector(settings: Settings, source: str) -> BaseCollector:
             rotate_wait_sec=settings.avito_rotate_wait_sec,
             warm_timeout=settings.avito_browser_timeout_sec,
         ))
-    return AvitoCollector(
-        proxy=settings.avito_proxy or None, max_pages=settings.avito_max_pages,
-        min_interval_sec=settings.avito_collect_interval_min * 60,
-    )
 
 
 def source_enabled(settings: Settings, source: str) -> bool:
@@ -69,10 +73,11 @@ class WorkerState:
     def __init__(self, storage: SqlStorage):
         self._session = storage._session
 
-    async def read(self) -> dict[str, CollectorStateRow]:
+    async def read(self, *, include_details: bool = False) -> dict[str, CollectorStateRow]:
+        sources = (*SOURCES, DETAIL_ROLE) if include_details else SOURCES
         async with self._session() as session:
             rows = await session.scalars(select(CollectorStateRow).where(
-                CollectorStateRow.source.in_(SOURCES)
+                CollectorStateRow.source.in_(sources)
             ))
             return {row.source: row for row in rows}
 
@@ -120,52 +125,6 @@ class WorkerState:
             return row
 
 
-async def enrich_avito(
-    settings: Settings, storage: SqlStorage, deferred: dict[str, datetime] | None = None,
-) -> int:
-    cap = settings.avito_detail_max_per_run
-    if cap <= 0:
-        return 0
-    if deferred is None:
-        deferred = {}
-    now = utcnow()
-    store = PersonalStore(storage, pause_max_days=settings.pause_max_days)
-    active: dict[int, bool] = {}
-    filters = []
-    for flt in await store.all_active_filters():
-        if flt.user_id not in active:
-            active[flt.user_id] = await store.is_active(flt.user_id, now)
-        if active[flt.user_id]:
-            filters.append((flt, flt.model_copy(update={"no_commission": False})))
-    candidates = await storage.unenriched_listings("avito", now - timedelta(hours=24), cap * 15)
-    candidates = [item for item in candidates if deferred.get(item.external_id, now) <= now]
-    candidates.sort(key=lambda listing: not any(
-        matches(listing, provisional if listing.commission_amount is None else flt)
-        for flt, provisional in filters
-    ))
-    changed = 0
-    for index, listing in enumerate(candidates[:cap]):
-        if index:
-            await asyncio.sleep(settings.avito_detail_delay_sec)
-        try:
-            detail = await fetch_detail(
-                listing.url, price=listing.price, proxy=settings.avito_proxy or None,
-                parse_timeout=settings.avito_detail_parse_timeout_sec,
-            )
-        except DetailDeferred as error:
-            deferred[listing.external_id] = utcnow() + timedelta(minutes=30)
-            log.warning("avito detail result=deferred reason=%s", error)
-            continue
-        if detail is None:
-            break
-        saved = await storage.save_enrichment(
-            "avito", listing.external_id, enriched_at=utcnow(),
-            expected_price=listing.price, **detail._asdict(),
-        )
-        changed += saved is not None
-    return changed
-
-
 def _classify(statuses: list[str], progress: CollectionProgress) -> str:
     observed = set(statuses) - {"skipped"}
     if observed == {"ok"}:
@@ -206,12 +165,19 @@ async def run_worker(
     if previous.started_at is not None:
         due += max(0, interval - (utcnow() - previous.started_at).total_seconds())
     phone_due = loop.time()
-    deferred: dict[str, datetime] = {}
 
     async def heartbeat() -> None:
+        next_beat = loop.time()
         while True:
+            begin = loop.time()
+            lag = begin - next_beat
             await states.set(source, heartbeat=utcnow())
+            write = loop.time() - begin
+            if max(lag, write) >= 1:
+                log.warning("heartbeat source=%s lag_ms=%d write_ms=%d",
+                            source, round(lag * 1000), round(write * 1000))
             notify_systemd("WATCHDOG=1")
+            next_beat = loop.time() + HEARTBEAT_SECONDS
             await asyncio.sleep(HEARTBEAT_SECONDS)
 
     async def passes() -> None:
@@ -220,7 +186,9 @@ async def run_worker(
             row = await states.get(source)
             if loop.time() >= due or row.requested:
                 started = utcnow()
-                due = loop.time() + interval
+                begin = loop.time()
+                due = begin + interval
+                run_id = uuid4().hex[:12]
                 await states.set(source, started_at=started, state="running", requested=False)
                 progress = CollectionProgress()
                 try:
@@ -232,32 +200,32 @@ async def run_worker(
                             )
                             statuses.append(status)
                 except TimeoutError:
+                    elapsed = round((loop.time() - begin) * 1000)
                     await states.set(
                         source, state="timeout", failures=row.failures + 1,
                         new_count=progress.new, changed_count=progress.changed,
+                        reason="pass_timeout", duration_ms=elapsed,
+                        last_usable=utcnow() if progress.pages else row.last_usable,
                     )
+                    log.warning("collection_timeout source=%s run_id=%s duration_ms=%d "
+                                "pages=%d new=%d changed=%d rejected=%d", source, run_id, elapsed,
+                                progress.pages, progress.new, progress.changed, progress.rejected)
                     raise
                 state = _classify(statuses, progress)
                 succeeded = state in ("ok", "empty", "partial")
                 failures = 0 if succeeded else row.failures + (state != "paused")
+                finished = utcnow()
+                elapsed = round((loop.time() - begin) * 1000)
                 await states.set(
                     source, state=state, new_count=progress.new, changed_count=progress.changed,
-                    last_success=utcnow() if state in ("ok", "empty") else row.last_success,
-                    failures=failures,
+                    last_success=finished if state in ("ok", "empty") else row.last_success,
+                    last_usable=finished if succeeded else row.last_usable,
+                    failures=failures, reason=progress.reason, duration_ms=elapsed,
                 )
-                log.info("collection source=%s state=%s new=%d changed=%d total=%d",
-                         source, state, progress.new, progress.changed, progress.seen)
-                if source == "avito" and state in ("ok", "partial"):
-                    for key in [key for key, until in deferred.items() if until <= started]:
-                        del deferred[key]
-                    try:
-                        async with asyncio.timeout(settings.avito_detail_run_timeout_sec):
-                            enriched = await enrich_avito(settings, storage, deferred)
-                        log.info("avito enrichment result=ok changed=%d", enriched)
-                    except CollectionSkipped:
-                        log.info("avito enrichment paused while shared proxy is in use")
-                    except TimeoutError:
-                        log.warning("avito enrichment result=timeout")
+                log.info("collection source=%s state=%s new=%d changed=%d total=%d "
+                         "run_id=%s duration_ms=%d pages=%d rejected=%d reason=%s",
+                         source, state, progress.new, progress.changed, progress.seen, run_id,
+                         elapsed, progress.pages, progress.rejected, progress.reason)
             if phone is not None and loop.time() >= phone_due:
                 phone_due = loop.time() + 60 * max(1, settings.avito_phone_check_min)
                 try:

@@ -3,8 +3,9 @@
 One `rentradar.service` owns Telegram polling, menu callbacks, subscriptions,
 matching, personal and public delivery, Vision, market statistics, reminders
 and queue cleanup. `rentradar-collector@{avito,cian,yandex}.service` each own
-one adapter, its interval and its journal. The Avito instance also owns
-detail enrichment and phone checks. The Telegram publisher uses saved terms
+one adapter, its interval and its journal. The Avito collector owns search and
+phone checks. `rentradar-avito-detail.service` owns queued detail enrichment.
+The Telegram publisher uses saved terms
 and photo links. Public Avito listings without photos wait for a later slot.
 
 All roles use `/opt/rentradar/data/rentradar.db` in WAL mode and read local
@@ -40,7 +41,7 @@ Push the exact candidate to a GitHub branch first. On the VPS, download
 ```bash
 bash release.sh stage "$SHA" refs/heads/codex/worker-split
 # Publish the tested commit to main and create the corresponding tag on GitHub.
-bash release.sh deploy "$SHA" v0.3.0
+bash release.sh deploy "$SHA" v0.4.0
 bash release.sh verify "$SHA"
 ```
 
@@ -56,6 +57,7 @@ the bot's polling startup. `/cc apply` directs the operator to this procedure.
 ```bash
 systemctl status rentradar.service 'rentradar-collector@*.service'
 journalctl -u rentradar-collector@avito.service -n 100 --no-pager
+journalctl -u rentradar-avito-detail.service -n 100 --no-pager
 systemctl restart rentradar-collector@avito.service
 bash /opt/rentradar-releases/current/scripts/release.sh rollback "$BACKUP_PATH"
 ```
@@ -68,15 +70,32 @@ previous single-process version can read the additive schema. If production
 has rolled back, publish a normal revert commit on GitHub before the next
 switch so the source of record and server agree.
 
-`/health` shows per-source state, heartbeat age, last start and successful
-pass, new and changed counts, and the immediate queue's age and retry counts.
+`/health` shows per-source state, heartbeat age, usable search, complete pass,
+new and changed counts, the detail backlog and the delivery queue's age. A
+source incident clears after a usable search result. The initial rollout runs
+Avito search every six minutes and attempts one detail per cycle. Override the
+unit environment to tune those separately after comparing freshness and
+source rejection rates.
 `/collectnow` requests work from live owners and reports when a pass is already
 running. A hung async pass hits its configured deadline. A blocked event loop
 loses its systemd watchdog heartbeat. Both paths restart that collector only.
+
+Search commits create or refresh the detail task for any changed Avito card
+that needs enrichment. The task holds the revision of the fields it can
+update. An expired lease is eligible after a restart. Result and delivery
+event are committed together, with the lease and revision checked at commit.
+The parser runs outside the search process with its own deadline and Linux
+address-space limit. HTTP `403` and `429` pause Avito on that route, keep the
+deadline across restarts and honour `Retry-After`.
+
+For rollout evidence, run the read-only `scripts/observe_release.py` with
+`--since-epoch` set to the deployed bot's start time. It emits reports after
+two and 24 hours. Pass `--seconds 300` for a five-minute smoke report.
 
 ## Local development
 
 Run `python -m rentradar init-db` once. Start `python -m rentradar serve` and
 `python -m rentradar worker --source avito` (likewise `cian` and `yandex`) in
-separate terminals with the same settings and database. The one-shot
+separate terminals with the same settings and database. Run
+`python -m rentradar enrich-avito` for the details role. The one-shot
 `collect` and `run` commands are available while the workers are stopped.

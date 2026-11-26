@@ -93,9 +93,15 @@ class AvitoAccess:
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
+        staged = self._path.with_suffix(".tmp")
+        staged.write_text(
             json.dumps({"ua": self.user_agent, "cookies": self.cookies}), encoding="utf-8"
         )
+        staged.replace(self._path)
+
+    def refresh(self) -> None:
+        """Search and detail services can each have updated the shared session."""
+        self._load()
 
     @property
     def headers(self) -> dict[str, str]:

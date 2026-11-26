@@ -140,6 +140,12 @@ class PersonalDispatcher:
                             and now - last < timedelta(minutes=flt.clamp_interval())
                         ):
                             continue
+                        elif last is not None:
+                            interval = flt.clamp_interval()
+                            due = last + timedelta(minutes=interval)
+                            lag = (now - due).total_seconds() + monotonic() - started
+                            logger.info("filter_schedule interval_min=%d lateness_seconds=%.2f",
+                                        interval, max(0.0, lag))
                         sent, complete = await self._dispatch_one(
                             filter_id, flt, now, started=started, fresh_only=immediate, batch=batch,
                         )
@@ -289,15 +295,27 @@ class PersonalDispatcher:
             finished = now + timedelta(seconds=monotonic() - started)
             if not ok:
                 await self._ps.defer_delivery(flt.user_id, content_key, state, finished + delay)
+                logger.info("delivery_deferred source=%s state=%s retry_seconds=%.1f",
+                            listing.source.value, state, delay.total_seconds())
                 pending_fresh = True
                 continue
-            await self._ps.mark_sent(flt.user_id, content_key, delivered=True, now=finished)
+            get_ids = getattr(self._publisher, "delivery_message_ids", None)
+            await self._ps.mark_sent(flt.user_id, content_key, delivered=True, now=finished,
+                                     message_ids=get_ids() if get_ids is not None else ())
+            first_seen = listing.first_seen_at or listing.collected_at
             logger.info(
-                "delivery_ack user=%s source=%s collected_to_ack_seconds=%.2f",
+                "delivery_ack user=%s source=%s collected_to_ack_seconds=%.2f "
+                "lane=%s send_seconds=%.2f",
                 flt.user_id,
                 listing.source.value,
-                (finished - (listing.first_seen_at or listing.collected_at)).total_seconds(),
+                (finished - first_seen).total_seconds(),
+                "immediate" if fresh_only else "scheduled",
+                (finished - sending_at).total_seconds(),
             )
+            if listing.published_at is not None:
+                logger.info("listing_freshness source=%s published_to_saved_seconds=%.2f",
+                            listing.source.value,
+                            (first_seen - listing.published_at).total_seconds())
             handled.add(content_key)
             sent += 1
             if fresh:

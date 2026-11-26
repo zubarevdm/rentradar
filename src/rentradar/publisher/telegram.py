@@ -16,6 +16,7 @@ import html
 import logging
 import re
 from collections import OrderedDict
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
 
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
 
 # Лимит подписи к фото в Telegram — 1024 символа.
 _CAPTION_LIMIT = 1024
+_PHOTO_BYTES = 12 * 1024 * 1024
 _PHOTO_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -81,6 +83,7 @@ class TelegramPublisher(Publisher):
         self._bot = bot
         self._storage = storage
         self._telegram_files: OrderedDict[str, str] = OrderedDict()
+        self._receipt: ContextVar[tuple[int, ...]] = ContextVar("telegram_receipt", default=())
         self._avito_proxy = avito_proxy or None  # прокси для дозагрузки фото Авито (VPS)
         # Кап фото по каналу (Telegram: альбом ≤ 10). Личка — больше, канал — меньше.
         self._max_personal = max(1, min(10, max_photos_personal))
@@ -103,6 +106,9 @@ class TelegramPublisher(Publisher):
     @property
     def simulated(self) -> bool:
         return self._dry_run or self._bot is None
+
+    def delivery_message_ids(self) -> tuple[int, ...]:
+        return self._receipt.get()
 
     @classmethod
     def from_settings(
@@ -239,6 +245,7 @@ class TelegramPublisher(Publisher):
         Флуд-лимит (RetryAfter) обрабатывается ожиданием и повтором. `use_custom_emoji`
         включает кастом-эмодзи (только для личных чатов, не для канала).
         """
+        self._receipt.set(())
         # В личке больше фото (5-7), в канале меньше (3-5).
         cap = self._max_personal if use_custom_emoji else self._max_public
         if self._storage is not None and scored.listing.source == Source.AVITO:
@@ -336,12 +343,14 @@ class TelegramPublisher(Publisher):
         if urls and await self._try_send(
             channel, text, urls, protect=protect, photo_timeout=12 if len(urls) > 1 else 8,
         ):
-            logger.info("Telegram media delivered: source=%s mode=url count=%d", source, len(urls))
+            logger.info("Telegram media delivered: source=%s mode=url count=%d requested=%d",
+                        source, len(urls), len(photos))
             return True
         if len(urls) > 1 and await self._try_send(
             channel, text, urls[:1], protect=protect, photo_timeout=8,
         ):
-            logger.info("Telegram media delivered: source=%s mode=url count=1", source)
+            logger.info("Telegram media delivered: source=%s mode=url count=1 requested=%d",
+                        source, len(photos))
             return True
         preview = await self._download_relay_preview(photos[:2])
         if preview is None:
@@ -351,7 +360,8 @@ class TelegramPublisher(Publisher):
         if preview and await self._try_send(
             channel, text, [preview], protect=protect, photo_timeout=8,
         ):
-            logger.info("Telegram media delivered: source=%s mode=uploaded-preview count=1", source)
+            logger.info("Telegram media delivered: source=%s mode=uploaded-preview count=1 "
+                        "requested=%d", source, len(photos))
             return True
         if require_photo:
             logger.warning("Telegram media unavailable: source=%s, deferring card", source)
@@ -366,9 +376,8 @@ class TelegramPublisher(Publisher):
             async def preview(url: str) -> BufferedInputFile | None:
                 try:
                     async with asyncio.timeout(4):
-                        response = await client.get(url)
-                        response.raise_for_status()
-                        data = await asyncio.to_thread(telegram_preview, response.content)
+                        content = await _photo_bytes(client, url)
+                        data = await asyncio.to_thread(telegram_preview, content)
                     return BufferedInputFile(data, filename="preview.jpg")
                 except (httpx.HTTPError, TimeoutError, OSError, ValueError):
                     return None
@@ -388,9 +397,8 @@ class TelegramPublisher(Publisher):
         ) as cl:
             for i, url in enumerate(urls):
                 try:
-                    resp = await cl.get(url)
-                    resp.raise_for_status()
-                    content, extension = await asyncio.to_thread(telegram_photo, resp.content)
+                    incoming = await _photo_bytes(cl, url)
+                    content, extension = await asyncio.to_thread(telegram_photo, incoming)
                     out.append(BufferedInputFile(content, filename=f"photo{i}.{extension}"))
                 except (httpx.HTTPError, OSError, ValueError) as exc:
                     logger.warning("не скачал фото %s: %s", url, exc)
@@ -431,12 +439,16 @@ class TelegramPublisher(Publisher):
                     )
                     messages = [message]
                 else:
-                    messages = []
-                    await self._bot.send_message(
+                    message = await self._bot.send_message(
                         chat_id=channel, text=text,
                         # Превью ссылки сильно удлиняет пост — без него.
                         disable_web_page_preview=True, protect_content=protect,
                     )
+                    messages = [message]
+                self._receipt.set(tuple(
+                    message_id for message in messages or []
+                    if isinstance(message_id := getattr(message, "message_id", None), int)
+                ))
                 for url, message in zip(original, messages or [], strict=False):
                     sizes = getattr(message, "photo", None)
                     if isinstance(url, str) and sizes:
@@ -472,6 +484,17 @@ class TelegramPublisher(Publisher):
         """Закрыть HTTP-сессию бота (вызывать в finally оркестратора)."""
         if self._bot is not None:
             await self._bot.session.close()
+
+
+async def _photo_bytes(client: httpx.AsyncClient, url: str) -> bytes:
+    content = bytearray()
+    async with client.stream("GET", url) as response:
+        response.raise_for_status()
+        async for part in response.aiter_bytes():
+            if len(content) + len(part) > _PHOTO_BYTES:
+                raise ValueError("photo_download_limit")
+            content.extend(part)
+    return bytes(content)
 
 
 def _money(value: float) -> str:

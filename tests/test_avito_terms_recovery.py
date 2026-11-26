@@ -1,18 +1,20 @@
 """Recover terms after temporary source failures and reuse them across recipients."""
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from rentradar.avito_enrichment import enrich_avito
 from rentradar.collectors import avito
 from rentradar.config import Settings
 from rentradar.models import ScoreBreakdown, ScoredListing, Source
 from rentradar.publisher import TelegramPublisher
 from rentradar.storage import SqlStorage
-from rentradar.worker import enrich_avito
 from tests.test_publisher_send import FakeBot
 
 
@@ -63,7 +65,7 @@ async def test_worker_enrichment_is_persisted_and_reused(
     })
     await storage.upsert_listings([listing])
     fetch = AsyncMock(return_value=detail)
-    monkeypatch.setattr("rentradar.worker.fetch_detail", fetch)
+    monkeypatch.setattr("rentradar.avito_enrichment.fetch_detail", fetch)
     await enrich_avito(Settings(), storage)
     monkeypatch.setattr(TelegramPublisher, "_download_photos", AsyncMock(return_value=[]))
     bot = FakeBot()
@@ -143,3 +145,13 @@ def test_structured_terms_large_page_is_linear() -> None:
     assert time.monotonic() - started < 5
     assert "залог 50000 ₽" in texts
     assert any(t.startswith("Комиссия: 0 ₽") for t in texts)
+
+
+def test_escaped_json_literals_with_brackets_stay_within_parser_budget():
+    term = {"label": "Комиссия", "value": "[", "depositRub": 50000}
+    encoded = json.dumps(json.dumps([term] * 800, ensure_ascii=False), ensure_ascii=False)
+    html = f"<html><script>window.state = {encoded};</script></html>"
+    start = perf_counter()
+    terms = avito._structured_terms(html)
+    assert perf_counter() - start < 2
+    assert any(term.startswith("Залог: 50000") for term in terms)

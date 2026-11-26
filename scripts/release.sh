@@ -8,9 +8,11 @@ live=/opt/rentradar
 releases=/opt/rentradar-releases
 backups=/var/backups/rentradar
 python="$live/.venv/bin/python"
-units=(rentradar.service rentradar-collector@avito.service rentradar-collector@cian.service
-       rentradar-collector@yandex.service)
-templates=(rentradar.service rentradar-collector@.service)
+legacy_units=(rentradar.service rentradar-collector@avito.service rentradar-collector@cian.service
+              rentradar-collector@yandex.service)
+detail_unit=rentradar-avito-detail.service
+units=("${legacy_units[@]}" "$detail_unit")
+templates=(rentradar.service rentradar-collector@.service "$detail_unit")
 system=/etc/systemd/system
 
 die() { echo "$*" >&2; exit 1; }
@@ -50,7 +52,9 @@ get_candidate() {
 verify() {
     local sha=$1 path="$releases/$1" u pid invocation stamp role source line
     [[ $(readlink -f "$releases/current") == "$path" ]] || return 1
-    for u in "${units[@]}"; do
+    local -a expected=("${legacy_units[@]}")
+    if [[ -f $path/scripts/systemd/$detail_unit ]]; then expected+=("$detail_unit"); fi
+    for u in "${expected[@]}"; do
         systemctl is-active --quiet "$u" && systemctl is-enabled --quiet "$u" || return 1
         pid=$(systemctl show "$u" --property=MainPID --value)
         [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
@@ -62,6 +66,9 @@ verify() {
             role=collector
             source=${u#*@}
             source=${source%.service}
+        elif [[ $u == "$detail_unit" ]]; then
+            role=enrichment
+            source=avito
         fi
         line="runtime_start role=$role source=$source pid=$pid sha=$sha path=$path/src/rentradar/runtime.py"
         journalctl "_SYSTEMD_INVOCATION_ID=$invocation" "_PID=$pid" --no-pager -o cat |
@@ -145,12 +152,12 @@ case "${1:-}" in
         ) | tee "$tmp/tests.log"
         "$python" "$path/scripts/check_database.py" "$tmp/migration.db" --test-migration |
             tee "$tmp/migration.log"
-        if [[ ! -L $releases/current ]]; then
-            RENTRADAR_DB_PATH="$tmp/migration.db" PYTHONPATH="$live/src" \
-                "$python" -m rentradar init-db
-            echo "PREVIOUS_RELEASE_SCHEMA_OK $(git -C "$live" rev-parse HEAD)" |
-                tee -a "$tmp/migration.log"
-        fi
+        previous=$live
+        if [[ -L $releases/current ]]; then previous=$(readlink -f "$releases/current"); fi
+        RENTRADAR_DB_PATH="$tmp/migration.db" PYTHONPATH="$previous/src" \
+            "$python" -m rentradar init-db
+        echo "PREVIOUS_RELEASE_SCHEMA_OK $(git -C "$previous" rev-parse HEAD)" |
+            tee -a "$tmp/migration.log"
         printf '%s\n' "$tmp" > "$releases/$sha.verified"
         echo "STAGED $sha EVIDENCE $tmp"
         ;;
@@ -198,7 +205,13 @@ case "${1:-}" in
         }
         trap on_failure ERR
         systemctl stop "${units[0]}"
-        if [[ -s $backup/current ]]; then systemctl stop "${units[@]:1}"; fi
+        if [[ -s $backup/current ]]; then
+            for name in "${units[@]:1}"; do
+                if [[ $(systemctl show "$name" -p LoadState --value) != not-found ]]; then
+                    systemctl stop "$name"
+                fi
+            done
+        fi
         "$python" "$path/scripts/check_database.py" "$backup/database.sqlite"
         "$python" -m rentradar init-db
         ln -sfn -- "$path" "$releases/current"

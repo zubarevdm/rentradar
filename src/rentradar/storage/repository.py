@@ -27,9 +27,18 @@ from ..models import (
     Source,
     build_segment_keys,
 )
-from .orm import Base, DataVersionRow, ListingEventRow, ListingRow, MarketStatRow, PostedRow
+from .detail_queue import DetailClaim, detail_revision
+from .orm import (
+    AvitoDetailTaskRow,
+    Base,
+    DataVersionRow,
+    ListingEventRow,
+    ListingRow,
+    MarketStatRow,
+    PostedRow,
+)
 
-_WORKER_SCHEMA = "collector_outbox_v1"
+_WORKER_SCHEMA = "collector_details_v2"
 
 
 class SqlStorage(Storage):
@@ -78,6 +87,7 @@ class SqlStorage(Storage):
         new_items: list[Listing] = []
         changed: list[Listing] = []
         seen_keys: set[tuple[str, str]] = set()
+        detail_candidates: list[ListingRow] = []
         async with self._session() as session:
             if not listings:
                 return [], []
@@ -155,10 +165,18 @@ class SqlStorage(Storage):
                     if session.is_modified(row):
                         row.collected_at = max(row.collected_at, listing.collected_at)
                         changed.append(_row_to_listing(row))
+                        if listing.source == Source.AVITO and row.enriched_at is None:
+                            detail_candidates.append(row)
                     continue
-                session.add(_to_row(listing))
+                row = _to_row(listing)
+                session.add(row)
+                if listing.source == Source.AVITO and row.enriched_at is None:
+                    detail_candidates.append(row)
                 new_items.append(listing)
             session.add_all(_listing_event(item) for item in (*new_items, *changed))
+            if detail_candidates:
+                await session.flush()
+                await _queue_details(session, detail_candidates)
             await session.commit()
         return new_items, [*new_items, *changed]
 
@@ -245,21 +263,92 @@ class SqlStorage(Storage):
             ).scalars()
             return [_row_to_listing(r) for r in rows]
 
+    async def seed_details(self, since: datetime) -> None:
+        """Pick up recent cards created before the enrichment queue existed."""
+        async with self._session() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            rows = list(await session.scalars(select(ListingRow).where(
+                ListingRow.source == "avito", ListingRow.collected_at >= since,
+                ListingRow.enriched_at.is_(None),
+            )))
+            await _queue_details(session, rows)
+            await session.commit()
+
     async def unenriched_listings(self, source: str, since: datetime, limit: int) -> list[Listing]:
-        """Свежие лоты площадки, ещё не дообогащённые с детальной страницы.
-        Новейшие сначала — свежак важнее для постинга, хвост догоним позже."""
+        async with self._session() as session:
+            rows = await session.scalars(select(ListingRow).where(
+                ListingRow.source == source, ListingRow.collected_at >= since,
+                ListingRow.enriched_at.is_(None),
+            ).order_by(ListingRow.collected_at.desc()).limit(limit))
+            return [_row_to_listing(row) for row in rows]
+
+    async def ready_details(self, now: datetime, limit: int) -> list[Listing]:
         async with self._session() as session:
             rows = (
                 await session.execute(
                     select(ListingRow)
-                    .where(ListingRow.source == source)
-                    .where(ListingRow.collected_at >= since)
-                    .where(ListingRow.enriched_at.is_(None))
+                    .join(AvitoDetailTaskRow,
+                          AvitoDetailTaskRow.external_id == ListingRow.external_id)
+                    .where(ListingRow.source == "avito", ListingRow.enriched_at.is_(None),
+                           AvitoDetailTaskRow.ready_at <= now, AvitoDetailTaskRow.attempts < 5,
+                           ListingRow.collected_at >= now - timedelta(hours=24))
                     .order_by(ListingRow.collected_at.desc())
                     .limit(limit)
                 )
             ).scalars()
             return [_row_to_listing(r) for r in rows]
+
+    async def claim_detail(
+        self, listing: Listing, now: datetime, lease_seconds: float,
+    ) -> tuple[DetailClaim, Listing] | None:
+        async with self._session() as session:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            task = await session.get(AvitoDetailTaskRow, listing.external_id)
+            if task is None or task.ready_at > now or task.attempts >= 5:
+                return None
+            row = await session.scalar(select(ListingRow).where(
+                ListingRow.source == "avito", ListingRow.external_id == listing.external_id,
+            ))
+            if row is None or row.enriched_at is not None or detail_revision(row) != task.revision:
+                await session.delete(task)
+                if row is not None and row.enriched_at is None:
+                    await session.flush()
+                    await _queue_details(session, [row])
+                await session.commit()
+                return None
+            task.ready_at = now + timedelta(seconds=lease_seconds)
+            task.reason = "processing"
+            claim = DetailClaim(task.external_id, task.revision, task.attempts, task.ready_at)
+            result = _row_to_listing(row)
+            await session.commit()
+            return claim, result
+
+    async def defer_detail(
+        self, claim: DetailClaim, ready_at: datetime, reason: str, *, count_attempt: bool,
+    ) -> None:
+        async with self._session() as session:
+            await session.execute(update(AvitoDetailTaskRow).where(
+                AvitoDetailTaskRow.external_id == claim.external_id,
+                AvitoDetailTaskRow.revision == claim.revision,
+                AvitoDetailTaskRow.ready_at == claim.until,
+            ).values(ready_at=ready_at, reason=reason[:48],
+                     attempts=AvitoDetailTaskRow.attempts + int(count_attempt)))
+            await session.commit()
+
+    async def detail_backlog(self, now: datetime) -> tuple[int, int]:
+        async with self._session() as session:
+            total, oldest = (await session.execute(select(
+                func.count(), func.min(AvitoDetailTaskRow.created_at),
+            ).where(AvitoDetailTaskRow.attempts < 5,
+                    AvitoDetailTaskRow.created_at >= now - timedelta(hours=24)))).one()
+            return total, max(0, int((now - oldest).total_seconds())) if oldest else 0
+
+    async def prune_details(self, cutoff: datetime) -> None:
+        async with self._session() as session:
+            await session.execute(delete(AvitoDetailTaskRow).where(
+                AvitoDetailTaskRow.created_at < cutoff,
+            ))
+            await session.commit()
 
     async def save_enrichment(
         self,
@@ -268,6 +357,7 @@ class SqlStorage(Storage):
         *,
         enriched_at: datetime,
         expected_price: int | None = None,
+        claim: DetailClaim | None = None,
         description: str | None = None,
         deposit_rub: int | None = None,
         commission_pct: int | None = None,
@@ -298,6 +388,12 @@ class SqlStorage(Storage):
             )
             if row is None or (expected_price is not None and row.price != expected_price):
                 return None
+            task = None
+            if claim is not None:
+                task = await session.get(AvitoDetailTaskRow, external_id)
+                if (task is None or task.revision != claim.revision or task.ready_at != claim.until
+                        or detail_revision(row) != claim.revision):
+                    return None
             if description is not None:
                 row.description = description[:4000]
             if deposit_present:
@@ -335,6 +431,14 @@ class SqlStorage(Storage):
                 row.collected_at = max(row.collected_at, enriched_at)
                 listing = _row_to_listing(row)
                 session.add(_listing_event(listing))
+            if task is not None:
+                if incomplete:
+                    task.revision = detail_revision(row)
+                    task.ready_at = enriched_at + timedelta(minutes=30)
+                    task.attempts += 1
+                    task.reason = "partial_fields"
+                else:
+                    await session.delete(task)
             await session.commit()
             return listing if changed else None
 
@@ -417,6 +521,23 @@ class SqlStorage(Storage):
 
     async def dispose(self) -> None:
         await self._engine.dispose()
+
+
+async def _queue_details(session, rows: Sequence[ListingRow]) -> None:
+    for chunk in batched(rows, 100):
+        statement = insert(AvitoDetailTaskRow).values([
+            {"external_id": row.external_id, "revision": detail_revision(row),
+             "ready_at": row.collected_at, "created_at": row.collected_at,
+             "attempts": 0, "reason": "new"}
+            for row in chunk
+        ])
+        await session.execute(statement.on_conflict_do_update(
+            index_elements=[AvitoDetailTaskRow.external_id],
+            set_={key: getattr(statement.excluded, key) for key in (
+                "revision", "ready_at", "created_at", "attempts", "reason",
+            )},
+            where=AvitoDetailTaskRow.revision != statement.excluded.revision,
+        ))
 
 
 def _listing_event(listing: Listing) -> ListingEventRow:
