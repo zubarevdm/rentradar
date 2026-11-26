@@ -130,7 +130,7 @@ async def main(folder: Path, role: str) -> None:
     path = folder / "shared.db"
     settings = Settings(
         _env_file=None, db_path=path, dry_run=False, avito_detail_max_per_run=0,
-        worker_pass_timeout_sec=2,
+        worker_pass_timeout_sec=8,
     )
     storage = SqlStorage(settings.db_url)
     try:

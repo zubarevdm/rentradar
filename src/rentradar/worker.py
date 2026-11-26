@@ -80,15 +80,15 @@ class WorkerState:
             accepted = await session.execute(update(CollectorStateRow).where(
                 CollectorStateRow.source == source,
                 CollectorStateRow.heartbeat >= now - STALE_AFTER,
-                CollectorStateRow.state != "running",
-                CollectorStateRow.state != "disabled",
+                CollectorStateRow.state.not_in(("running", "disabled", "stopped", "timeout")),
                 CollectorStateRow.requested.is_(False),
             ).values(requested=True))
             row = await session.get(CollectorStateRow, source)
             await session.commit()
             if accepted.rowcount:
                 return "requested"
-            if row is None or row.heartbeat < now - STALE_AFTER:
+            if (row is None or row.heartbeat < now - STALE_AFTER
+                    or row.state in ("stopped", "timeout")):
                 return "offline"
             if row.state == "disabled":
                 return "disabled"

@@ -10,7 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 
 from rentradar.personal import PersonalStore, UserFilter
 from rentradar.personal.outbox import Outbox
@@ -138,14 +138,17 @@ async def wait_sync(services, predicate, timeout=18):
     await wait_for(services, check, timeout)
 
 
-async def subscribe(storage, user: int, *, minutes: int = 5, price_max: int = 60_000):
+async def subscribe(
+    storage, user: int, *, minutes: int = 5, price_max: int = 60_000,
+    no_commission: bool = False,
+):
     store = PersonalStore(storage)
     now = utcnow()
     await store.get_or_create_subscriber(user)
     await store.grant_hours(user, now, 2)
     filter_id = await store.upsert_filter(UserFilter(
         user_id=user, city="Москва", interval_min=minutes, price_max=price_max,
-        include_backlog=False,
+        include_backlog=False, no_commission=no_commission,
     ))
     await store.touch_filter(filter_id, now - timedelta(minutes=1))
     return filter_id
@@ -179,6 +182,8 @@ async def test_source_stop_watchdog_and_recovery(shared):
     await wait_sync(services, lambda: received(services, 1001, "initial-cian") == 1)
     await wait_sync(services, lambda: ["menu", polling_pid] in services.records())
     assert services.pid("bot") == bot_pid
+    if os.name != "nt":  # Windows TerminateProcess cannot run the SIGTERM cleanup.
+        assert await states.request("avito", utcnow()) == "offline"
 
     async def yandex_ok():
         row = (await states.read()).get("yandex")
@@ -192,6 +197,8 @@ async def test_source_stop_watchdog_and_recovery(shared):
     await request(states, "avito", services)
     await wait_sync(services, lambda: any(row[:2] == ["fetch", "avito"]
                                          for row in services.records()))
+    observed_running = await states.get("avito")
+    assert observed_running.state == "running"
     assert await states.request("avito", utcnow()) == "running"
     services.submit("cian", "partial-cian")
     services.submit("yandex", "second-yandex")
@@ -302,3 +309,30 @@ async def test_revisions_and_scheduled_interval(shared):
     await wait_sync(services, lambda: received(services, 1002, "late") == 1)
     found = await storage.get_listing("cian", "late")
     assert found.price == 55_000 and found.first_seen_at <= found.collected_at
+
+
+async def test_migration_and_fee_revision_without_replay(shared):
+    storage, services = shared
+    await subscribe(storage, 1001, no_commission=True)
+    historic = make_listing("cian", "historical", commission_rub=0)
+    await storage.upsert_listings([historic])
+    async with storage._session.begin() as session:
+        # Represent a v0.2.0 database with listings and delivery history already on disk.
+        for table in ("listing_events", "recipient_tasks", "collector_state"):
+            await session.execute(text(f"DROP TABLE {table}"))
+        await session.execute(text(
+            "DELETE FROM data_versions WHERE name='collector_outbox_v1'"
+        ))
+    await storage.init()
+    await storage.init()
+    async with storage._session() as session:
+        assert await session.scalar(select(func.count()).select_from(ListingEventRow)) == 0
+    services.start("bot")
+    await wait_sync(services, lambda: any(row[0] == "bot" for row in services.records()))
+    unknown = make_listing("cian", "no-fee")
+    await storage.upsert_listings([unknown])
+    no_fee = unknown.model_copy(update={"commission_rub": 0, "collected_at": utcnow()})
+    await storage.upsert_listings([no_fee])
+    await storage.upsert_listings([no_fee])
+    await wait_sync(services, lambda: received(services, 1001, "no-fee") == 1)
+    assert received(services, 1001, "historical") == 0
