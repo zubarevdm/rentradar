@@ -41,7 +41,7 @@ Push the exact candidate to a GitHub branch first. On the VPS, download
 ```bash
 bash release.sh stage "$SHA" refs/heads/codex/worker-split
 # Publish the tested commit to main and create the corresponding tag on GitHub.
-bash release.sh deploy "$SHA" v0.4.1
+bash release.sh deploy "$SHA" v0.4.2
 bash release.sh verify "$SHA"
 ```
 
@@ -72,11 +72,19 @@ switch so the source of record and server agree.
 
 `/health` shows per-source state, heartbeat age, usable search, complete pass,
 new and changed counts, the detail backlog and the delivery queue's age. A
-source incident clears after a usable search result. The cadence pilot runs
-Avito search every three minutes and still attempts one detail per six-minute
-cycle. A separate six-minute base cooldown applies after an Avito refusal.
-The VPS pilot keeps its one-page search depth. Compare freshness and source
-rejection rates before adjusting the cadence, depth or detail budget.
+source incident clears after a usable search result. The VPS runs one-page
+Avito searches every six minutes and attempts one detail per six-minute cycle.
+A separate six-minute base cooldown applies after an Avito refusal.
+
+The 24-hour three-minute pilot on v0.4.1 ended on 27 November 2026 at
+21:36 Moscow time. All five services recorded zero restarts. Avito search
+made 83 network attempts, with 25 responses of 429 and 2 of 403. The route
+spent about 80% of the window in cooldown, including the pause inherited at
+startup. The p95 from storage to immediate Telegram acknowledgement for
+Avito was 137.69 seconds across 375 acknowledgements, above the 20-second
+pilot target. The v0.4.0 comparison window was about an hour. Use the
+six-minute interval with the same instrumentation to collect a full comparison
+window before adjusting search depth or the detail budget.
 `/collectnow` requests work from live owners and reports when a pass is already
 running. A hung async pass hits its configured deadline. A blocked event loop
 loses its systemd watchdog heartbeat. Both paths restart that collector only.

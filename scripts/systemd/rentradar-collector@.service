@@ -10,7 +10,7 @@ Type=notify
 NotifyAccess=main
 WorkingDirectory=/opt/rentradar
 Environment=RENTRADAR_DB_PATH=/opt/rentradar/data/rentradar.db
-Environment=RENTRADAR_AVITO_COLLECT_INTERVAL_MIN=3
+Environment=RENTRADAR_AVITO_COLLECT_INTERVAL_MIN=6
 Environment=RENTRADAR_AVITO_COOLDOWN_MIN=6
 ExecStart=/bin/bash /opt/rentradar-releases/current/scripts/run-role.sh worker --source %i
 Restart=on-failure
